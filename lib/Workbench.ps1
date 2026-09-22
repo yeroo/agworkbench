@@ -40,6 +40,97 @@ function Get-AgwintermCtl {
     return $null
 }
 
+# --- installed versions ----------------------------------------------------------------------
+
+function Find-Tool([string] $Name) {
+    # npm installs adjacent .ps1/.cmd shims, and PATH can contain several installs.
+    # Prefer one executable in PATH order; use a PowerShell-only install as a fallback.
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) {
+        $command = Get-Command $Name -CommandType ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($command) { return $command.Source }
+    return $null
+}
+
+function Get-VersionToken([string] $Line) {
+    if ($Line -match '\d+\.\d+(\.\d+)?') { return $Matches[0] }
+    return $null
+}
+
+function Get-GoModuleVersion([string] $Exe) {
+    # go install stamps module metadata even when the CLI itself says "unknown".
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $go = Find-Tool go
+        if (-not $go) { return $null }
+        $global:LASTEXITCODE = 0
+        $output = & $go version -m $Exe 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        foreach ($line in $output) {
+            if ("$line" -match '^\s*mod\s+\S+\s+(\S+)') { return $Matches[1] }
+        }
+    } catch { return $null }
+    return $null
+}
+
+function Get-ToolVersion([string] $Exe, [string[]] $Arguments) {
+    # 5.1 wraps native stderr in ErrorRecords: capture it without aborting the report.
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        # Scripts without an explicit exit/native call leave this value untouched.
+        # Reset the global value: a local variable would hide native exit-code updates.
+        $global:LASTEXITCODE = 0
+        $output = & $Exe @Arguments 2>&1
+        $code = $LASTEXITCODE
+        $line = $output | ForEach-Object { "$_" -split '\r?\n' } |
+            Where-Object { $_.Trim() } | Select-Object -First 1
+        if ($code -ne 0) {
+            if ($line) { return "error (exit ${code}): $line" }
+            return "error (exit $code)"
+        }
+        if (-not $line) { return 'error: no output' }
+        $token = Get-VersionToken $line
+        if ($token) { return $token }
+        $module = Get-GoModuleVersion $Exe
+        if ($module) { return $module }
+        return $line
+    } catch {
+        return "error: $(($_.Exception.Message -split '\r?\n')[0])"
+    }
+}
+
+function Get-ToolchainVersions {
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    $version = 'unversioned'
+    try {
+        $git = Find-Tool git
+        if ($git) {
+            $global:LASTEXITCODE = 0
+            $description = & $git -C $script:Root describe --always --dirty 2>$null
+            if ($LASTEXITCODE -eq 0 -and $description) { $version = @($description)[0] }
+        }
+    } catch { $version = 'unversioned' }
+    [pscustomobject] @{ Name = 'agworkbench'; Version = "$version ($script:Root)" }
+    foreach ($name in @('agwinterm', 'claude', 'codex', 'revmux', 'revdiff', 'gh')) {
+        try {
+            $arguments = @('--version')
+            if ($name -eq 'agwinterm') {
+                $exe = Get-AgwintermCtl
+                $arguments = @('version')
+            } else { $exe = Find-Tool $name }
+            $version = 'missing'
+            if ($exe) { $version = Get-ToolVersion $exe $arguments }
+        } catch {
+            $version = "error: $(($_.Exception.Message -split '\r?\n')[0])"
+        }
+        [pscustomobject] @{ Name = $name; Version = $version }
+    }
+}
+
 function Get-AgwintermApp {
     # The installer ships Agwinterm.Win32.exe; the scoop manifest exposes agwinterm.exe.
     foreach ($candidate in @(
