@@ -80,6 +80,7 @@ if ($DryRun) {
 } else {
     $co = New-IssueCheckout -Issue $ref -Title $info.title -Root $config.checkoutRoot
     Grant-CodexTrust -Dir $co.Dir
+    Grant-ClaudeTrust -Dir $co.Dir
 }
 $hubDir = Join-Path $co.Dir '.workbench'
 
@@ -116,7 +117,10 @@ Write-Done "mailbox ready: $hubDir"
 
 # Typed only into the pane this script just created, and only once it shows a shell prompt:
 # the one case where typing a launch line is not a guess about what holds focus.
-if (-not (Wait-ShellPrompt -Pane $right)) {
+# 90 s, not 20: the first live run found the new pane's first prompt (profile + oh-my-posh) arriving
+# after 20 s while Claude booted beside it. Waiting costs nothing - typing early is refused anyway.
+Write-Step "waiting for the right pane's shell prompt"
+if (-not (Wait-ShellPrompt -Pane $right -TimeoutSeconds 90)) {
     Write-Warning "the right pane is not at a shell prompt; start Codex there yourself with:`n  $codexLaunch"
 } else {
     Invoke-Ctl session type --select "$codexLaunch`n" --target $right | Out-Null

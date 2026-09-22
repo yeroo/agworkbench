@@ -58,8 +58,19 @@ function Invoke-Ctl {
     param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $Arguments)
     $ctl = Get-AgwintermCtl
     if (-not $ctl) { throw "agwintermctl not found" }
-    $output = & $ctl @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "agwintermctl $($Arguments -join ' '): $output" }
+    # agwintermctl is .NET and writes stdout in the console code page. Under `pwsh -NoProfile` -
+    # which is how github-workbench.cmd starts this - that is ibm437, and Codex's prompt glyph
+    # U+276F arrives as three wrong characters, so a pane sitting on a prompt never looked like one.
+    # UTF-8 for the call, then put back whatever the caller had.
+    $previous = $null
+    try { $previous = [Console]::OutputEncoding; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { $previous = $null }
+    try {
+        $output = & $ctl @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        if ($null -ne $previous) { try { [Console]::OutputEncoding = $previous } catch { } }
+    }
+    if ($code -ne 0) { throw "agwintermctl $($Arguments -join ' '): $output" }
     return ($output | Out-String).Trim()
 }
 
@@ -261,4 +272,13 @@ function Grant-CodexTrust {
     $entry = "`n[projects.'$key']`ntrust_level = `"trusted`"`n"
     Add-Content -LiteralPath $config -Value $entry -Encoding utf8
     Write-Step "codex: trusted $key (this clone only)"
+}
+
+function Grant-ClaudeTrust {
+    <# Claude Code's folder-trust dialog is not skipped by --dangerously-skip-permissions, and its
+       default is "No, exit". See lib/trust.py for why and how the entry is written. #>
+    param([string] $Dir)
+    $result = & python (Join-Path $script:Lib 'trust.py') --claude $Dir 2>&1
+    if ($LASTEXITCODE -eq 0) { Write-Step "claude: $result (this clone only)" }
+    else { Write-Warning "claude trust not recorded ($result) - answer its trust prompt in the left pane yourself" }
 }
