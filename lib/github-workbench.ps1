@@ -101,17 +101,19 @@ $sessionId = ($sessionId -split '\s+')[0]
 Start-Sleep -Milliseconds 600
 $session = Get-SessionById $sessionId
 if (-not $session) { throw "session $sessionId did not appear in the tree" }
-$left = (Get-PaneIds $session)[0]
+$left = @(Get-PaneIds $session)[0]
+if ($left -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-') { throw "left pane id '$left' is not a pane id" }
 
 # --- 4. the split: Codex on the right ---------------------------------------------------------
 Invoke-Ctl session split on --target $sessionId | Out-Null
 $right = $null
 foreach ($attempt in 1..30) {
     Start-Sleep -Milliseconds 300
-    $fresh = @(Get-PaneIds (Get-SessionById $sessionId)) | Where-Object { $_ -ne $left }
+    $fresh = @(@(Get-PaneIds (Get-SessionById $sessionId)) | Where-Object { $_ -ne $left })
     if ($fresh) { $right = @($fresh)[0]; break }
 }
 if (-not $right) { throw "the split did not appear" }
+if ($right -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-' -or $right -eq $left) { throw "right pane id '$right' is not a distinct pane id" }
 $hubDir = Initialize-Mailbox -Checkout $co.Dir -ClaudePane $left -CodexPane $right
 Write-Done "mailbox ready: $hubDir"
 

@@ -122,6 +122,20 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     return events
 
 
+PANE_ID_RE = __import__("re").compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def check_panes(claude: str, codex: str) -> None:
+    """Refuse to start on pane ids that cannot be right. The first live run passed "4" as Claude's
+    pane and Claude's own pane as Codex's; only the composer check stopped mail going to the
+    wrong agent. A relay that cannot be pointed at the wrong pane is better than one that notices."""
+    for name, pane in (("claude", claude), ("codex", codex)):
+        if not PANE_ID_RE.match(pane or ""):
+            raise SystemExit(f"relay: --{name}-pane {pane!r} is not a pane id")
+    if claude == codex:
+        raise SystemExit("relay: Claude and Codex cannot share a pane")
+
+
 def finished(snapshot: dict[str, Any] | None) -> bool:
     return bool(snapshot) and snapshot.get("state") in ("MERGED", "CLOSED")
 
@@ -257,6 +271,7 @@ def main() -> int:
     parser.add_argument("--pr-interval", type=float, default=60.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    check_panes(args.claude_pane, args.codex_pane)
     peers = [Peer("claude", "claude", args.claude_pane), Peer("codex", "codex", args.codex_pane)]
     relay = Relay(Path(args.hub), peers, args.repo, args.branch, args.mail_interval,
                   args.pr_interval, dry_run=args.dry_run)

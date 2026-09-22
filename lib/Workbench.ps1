@@ -144,8 +144,12 @@ function Get-SessionById([string] $Id) {
 }
 
 function Get-PaneIds($Session) {
-    if ($Session.paneIds) { return @($Session.paneIds) }
-    return @($Session.id)
+    # The leading comma matters: PowerShell unrolls a one-element array returned from a function
+    # into a bare string, and then (Get-PaneIds $s)[0] is its first CHARACTER. An unsplit session
+    # has exactly one pane, so the first live run registered Claude's pane as "4" and handed the
+    # relay Claude's pane as Codex's. Callers wrap in @( ) as well.
+    if ($Session.paneIds) { return ,@($Session.paneIds) }
+    return ,@($Session.id)
 }
 
 function Wait-ShellPrompt {

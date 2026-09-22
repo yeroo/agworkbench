@@ -107,5 +107,21 @@ class Pointer(unittest.TestCase):
         self.assertNotIn(chr(10), relay.pointer_text(message, Path("a"), Path("b")))
 
 
+class PaneIds(unittest.TestCase):
+    GOOD = "461a2dd0-4f22-49c3-a724-90e3b2cde3db"
+
+    def test_a_single_character_is_not_a_pane(self):
+        # the exact value the first live run produced
+        with self.assertRaises(SystemExit):
+            relay.check_panes("4", self.GOOD)
+
+    def test_the_two_agents_cannot_share_a_pane(self):
+        with self.assertRaises(SystemExit):
+            relay.check_panes(self.GOOD, self.GOOD)
+
+    def test_two_distinct_pane_ids_pass(self):
+        relay.check_panes(self.GOOD, "d387360b-a120-4e4b-b7a4-4db3171780ab")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -71,6 +71,20 @@ class IssueRefs(unittest.TestCase):
         self.assertLessEqual(len(slug), 20)
 
 
+class PaneIdsOfASession(unittest.TestCase):
+    def test_an_unsplit_session_yields_its_whole_id_not_its_first_character(self):
+        # PowerShell unrolls a one-element array returned from a function; indexing the result then
+        # takes a character. The first live run registered Claude's pane as "4" this way.
+        result = ps(". ./lib/Workbench.ps1; $s = [pscustomobject]@{ id = 'abc-123' }; "
+                    "(Get-PaneIds $s)[0]; @(Get-PaneIds $s)[0]")
+        self.assertEqual(["abc-123", "abc-123"], result.stdout.split())
+
+    def test_a_split_session_yields_both_panes_in_order(self):
+        result = ps(". ./lib/Workbench.ps1; $s = [pscustomobject]@{ id = 'a'; paneIds = @('p1','p2') }; "
+                    "(Get-PaneIds $s) -join ','")
+        self.assertEqual("p1,p2", result.stdout.strip())
+
+
 class CodexLaunch(unittest.TestCase):
     CHECKOUT = str(ROOT)
 
