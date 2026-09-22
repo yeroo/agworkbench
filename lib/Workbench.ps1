@@ -43,7 +43,12 @@ function Get-AgwintermCtl {
 # --- installed versions ----------------------------------------------------------------------
 
 function Find-Tool([string] $Name) {
-    $command = Get-Command $Name -CommandType Application, ExternalScript -ErrorAction SilentlyContinue
+    # npm installs adjacent .ps1/.cmd shims, and PATH can contain several installs.
+    # Prefer one executable in PATH order; use a PowerShell-only install as a fallback.
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) {
+        $command = Get-Command $Name -CommandType ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
     if ($command) { return $command.Source }
     return $null
 }
@@ -60,6 +65,7 @@ function Get-GoModuleVersion([string] $Exe) {
     try {
         $go = Find-Tool go
         if (-not $go) { return $null }
+        $global:LASTEXITCODE = 0
         $output = & $go version -m $Exe 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
         foreach ($line in $output) {
@@ -74,6 +80,9 @@ function Get-ToolVersion([string] $Exe, [string[]] $Arguments) {
     $ErrorActionPreference = 'Continue'
     $PSNativeCommandUseErrorActionPreference = $false
     try {
+        # Scripts without an explicit exit/native call leave this value untouched.
+        # Reset the global value: a local variable would hide native exit-code updates.
+        $global:LASTEXITCODE = 0
         $output = & $Exe @Arguments 2>&1
         $code = $LASTEXITCODE
         $line = $output | ForEach-Object { "$_" -split '\r?\n' } |
@@ -100,6 +109,7 @@ function Get-ToolchainVersions {
     try {
         $git = Find-Tool git
         if ($git) {
+            $global:LASTEXITCODE = 0
             $description = & $git -C $script:Root describe --always --dirty 2>$null
             if ($LASTEXITCODE -eq 0 -and $description) { $version = @($description)[0] }
         }

@@ -210,6 +210,43 @@ class VersionProbe(VersionFixtures):
                                               "0.154.0", MODULE_VERSION, MODULE_VERSION, "2.94.0"])),
                          self.probe_report())
 
+    def test_duplicate_path_matches_use_the_first_application(self):
+        later = self.tools / "later"
+        later.mkdir()
+        for name in ("git", "codex", "go"):
+            (later / f"{name}.cmd").write_text("@echo off\necho wrong 9.9.9\nexit /b 0\n",
+                                              encoding="utf-8")
+        self.env["PATH"] += os.pathsep + str(later)
+        values = self.probe_report()
+        self.assertEqual(f"0408866-dirty ({ROOT})", values["agworkbench"])
+        self.assertEqual("0.154.0", values["codex"])
+        self.assertEqual(MODULE_VERSION, values["revmux"])
+
+    def test_application_is_preferred_over_adjacent_powershell_shim(self):
+        (self.tools / "codex.ps1").write_text("throw 'PowerShell shim should not run'\n", encoding="utf-8")
+        self.assertEqual("0.154.0", self.probe_report()["codex"])
+
+    def test_powershell_probe_does_not_inherit_a_previous_exit_code(self):
+        pure = self.tools / "pure.ps1"
+        pure.write_text("'pure 1.2.3'\n", encoding="utf-8")
+        result = ps(". ./lib/Workbench.ps1; & $env:COMSPEC /d /c 'exit 5'; "
+                    "Get-ToolVersion " + ps_quote(pure) + " @()", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("1.2.3", result.stdout.strip())
+        self.assertEqual("", result.stderr)
+
+    def test_powershell_git_and_go_fallbacks_reset_previous_exit_codes(self):
+        for name, output in (("git", "0408866-dirty"),
+                             ("go", f"mod example.invalid/tool {MODULE_VERSION}")):
+            (self.tools / f"{name}.cmd").unlink()
+            (self.tools / f"{name}.ps1").write_text(ps_quote(output) + "\n", encoding="utf-8")
+        result = ps(". ./lib/Workbench.ps1; & $env:COMSPEC /d /c 'exit 5'; "
+                    "Get-GoModuleVersion 'unused.exe'", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(MODULE_VERSION, result.stdout.strip())
+        values = self.probe_report("& $env:COMSPEC /d /c 'exit 5'; ")
+        self.assertEqual(f"0408866-dirty ({ROOT})", values["agworkbench"])
+
     def test_everything_missing(self):
         self.env["PATH"] = str(self.tools / "empty")
         values = self.probe_report("function Get-AgwintermCtl { return $null }; ")
@@ -290,10 +327,17 @@ class VersionReport(VersionFixtures):
 
     def test_cmd_wrapper_smoke(self):
         self.env["PATH"] += os.pathsep + str(Path(PWSH).parent)
-        result = subprocess.run([os.environ["COMSPEC"], "/d", "/c", "github-workbench.cmd", "-Version"],
-                                env=self.env, cwd=ROOT, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace")
-        self.assertEqual("0.20.9", self.report(result)["agwinterm"])
+        for no_current_dir in (False, True):
+            with self.subTest(no_current_dir=no_current_dir):
+                if no_current_dir:
+                    self.env["NoDefaultCurrentDirectoryInExePath"] = "1"
+                else:
+                    self.env.pop("NoDefaultCurrentDirectoryInExePath", None)
+                result = subprocess.run([os.environ["COMSPEC"], "/d", "/c",
+                                         str(ROOT / "github-workbench.cmd"), "-Version"],
+                                        env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace")
+                self.assertEqual("0.20.9", self.report(result)["agwinterm"])
 
 
 if __name__ == "__main__":
