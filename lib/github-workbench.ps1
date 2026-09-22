@@ -20,6 +20,7 @@
   github-workbench yeroo/agworkbench#7
   github-workbench https://github.com/yeroo/agworkbench/issues/7
   github-workbench 7 -DryRun              # print what would happen, touch nothing
+  github-workbench -Version              # report the installed toolchain
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -27,14 +28,26 @@ param(
     [string] $Repo,
     [switch] $DryRun,
     [switch] $Yes,
-    [switch] $NoRelay
+    [switch] $NoRelay,
+    [switch] $Version
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Workbench.ps1')
 
+if ($Version) {
+    $others = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'Version' } | Sort-Object)
+    if ($others) {
+        Write-Host "-Version takes no other arguments (got: $($others -join ', '))" -ForegroundColor Yellow
+        exit 2
+    }
+    Get-ToolchainVersions | ForEach-Object { "{0,-12} {1}" -f $_.Name, $_.Version }
+    exit 0
+}
+
 if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes]" -ForegroundColor Yellow
+    Write-Host "       github-workbench -Version"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
 }

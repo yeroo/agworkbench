@@ -48,6 +48,7 @@ github-workbench 42                                         # issue 42 of the re
 github-workbench owner/repo#42
 github-workbench https://github.com/owner/repo/issues/42
 github-workbench owner/repo#42 -DryRun                      # show the plan, touch nothing
+github-workbench -Version                                  # installed toolchain, one line per tool
 ```
 
 Inside agwinterm (or agliteterm) the session opens in that window. From any other terminal it
