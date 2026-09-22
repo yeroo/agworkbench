@@ -1,0 +1,141 @@
+# agworkbench
+
+**Two agents, one GitHub issue, one terminal window.** Claude Code on the left, Codex on the right.
+They agree a plan, Codex implements, Claude reviews, Codex fixes — and it stops when *you* merge
+the pull request.
+
+```
+github-workbench yeroo/agworkbench#7
+```
+
+This is a Windows reproduction of the two-pane workflow umputun runs on macOS with
+[agterm](https://github.com/umputun/agterm) — his cookbook recipe
+[`two-agent-chat`](https://github.com/umputun/agterm/tree/master/cookbook/two-agent-chat) — built on
+[agwinterm](https://github.com/yeroo/agwinterm) and extended into a full issue-to-merge loop with his
+review tools [revmux](https://github.com/umputun/revmux) and [revdiff](https://github.com/umputun/revdiff).
+
+## Why two agents
+
+The value is disagreement. In umputun's words: *"An agent working alone accepts its own reasoning;
+a second one with its own context attacks it first, and what comes back is a located disagreement
+or a checked fact rather than agreement."* Two agents reviewing the same change find different
+defects, and each can refute the other's finding before it reaches you.
+
+## Install
+
+```powershell
+git clone https://github.com/yeroo/agworkbench
+cd agworkbench
+.\install.ps1            # asks before installing anything
+```
+
+It installs what is missing — git, gh, python, node, go (via scoop); agwinterm (via scoop, from
+[yeroo/scoop-bucket](https://github.com/yeroo/scoop-bucket)) with its agent skill and status hooks;
+Claude Code; the Codex CLI; revmux and revdiff (via `go install`, as neither ships a Windows binary)
+— then the `/start-github-issue` command for Claude, the `workbench-implementer` skill for Codex,
+and `github-workbench` on your PATH.
+
+`.\install.ps1 -Bypass` starts Claude with `--dangerously-skip-permissions` in workbench sessions.
+Without it, Claude stops to ask before every shell command and the loop stops with it. Codex is
+sandboxed either way (below).
+
+## Use
+
+From PowerShell or cmd, anywhere:
+
+```
+github-workbench 42                                         # issue 42 of the repo you are in
+github-workbench owner/repo#42
+github-workbench https://github.com/owner/repo/issues/42
+github-workbench owner/repo#42 -DryRun                      # show the plan, touch nothing
+```
+
+Inside agwinterm (or agliteterm) the session opens in that window. From any other terminal it
+starts agwinterm — installing it with scoop first if it is not there — and opens the session there.
+
+In PowerShell, a bare `#42` is a comment. Type `42`, or quote it.
+
+## What happens
+
+```
+ github-workbench owner/repo#42
+   ├─ full clone ~/source/workbench/repo-issue-42, branch issue-42-<slug>
+   ├─ session "#42 <slug>":   [ Claude  |  Codex ]
+   └─ session "#42 relay":    rings panes on mail; watches the PR
+
+ Claude  /start-github-issue owner/repo#42
+   1 intake      reads the issue, writes .workbench/issue.md for Codex
+   2 plan        drafts plan.md  ⇄  Codex critiques  … until "AGREED: plan vK"
+   3 implement   Codex, on the issue branch; commits; runs the tests
+   4 review      revmux round in its own session → Claude verifies findings
+                 ⇄ Codex fixes or disputes with evidence … until clean
+   5 PR          Claude pushes and opens it (Codex has no network)
+   6 you         revdiff opens in front of you — annotate, press q — or review on GitHub
+                 → each round of feedback becomes a fix round for Codex
+   7 merged      you merge; the relay sees it; both agents stop
+```
+
+Nothing polls on an agent's behalf. An agent sends mail and ends its turn; the relay types a
+one-line `Chat from Workbench:` pointer into the recipient's pane, which wakes it. Reports from
+revmux and your revdiff annotations arrive the same way.
+
+## Safety model
+
+**Codex** runs `--sandbox workspace-write --ask-for-approval never`, rooted at the issue's own
+clone. Network access and writes outside the clone are blocked, and the two settings that tune the
+sandbox are pinned on the command line so a config file cannot loosen them. `"allowNetwork": true`
+in `~/.agworkbench.json` is the one way to open the network. Nothing in `codexArgs` may re-decide
+the policy — not by flag, config key, profile, or alias; the test suite pins every spelling.
+
+Because its sandbox denies the terminal's control pipe, Codex cannot type into any pane — and
+doesn't need to: it writes mail files inside its clone, and the relay rings Claude.
+
+**The relay** types only into the two panes of its own session, only into an agent's composer it
+can prove is empty, never into a dialog, and never answers a prompt. A refusal before typing waits
+for the next tick; a failure after typing is never retried, so nothing is ever typed twice.
+
+**Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
+never merges, never force-pushes over commits you have reviewed.
+
+The per-issue clone gets a Codex trust entry in `~/.codex/config.toml` — the same entry Codex
+writes when you answer "Yes" to its trust prompt — because the relay will not answer that prompt
+for you, and the loop would otherwise stop on it for every new issue. Only clones this tool creates
+are trusted.
+
+## Configuration
+
+`~/.agworkbench.json` (created by the installer; all keys optional):
+
+| key | default | meaning |
+|---|---|---|
+| `claudeArgs` | `[]` | extra arguments for `claude` — `-Bypass` puts `--dangerously-skip-permissions` here |
+| `codexArgs` | `[]` | extra arguments for `codex`; anything touching the sandbox policy is refused |
+| `checkoutRoot` | `~/source/workbench` | where per-issue clones go |
+| `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch) |
+
+## Layout
+
+```
+github-workbench.cmd        the command: works in cmd and PowerShell
+install.ps1                 prerequisites, the Claude command, the Codex skill, PATH
+lib/github-workbench.ps1    terminal detection, clone, session, split, relay
+lib/pane-claude.ps1         left pane: claude "/start-github-issue <issue>"
+lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer prompt
+lib/relay.py                mail doorbell and PR watcher
+lib/run-revmux.ps1          one review round, report posted to Claude
+lib/human-review.ps1        revdiff for you, annotations posted to Claude
+lib/wb.py                   opens those sessions for Claude with correct Windows paths
+lib/agmsg.py, hub.py,       the mailbox and the fail-closed pane messenger, vendored from the
+    agw.py, peerchat.py     tested ai-hub tooling
+claude/commands/start-github-issue.md      the loop, from Claude's side
+codex/skills/workbench-implementer/        the loop, from Codex's side
+tests/                      python -m unittest discover -s tests   (no terminal needed)
+```
+
+## Credits
+
+The layout, the peer-chat mechanics and the principle that the value is disagreement are
+umputun's, from agterm's `two-agent-chat` recipe. revmux and revdiff are his too. agwinterm is the
+Windows terminal that makes the rest possible.
+
+MIT licence.

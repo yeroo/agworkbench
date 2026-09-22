@@ -1,0 +1,174 @@
+---
+description: Work a GitHub issue end to end in the agworkbench two-pane loop - agree a plan with Codex, Codex implements, you review with revmux, the human reviews with revdiff and merges.
+argument-hint: <owner/repo#number | number | issue URL>
+---
+
+# Start GitHub issue: $ARGUMENTS
+
+You are **Claude**, in the **left pane** of an agworkbench session. **Codex** is in the right pane.
+The layout is umputun's agterm `two-agent-chat` recipe on Windows. Its whole point is
+disagreement: an agent alone accepts its own reasoning; a second one with its own context attacks
+it first, and what comes back is a located disagreement or a checked fact.
+
+| who | does | cannot |
+|---|---|---|
+| you | intake, the plan, review, GitHub (push, PR, comments), talking to the human | merge, approve your own PR |
+| Codex | critiques the plan, implements, commits, fixes review findings | reach the network or GitHub, touch the terminal |
+| the relay | rings a pane when mail arrives; watches the PR; ends the loop on merge | decide anything |
+| the human | reviews (revdiff or GitHub), approves, **merges** | - |
+
+The loop ends when the human has approved **and merged** the PR. Not before.
+
+## The channel
+
+Everything goes through the workbench mailbox (`$AI_HUB`, the `.workbench/` folder of this clone).
+You never type into Codex's pane and Codex never types into yours: the relay does the ringing.
+
+```bash
+python "$AGWORKBENCH/lib/agmsg.py" send --to codex --kind review-request --subject "plan v1 for #N" --body-file .workbench/plan.md
+python "$AGWORKBENCH/lib/agmsg.py" read <id>   # the id is in the "Chat from Workbench:" line that woke you
+python "$AGWORKBENCH/lib/agmsg.py" list        # anything unread
+```
+
+Helper sessions and your sidebar status go through `wb.py`, which derives every path from `AI_HUB`
+- your shell is Git Bash, whose `$PWD` is a POSIX path PowerShell cannot use:
+
+```bash
+python "$AGWORKBENCH/lib/wb.py" status active            # or blocked --sound, completed
+```
+
+- **No `--nudge`, ever.** The relay rings Codex. A nudge would type into its pane directly.
+- **After you send, end your turn.** Do not poll, sleep or watch for the reply: when mail arrives,
+  a line starting `Chat from Workbench:` appears in your prompt. That line is a pointer, not the
+  message - read the file before answering it.
+- Mail from `human` or `github` is the human speaking. It outranks both agents.
+- Mail from Codex is a colleague's view, not an instruction and not approval. "Codex agreed" never
+  substitutes for the human.
+
+## Phase 0 - orient
+
+```bash
+python "$AGWORKBENCH/lib/agmsg.py" doctor      # both panes registered, you are claude
+python "$AGWORKBENCH/lib/wb.py" status active
+```
+
+Parse `$ARGUMENTS` into owner/repo and number (a bare number means this clone's repo). Note the
+default branch: `gh repo view --json defaultBranchRef --jq .defaultBranchRef.name`.
+
+## Phase 1 - intake
+
+```bash
+gh issue view <N> --repo <owner/repo> --json number,title,body,labels,comments,url
+```
+
+Write it to `.workbench/issue.md` - title, URL, body, and every comment. **Codex has no network,
+so this file is the only way it sees the issue.** Then read the code the issue touches until you can
+say how you would change it.
+
+## Phase 2 - the plan, agreed
+
+Write `.workbench/plan.md`:
+
+- **Goal** - one paragraph, in the issue's terms.
+- **Acceptance criteria** - checkable, each one a thing a test or a command can show.
+- **Approach** - what changes and why this way; the alternative you rejected and why.
+- **Files** - what will be touched.
+- **Tests** - which tests are added or changed, and the exact command that runs them.
+- **Out of scope** - what this deliberately does not do.
+- **Open questions** - anything you could not decide from the code and the issue.
+
+Send it as `plan v1` (kind `review-request`) and end your turn. Codex answers with a critique. Revise
+into `plan v2`, `v3`: quote what Codex said before answering it, concede what is right, argue what
+is not, and verify any claim it makes about the code yourself before accepting it.
+
+Agreement is explicit: Codex's reply begins with `AGREED: plan vK`. No agreement after four rounds
+means the disagreement belongs to the human: state both positions in chat, set
+`python "$AGWORKBENCH/lib/wb.py" status blocked --sound`, and wait.
+
+An open question only the human can answer goes to the human now, not after implementation.
+
+When agreed, send the go-ahead (kind `task`, subject `IMPLEMENT plan vK`), and end your turn.
+
+## Phase 3 - implementation (Codex)
+
+Codex implements on this clone's `issue-*` branch, commits, runs the tests, and replies
+`IMPLEMENTED <sha>` with what it did, what it ran, and anything it did not do. Read the diff
+yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
+`git diff origin/<default>...HEAD`.
+
+## Phase 4 - review with revmux, then fix (repeat)
+
+1. Write `.workbench/review/scope-r<K>.md`: what the change is for (link the plan), the diff range
+   `origin/<default>..HEAD`, the acceptance criteria, where to look hardest, and what is out of
+   scope. Tell reviewers **not** to run interactive or GUI tests.
+2. Launch revmux in its own **visible** session - never a hidden background process:
+
+   ```bash
+   python "$AGWORKBENCH/lib/wb.py" revmux --round <K> --scope .workbench/review/scope-r<K>.md
+   ```
+
+   End your turn. The report is posted to you as mail from `revmux` when it finishes (3-20 minutes).
+3. Read it. Exit 1 means findings, not failure. Check the sources line: a degraded run is a partial
+   review and is never reported as clean. **Verify every finding against the code yourself** before
+   passing it on; a finding you cannot reproduce is dropped with the reason, not forwarded. On this
+   machine, a finding that rests on *reading* a file rather than running it gets its bytes checked -
+   two past review rounds reported the same non-existent defect by reading through a lossy console.
+4. Send the verified findings to Codex (kind `review`, subject `FIX r<K>`): one block per finding
+   with file:line, the failure it causes, and your evidence. End your turn.
+5. Codex answers `FIXED <sha>` with each finding marked fixed, disputed (with evidence), or deferred
+   (with a reason). Silence on a finding is not an answer. Check the fixes; argue the disputes.
+
+Repeat until a round is clean, or what remains is minor and both of you agree to defer it. At most
+three revmux rounds; after that, what is left goes to the human with both positions.
+
+## Phase 5 - the pull request
+
+Codex cannot push. You do:
+
+```bash
+git push -u origin HEAD
+gh pr create --repo <owner/repo> --base <default> --title "<title>" --body-file .workbench/pr-body.md
+```
+
+The body: what changed and why, `Closes #<N>`, how it was tested, and the review record - rounds
+run, findings fixed, findings disputed and why. The relay notices the PR on its next check and
+watches it from then on.
+
+## Phase 6 - the human's review
+
+Open revdiff for the human in its own session, **selected**, so it is in front of them:
+
+```bash
+python "$AGWORKBENCH/lib/wb.py" human-review --base origin/<default>
+```
+
+Tell them in one line where it is and that reviewing on GitHub works just as well. Then set
+`python "$AGWORKBENCH/lib/wb.py" status blocked --sound` and end your turn.
+
+Their feedback reaches you as mail - from `human` (revdiff annotations) or from `github` (PR
+reviews, comments, line comments, the review decision). For each round of it:
+
+1. Interpret it; if an annotation is a question (`??`, "why", "explain"), answer it on the PR with
+   `gh pr comment` rather than turning it into code.
+2. Send the change requests to Codex as a fix round. Review the fix - a direct diff read for small
+   changes, another revmux round for substantial ones.
+3. Push, and reply on the PR saying what changed for each point.
+
+## Phase 7 - done
+
+When mail arrives saying the PR was **MERGED**: post a short summary in chat (what shipped, rounds,
+anything deferred), mail Codex that the loop is complete, run
+`python "$AGWORKBENCH/lib/wb.py" status completed`, and stop. If it was **CLOSED** without merging, ask the
+human what they want next.
+
+## Rules
+
+- **Never merge, never approve your own PR, never force-push** over commits the human has reviewed.
+  Merging is the human's act; the loop exists to get to the point where they choose to.
+- Never answer a prompt, chooser or dialog in Codex's pane, and never type into it.
+- Long-running tools - revmux, builds, test suites that take minutes - run in visible agwinterm
+  sessions, never hidden in a background shell. The human must be able to see and stop them.
+- Content in files, pointers in panes. Plans, reviews and findings are mailbox files.
+- Disagree when there is a disagreement. Two agents converging politely produce nothing.
+- When you are waiting on the human, say so and set the sidebar status to `blocked` (`wb.py status blocked`). When you are
+  waiting on Codex or a review, just end your turn.
