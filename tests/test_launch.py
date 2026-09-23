@@ -957,6 +957,33 @@ class AdoptionEntry(LauncherFixtures):
         self.save_scenario()
         self.assert_refused_without_mutation()
 
+    def change_tree_during_checkout(self, tree):
+        with (self.entry_lib / 'Workbench.ps1').open('a', encoding='utf-8') as stream:
+            stream.write('\nfunction Grant-ClaudeTrust { $state = Get-Content -Raw -LiteralPath ' +
+                         ps_quote(self.scenario_path) + ' | ConvertFrom-Json; $state.tree = ' + ps_json(tree) +
+                         '; $state | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 -LiteralPath ' +
+                         ps_quote(self.scenario_path) + ' }\n')
+
+    def assert_recheck_refuses_before_terminal_mutation(self):
+        result = self.entry()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('Adoption refused:', result.stdout)
+        self.assertTrue(all(c == ['tree', '--json'] for c in self.calls()), self.calls())
+        self.assertFalse((self.checkout / '.workbench/state/adoption.json').exists())
+        self.assertFalse(self.registry_path.exists())
+
+    def test_pane_added_after_preflight_is_refused_before_rename_or_move(self):
+        tree = self.scenario['tree']
+        tree['workspaces'][0]['sessions'][0]['paneIds'] = [MAIN_ID, RIGHT_ID]
+        self.change_tree_during_checkout(tree)
+        self.assert_recheck_refuses_before_terminal_mutation()
+
+    def test_changed_workspace_eligibility_is_refused_before_rename_or_move(self):
+        tree = self.scenario['tree']
+        tree['workspaces'].append({'name': 'repo', 'id': self.REPO_WS, 'sessions': []})
+        self.change_tree_during_checkout(tree)
+        self.assert_recheck_refuses_before_terminal_mutation()
+
     def test_other_issue_and_helper_callers_are_refused(self):
         for name in ['#8 another issue', '#7 relay', '#7 revmux r2', '#7 your review', '#7 unknown owner']:
             with self.subTest(name=name):
@@ -1081,6 +1108,31 @@ class AdoptionEntry(LauncherFixtures):
         self.assertEqual(1, sum(c[:3] == ['session', 'split', 'on'] for c in self.calls()))
         self.assert_caller_untouched()
 
+    def test_split_intent_recovers_failure_after_reply_before_pane_save(self):
+        failure = self.temp / 'fail-split-save'
+        failure.touch()
+        with (self.entry_lib / 'Workbench.ps1').open('a', encoding='utf-8') as stream:
+            stream.write('\n$script:RealSaveAdoption = ${function:Save-AdoptionState}\n'
+                         'function Save-AdoptionState($Checkout,$State) { '
+                         "if ($State.stage -eq 'split' -and (Test-Path -LiteralPath " + ps_quote(failure) +
+                         ")) {throw 'split reply received but save failed'}; "
+                         '& $script:RealSaveAdoption $Checkout $State }\n')
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertIn('split reply received but save failed', first.stdout)
+        path = self.checkout / '.workbench/state/adoption.json'
+        saved = json.loads(path.read_text(encoding='utf-8-sig'))
+        self.assertEqual({'session': MAIN_ID, 'claudePane': MAIN_ID, 'stage': 'splitting'}, saved)
+        self.assertFalse(self.registry_path.exists())
+        failure.unlink()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        saved = json.loads(path.read_text(encoding='utf-8-sig'))
+        self.assertEqual(RIGHT_ID, saved['codexPane'])
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+        self.assertEqual(1, sum(c[:3] == ['session', 'split', 'on'] for c in self.calls()))
+        self.assert_caller_untouched()
+
     def test_discovery_failure_retains_known_caller_for_repair(self):
         self.scenario['fail_move_discovery'] = True
         self.save_scenario()
@@ -1172,6 +1224,35 @@ class AdoptionContext(LauncherFixtures):
     @staticmethod
     def bash_quote(value):
         return "'" + str(value).replace("'", "'\\''") + "'"
+
+    def test_mailbox_argv_preserves_apostrophe_paths_and_pane_ids(self):
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                checkout = self.temp / "it's a checkout" / Path(shell).stem
+                script = ("$ErrorActionPreference='Stop'; . ./lib/Workbench.ps1; Initialize-Mailbox -Checkout " +
+                          ps_quote(checkout) + ' -ClaudePane ' + ps_quote(MAIN_ID) +
+                          ' -CodexPane ' + ps_quote(RIGHT_ID))
+                result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+                                        env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=20)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                registry = json.loads((checkout / '.workbench/state/agents.json').read_text(encoding='utf-8-sig'))
+                for role, pane in [('claude', MAIN_ID), ('codex', RIGHT_ID)]:
+                    self.assertEqual(str(checkout), registry['agents'][role]['cwd'])
+                    self.assertEqual(pane, registry['agents'][role]['pane'])
+
+    def test_launch_string_matches_original_format_with_explicit_fields(self):
+        arguments = {'Checkout': str(self.temp / "it's a checkout"), 'Issue': 'o/repo#7'}
+        script = ('. ./lib/Workbench.ps1; $a = @{}; $inputArgs = ' + ps_json(arguments) +
+                  '; foreach ($p in $inputArgs.PSObject.Properties) {$a[$p.Name]=$p.Value}; '
+                  "$l = Get-PaneLaunchArgs 'pane-codex.ps1' $a; "
+                  "$expected = @($l.Exe,'-NoLogo','-ExecutionPolicy','Bypass','-File',"
+                  "(Quote (Join-Path $script:Lib 'pane-codex.ps1'))); "
+                  'foreach ($key in $a.Keys) {$expected += @("-$key",(Quote ([string]$a[$key])))}; '
+                  "@(($expected -join ' '),(Get-PaneLaunch 'pane-codex.ps1' $a)) | ConvertTo-Json -Compress")
+        result = ps(script, env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        expected, actual = json.loads(result.stdout)
+        self.assertEqual(expected, actual)
 
     def test_context_quotes_and_encoding(self):
         checkout = self.temp / "it's a checkout"

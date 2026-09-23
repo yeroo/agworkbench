@@ -499,7 +499,11 @@ function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $RepoName, [int] $
     if ($ownRecord) {
         if ($adoption.codexPane) {
             $ownRecord = $adoption.codexPane -in $panes -and $adoption.codexPane -ne $caller.Pane
-        } elseif ($panes.Count -eq 2) { $ownRecord = $false }
+        } elseif ($panes.Count -eq 2) {
+            # A durable intent written before split permits recovery when its reply was
+            # received but the new pane id could not be checkpointed.
+            $ownRecord = $adoption.stage -eq 'splitting'
+        }
     }
     $helper = $session.name -match '^#\d+ (relay|revmux r\d+|your review)$|^(relay|revmux|your review)$'
     $foreignIssue = $session.name -match '^#\d+ ' -and -not (Test-IssueSessionName $session.name $Number)
@@ -629,6 +633,9 @@ function Start-WorkbenchSession {
     $script:Launch.ClaudeLaunchRequired = $plan.NeedSplit -and $plan.NewPaneRole -eq 'Claude'
     if ($plan.NeedSplit) {
         Set-LaunchStage split
+        if ($AdoptSession) {
+            Save-AdoptionState $Checkout @{ session = $session.id; claudePane = $CallerPane; stage = 'splitting' }
+        }
         $reply = Invoke-Ctl session split on --target $session.id
         $script:Launch[$plan.NewPaneRole] = ($reply -split '\s+')[0]
         if ($AdoptSession) {
@@ -906,17 +913,22 @@ function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments) {
     # Restricted still runs the pane script - `& 'x.ps1'` alone would be refused there.
     $shell = 'powershell.exe'
     if (Get-Command pwsh -ErrorAction SilentlyContinue) { $shell = 'pwsh' }
-    $parts = @('-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $script:Lib $Script))
-    foreach ($key in $Arguments.Keys) { $parts += @("-$key", [string]$Arguments[$key]) }
-    return @{ Exe = $shell; Args = $parts }
+    $prefix = @('-NoLogo', '-ExecutionPolicy', 'Bypass', '-File')
+    $scriptPath = Join-Path $script:Lib $Script
+    $parameters = @()
+    $parts = $prefix + @($scriptPath)
+    foreach ($key in $Arguments.Keys) {
+        $parameters += @{ Name = "-$key"; Value = [string]$Arguments[$key] }
+        $parts += @("-$key", [string]$Arguments[$key])
+    }
+    return @{ Exe = $shell; Prefix = $prefix; ScriptPath = $scriptPath; Parameters = $parameters; Args = $parts }
 }
 
 function Get-PaneLaunch([string] $Script, [hashtable] $Arguments) {
     $launch = Get-PaneLaunchArgs $Script $Arguments
-    $parts = @($launch.Exe)
-    for ($i = 0; $i -lt $launch.Args.Count; $i++) {
-        if ($i -ge 4 -and $i % 2 -eq 0) { $parts += Quote $launch.Args[$i] }
-        else { $parts += $launch.Args[$i] }
+    $parts = @($launch.Exe) + $launch.Prefix + @((Quote $launch.ScriptPath))
+    foreach ($parameter in $launch.Parameters) {
+        $parts += @($parameter.Name, (Quote $parameter.Value))
     }
     return ($parts -join ' ')
 }
@@ -936,7 +948,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
     [IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
     Write-Host "WORKBENCH ADOPTED`nissue:    $Issue`ncheckout: $Checkout"
     Write-Host "context:  . $(Quote-Bash ($path -replace '\\', '/'))"
-    Write-Host "next:     run the start-github-issue skill for $Issue; prefix EVERY shell command (including wait-mail) with the context line and ' && '"
+    Write-Host "next:     run the start-github-issue skill for $Issue; prefix EVERY shell command (including wait-mail) with the context line and ' && '; use absolute paths under checkout for EVERY loop file read/write and source review, including file tools"
 }
 
 function Invoke-LauncherBody {
@@ -1017,6 +1029,19 @@ function Invoke-LauncherBody {
     }
     $adoptArgs = @{}
     if ($adoptionPlan) {
+        Set-LaunchStage adoption-recheck
+        $currentPlan = Get-AdoptionPlan (Get-Tree) $co.Dir $repoName $ref.Number
+        $previousPanes = (@(Get-PaneIds $adoptionPlan.Session) | Sort-Object) -join ','
+        $currentPanes = (@(Get-PaneIds $currentPlan.Session) | Sort-Object) -join ','
+        if ($currentPlan.Session.id -ne $adoptionPlan.Session.id -or
+            $currentPlan.CallerPane -ne $adoptionPlan.CallerPane -or $currentPanes -ne $previousPanes -or
+            $currentPlan.Workspace.id -ne $adoptionPlan.Workspace.id -or
+            $currentPlan.Workspace.name -ne $adoptionPlan.Workspace.name -or
+            $currentPlan.TargetWorkspace -ne $adoptionPlan.TargetWorkspace -or
+            $currentPlan.Mode -ne $adoptionPlan.Mode) {
+            throw [AdoptRefused]::new('caller panes or workspace eligibility changed during setup; rerun to reassess adoption')
+        }
+        $adoptionPlan = $currentPlan
         Initialize-AdoptedSession $adoptionPlan $co.Dir $repoName $ref.Number $slug
         $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane }
     }

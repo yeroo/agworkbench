@@ -30,6 +30,12 @@ If sourcing or changing directory fails, fix the context before running work com
 continue in the old checkout. Continue this command yourself with the printed issue reference;
 the human does not need to type a slash command into your composer.
 
+Shell context does not change the project root used by Read, Write, Edit, Grep, or other file
+tools. For **every file read or written for this loop**, use an **absolute path under the printed
+`checkout:` directory**, never a relative path. This includes `.workbench/issue.md`, `plan.md`,
+scope and PR body files, and all source files inspected or reviewed. Apply the same rule to file
+paths in shell commands; do not let the original project root select the old checkout.
+
 ## The channel
 
 Everything goes through the workbench mailbox (`$AI_HUB`, the `.workbench/` folder of this clone).
