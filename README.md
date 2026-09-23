@@ -91,9 +91,13 @@ repository names. Ambiguous matches are reported with their session IDs rather t
    7 merged      you merge; the relay sees it; both agents stop
 ```
 
-Nothing polls on an agent's behalf. An agent sends mail and ends its turn; the relay types a
-one-line `Chat from Workbench:` pointer into the recipient's pane, which wakes it. Reports from
-revmux and your revdiff annotations arrive the same way.
+The relay types a one-line `Chat from Workbench:` pointer into the recipient's pane when mail
+arrives. Claude also keeps one `wb.py wait-mail` command running through its background execution;
+the command checks its unread inbox immediately and then waits, waking Claude on mail or timeout.
+Reports from revmux and your revdiff annotations arrive through the same mailbox. You never need
+to type anything to keep the loop moving: a draft in Claude's composer only delays the relay's
+ring, which raises an alert after a minute; the background waiter still wakes Claude. Codex uses
+the relay's queued pointers. Claude stops its waiter when the loop is complete.
 
 ## Safety model
 
