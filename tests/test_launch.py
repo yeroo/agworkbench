@@ -446,7 +446,7 @@ class LauncherFixtures(unittest.TestCase):
                 "$script:Launch = @{Stage='config'; IssueRef='o/repo#7'; Checkout=" +
                 ps_quote(self.checkout) + "}; Enable-LaunchLog; ")
 
-    def flow(self, shell=PWSH, no_relay=False):
+    def flow(self, shell=PWSH, no_relay=False, timeout=40):
         script = (self.setup_ps() + "Connect-LaunchLog " + ps_quote(self.log_path) + "; "
                   "$codexLine = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
                   "; Issue='o/repo#7'}; $claudeLine = Get-PaneLaunch 'pane-claude.ps1' @{Checkout=" +
@@ -459,7 +459,7 @@ class LauncherFixtures(unittest.TestCase):
                   "}; if (-not $ok) {exit 1}; $script:Launch | ConvertTo-Json -Compress")
         return subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
                               env=self.env, cwd=ROOT, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=40)
+                              encoding="utf-8", errors="replace", timeout=timeout)
 
     def resumed(self, right_text="Ask Codex to do anything\ngpt-test", relay=True, panes=2):
         main = {"id": MAIN_ID, "name": "#7 fix-x"}
@@ -477,6 +477,13 @@ class LauncherFixtures(unittest.TestCase):
                     " -ClaudePane " + ps_quote(claude) + " -CodexPane " + ps_quote(codex), env=self.env)
         self.assertEqual(0, result.returncode, result.stderr)
         return json.loads(self.registry_path.read_text(encoding="utf-8"))
+
+    def surviving_codex(self):
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)
+        self.scenario.update(main_id=RIGHT_ID, right_id=OTHER_ID,
+                             tree={"workspaces": [{"name": "repo", "sessions": [{"id": RIGHT_ID, "name": "#7 fix-x"}]}]},
+                             text={RIGHT_ID: "Ask Codex to do anything\ngpt-test"})
+        self.save_scenario()
 
 
 class IssueSessions(LauncherFixtures):
@@ -591,6 +598,7 @@ class LauncherFlow(LauncherFixtures):
         typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
         self.assertEqual([["session", "type", "--select", launch["CodexLaunch"] + "\n", "--target", RIGHT_ID]], typed)
         self.assertIn("pane-codex.ps1'", launch["CodexLaunch"])
+        self.assertFalse(any(c[:2] == ["session", "text"] and c[-1] == MAIN_ID for c in self.calls()))
         commands = [c[:2] for c in self.calls()]
         self.assertEqual([["tree", "--json"], ["session", "new"], ["tree", "--json"],
                           ["session", "split"], ["tree", "--json"], ["session", "text"],
@@ -653,11 +661,7 @@ class LauncherFlow(LauncherFixtures):
         self.assertFalse(any(c[:2] == ["session", "new"] for c in self.calls()))
 
     def test_surviving_codex_gets_a_new_claude_pane(self):
-        self.register(claude=MAIN_ID, codex=RIGHT_ID)
-        self.scenario.update(main_id=RIGHT_ID, right_id=OTHER_ID,
-                             tree={"workspaces": [{"name": "repo", "sessions": [{"id": RIGHT_ID, "name": "#7 fix-x"}]}]},
-                             text={RIGHT_ID: "Ask Codex to do anything\ngpt-test"})
-        self.save_scenario()
+        self.surviving_codex()
         result = self.flow(no_relay=True)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         launch = json.loads(result.stdout.splitlines()[-1])
@@ -668,6 +672,63 @@ class LauncherFlow(LauncherFixtures):
         self.assertEqual(OTHER_ID, registry["agents"]["claude"]["pane"])
         self.assertEqual(RIGHT_ID, registry["agents"]["codex"]["pane"])
         self.assertEqual(["session", "focus", "split", "--target", RIGHT_ID], self.calls()[-1])
+
+    def test_new_claude_is_launched_on_retry_after_mailbox_failure(self):
+        self.surviving_codex()
+        (self.temp / "python.cmd").unlink()
+        failed = self.flow(no_relay=True)
+        self.assertEqual(1, failed.returncode, failed.stdout + failed.stderr)
+        self.assertIn("stage 'mailbox'", failed.stdout)
+        self.assertFalse(any(c[:2] == ["session", "type"] for c in self.calls()))
+        self.cmd("python", f'"{sys.executable}" %*')
+        retry = self.flow(no_relay=True)
+        self.assertEqual(0, retry.returncode, retry.stdout + retry.stderr)
+        launch = json.loads(retry.stdout.splitlines()[-1])
+        typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
+        self.assertEqual([["session", "type", "--select", launch["ClaudeLaunch"] + "\n", "--target", OTHER_ID]], typed)
+        self.assertEqual(1, sum(c[:2] == ["session", "split"] for c in self.calls()))
+        self.assertTrue(launch["ClaudeLaunchRequired"])
+        self.assertTrue(launch["ClaudeTyped"])
+
+    def test_adopted_claude_shell_starts_without_disturbing_codex(self):
+        self.resumed(relay=False)
+        self.scenario["text"][MAIN_ID] = "PS C:\\checkout> "
+        self.save_scenario()
+        result = self.flow(no_relay=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        launch = json.loads(result.stdout.splitlines()[-1])
+        typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
+        self.assertEqual([["session", "type", "--select", launch["ClaudeLaunch"] + "\n", "--target", MAIN_ID]], typed)
+        self.assertFalse(any(c[:2] in (["session", "new"], ["session", "split"]) for c in self.calls()))
+
+    def test_new_claude_shell_timeout_does_not_claim_claude_is_running(self):
+        self.surviving_codex()
+        self.scenario["responses"] = [{"args": "^session text --target " + OTHER_ID + "$", "stdout": ""}]
+        self.save_scenario()
+        result = self.flow(no_relay=True, timeout=120)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("not at a proven shell prompt; start Claude", result.stdout)
+        self.assertIn("ready: Claude (right) still needs starting by hand:", result.stdout)
+        self.assertNotIn("is running /start-github-issue", result.stdout)
+        launch = json.loads(result.stdout.splitlines()[-1])
+        self.assertIn(launch["ClaudeLaunch"], result.stdout)
+        self.assertIn(OTHER_ID + " not-proven timeout last-row= waited=90s", self.log())
+        self.assertFalse(any(c[:2] == ["session", "type"] for c in self.calls()))
+
+    def test_relay_failure_after_both_agents_start_omits_their_repair_lines(self):
+        self.resumed("PS C:\\checkout> ", relay=False)
+        self.scenario["text"][MAIN_ID] = "PS C:\\checkout> "
+        self.scenario["responses"] = [{"args": r"^session new --name #7 relay", "stdout": "forced failure", "exit": 1}]
+        self.save_scenario()
+        result = self.flow()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
+        self.assertEqual([MAIN_ID, RIGHT_ID], [c[-1] for c in typed])
+        repair = result.stdout.split("Launcher stopped at stage 'relay'.", 1)[1]
+        self.assertNotIn("pane-claude.ps1", repair)
+        self.assertNotIn("pane-codex.ps1", repair)
+        self.assertIn("In the relay's shell", repair)
+        self.assertIn("python 'relay.py'", repair)
 
     def test_changed_panes_stop_running_relay_before_restart(self):
         self.resumed(panes=1)
@@ -767,8 +828,10 @@ class LauncherFlow(LauncherFixtures):
                 self.save_scenario()
                 result = self.flow()
                 self.assertEqual(1, result.returncode, result.stdout + result.stderr)
-                for text in ("pane-codex.ps1", "python 'relay.py'", "--codex-pane '" + RIGHT_ID + "'", str(self.checkout)):
+                for text in ("python 'relay.py'", "--codex-pane '" + RIGHT_ID + "'", str(self.checkout)):
                     self.assertIn(text, result.stdout)
+                repair = result.stdout.split("Launcher stopped at stage ", 1)[1]
+                self.assertEqual(pattern == r"^session type", "pane-codex.ps1" in repair)
 
     @unittest.skipUnless(WINDOWS_PS, "Windows PowerShell not installed")
     def test_windows_powershell_split_failure(self):

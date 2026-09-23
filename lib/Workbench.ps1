@@ -473,6 +473,8 @@ function Start-WorkbenchSession {
     if ($plan.ClaudeSlot -eq 'split') { $claudeSide = 'right'; $codexSide = 'left' }
     $script:Launch.Claude = $plan.Claude
     $script:Launch.Codex = $plan.Codex
+    # A new Claude pane needs a launch even if its shell never becomes ready.
+    # Existing Claude panes become launch candidates only after a shell is proven below.
     $script:Launch.ClaudeLaunchRequired = $plan.NeedSplit -and $plan.NewPaneRole -eq 'Claude'
     if ($plan.NeedSplit) {
         Set-LaunchStage split
@@ -513,7 +515,9 @@ function Start-WorkbenchSession {
     $script:Launch.RelayCommand = & $RelayCommand $hub $script:Launch.Claude $script:Launch.Codex
     Write-Done "mailbox ready: $hub"
     $roles = @('Codex')
-    if ($script:Launch.ClaudeLaunchRequired) { $roles = @('Claude', 'Codex') }
+    # A previous run may have split or registered an empty Claude pane before failing.
+    # Fresh sessions already start Claude through --command; never probe/type that pane.
+    if ($script:Launch.Adopted) { $roles = @('Claude', 'Codex') }
     foreach ($role in $roles) {
         Set-LaunchStage $role.ToLowerInvariant()
         $line = $script:Launch["${role}Launch"]
@@ -524,6 +528,7 @@ function Start-WorkbenchSession {
         $timeout = 3
         if ($freshPane) { $timeout = 90 }
         if (Wait-ShellPrompt -Pane $script:Launch[$role] -TimeoutSeconds $timeout -Adopted:(-not $freshPane)) {
+            if ($role -eq 'Claude') { $script:Launch.ClaudeLaunchRequired = $true }
             Invoke-Ctl session type --select "$line`n" --target $script:Launch[$role] | Out-Null
             $script:Launch["${role}Typed"] = $true
             Write-Done "$role starting in the $side pane"
@@ -568,7 +573,11 @@ function Start-WorkbenchSession {
     Invoke-Ctl session select $script:Launch.SessionId | Out-Null
     Invoke-Ctl session focus $plan.ClaudeSlot --target $script:Launch.SessionId | Out-Null
     Set-LaunchStage ready
-    Write-Done "ready: Claude ($claudeSide) is running /start-github-issue $($script:Launch.IssueRef)"
+    if ($script:Launch.ClaudeLaunchRequired -and -not $script:Launch.ClaudeTyped) {
+        Write-Done "ready: Claude ($claudeSide) still needs starting by hand:`n  $ClaudeLaunch"
+    } else {
+        Write-Done "ready: Claude ($claudeSide) is running /start-github-issue $($script:Launch.IssueRef)"
+    }
     return $script:Launch
 }
 
@@ -579,10 +588,12 @@ function Format-RepairMessage($Launch) {
     }
     if ($Launch.DryRun) { return $lines -join "`n" }
     if ($Launch.MailboxReady) {
-        if ($Launch.ClaudeLaunchRequired) {
+        if ($Launch.ClaudeLaunchRequired -and -not $Launch.ClaudeTyped) {
             $lines += "In the Claude pane, once it is at an empty shell prompt: $($Launch.ClaudeLaunch)"
         }
-        $lines += "In the Codex pane, once it is at an empty shell prompt: $($Launch.CodexLaunch)"
+        if (-not $Launch.CodexTyped) {
+            $lines += "In the Codex pane, once it is at an empty shell prompt: $($Launch.CodexLaunch)"
+        }
         if (-not $Launch.NoRelay -and $Launch.RelayCommand) {
             if ($Launch.RelayStopFile) {
                 $lines += "Only after the old relay has exited, clear its stop request: Remove-Item -LiteralPath $(Quote $Launch.RelayStopFile)"
