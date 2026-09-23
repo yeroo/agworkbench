@@ -218,10 +218,12 @@ class Relay:
         saved_branch = self.state.get('branch', (saved_pr or {}).get('headRefName'))
         changed = self.state.get('branch') != self.branch
         if saved_branch != self.branch or (saved_pr and saved_pr.get('headRefName') != self.branch):
-            stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
-            self.log(f"discarding saved PR state for branch {stale_branch} "
-                     f"(this relay watches {self.branch})")
-            for key in ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs'):
+            branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs')
+            if saved_branch is not None or any(self.state.get(key) for key in branch_keys):
+                stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
+                self.log(f"discarding saved PR state for branch {stale_branch} "
+                         f"(this relay watches {self.branch})")
+            for key in branch_keys:
                 self.state.pop(key, None)
             saved_pr = None
             changed = True
@@ -410,7 +412,10 @@ class Relay:
         if snapshot.get('isCrossRepository') is not False or snapshot.get('headRefName') != self.branch:
             self.log(f'ignoring PR #{number}: head repository or branch does not match')
             return None
-        snapshot['inline'] = gh_pages(f'repos/{self.repo}/pulls/{number}/comments') or []
+        inline = gh_pages(f'repos/{self.repo}/pulls/{number}/comments')
+        if inline is None:
+            return None
+        snapshot['inline'] = inline
         return snapshot
 
     def watch_pr(self) -> bool:
@@ -443,6 +448,9 @@ class Relay:
         if not self.dry_run:
             if snapshot.get('state') == 'OPEN':
                 seen_open.add(snapshot['number'])
+                for key in ('completed_prs', 'ignored_prs'):
+                    if snapshot['number'] in self.state.get(key, []):
+                        self.state[key] = [number for number in self.state[key] if number != snapshot['number']]
             self.state['seen_open'] = sorted(seen_open)
             self.state["pr"] = snapshot
             self.state['terminal_mail'] = terminal_mail
@@ -475,13 +483,19 @@ class Relay:
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()
                 resets = {key for key, held in self.holds.items() if held.clear_pending}
+                resets.update((box, '') for box in self.state.get('reset_pending', []))
                 if not pending and not resets:
                     self.retire(self.state['pr']['number'])
                     self.log("PR is finished; final notices delivered or read; the relay's job is done")
                     return 0
                 if now() >= drain_deadline:
-                    detail = '; '.join(f"{box}/{mid}: {self.holds[(box, mid)].reason if (box, mid) in self.holds else 'not delivered'}"
-                                       for box, mid in sorted(pending | resets))
+                    details = []
+                    for box, mid in sorted(pending | resets):
+                        held = self.holds.get((box, mid))
+                        reason = (held.reason if held else 'status reset pending' if (box, mid) in resets
+                                  else 'not delivered')
+                        details.append(f'{box}/{mid}: {reason}')
+                    detail = '; '.join(details)
                     self.log(f"PR is finished; drain deadline reached; still held or awaiting status reset: {detail}")
                     return 0
             elif now() >= next_pr:

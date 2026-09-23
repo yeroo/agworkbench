@@ -646,6 +646,70 @@ class GithubLookup(DeliveryFixture):
         self.r.hub.write_message.assert_not_called()
         self.assertEqual('OPEN', self.r.state['pr']['state'])
 
+    def test_failed_inline_lookup_preserves_snapshot_and_does_not_repeat_comments(self):
+        self.open_pages = [[rest_pr(53)]]
+        self.views[53] = with_(OPEN, number=53)
+        self.inline_pages = [[{'id': 1, 'path': 'a.py', 'line': 4, 'body': 'fix this',
+                               'user': {'login': 'reviewer'}}]]
+        self.assertFalse(self.r.watch_pr())
+        before = copy.deepcopy(self.r.state)
+        self.r.hub.write_message.reset_mock()
+        self.r._save.reset_mock()
+
+        def transient_failure(argv, **kwargs):
+            if argv[1] == 'api' and argv[2].endswith('/comments'):
+                return SimpleNamespace(returncode=1, stdout='')
+            return self.command(argv, **kwargs)
+
+        self.gh.side_effect = transient_failure
+        self.assertFalse(self.r.watch_pr())
+        self.assertEqual(before, self.r.state)
+        self.r._save.assert_not_called()
+        self.gh.side_effect = self.command
+        self.assertFalse(self.r.watch_pr())
+        self.r.hub.write_message.assert_not_called()
+
+    def test_retired_closed_pr_can_reopen_and_merge_after_restart(self):
+        self.use_disk_state()
+        self.r.peers.append(relay.Peer('claude', 'claude', 'claude-pane'))
+        self.unread = {'codex': [], 'claude': []}
+        filed = []
+
+        def write(**message):
+            mid = f'reopened-{len(filed)}'
+            filed.append(message)
+            self.messages[mid] = dict(message, id=mid)
+            self.unread[message['to']].append(mid)
+            return Path(mid + '.md')
+
+        self.r.hub.write_message = Mock(side_effect=write)
+        self.history_pages = [[rest_pr(51, state='closed'), rest_pr(53, state='closed')]]
+        self.assertFalse(self.r.watch_pr())
+        self.assertEqual([51, 53], self.r.state['ignored_prs'])
+
+        for ending in ['CLOSED', 'MERGED']:
+            self.restart_from_disk()
+            self.r.fetch_pr = relay.Relay.fetch_pr.__get__(self.r)
+            self.open_pages = [[rest_pr(53)]]
+            self.views[53] = with_(OPEN, number=53)
+            self.assertFalse(self.r.watch_pr())
+            stored = json.loads(self.r.state_file.read_text())
+            self.assertEqual([51], stored['ignored_prs'])
+            self.assertNotIn(53, stored.get('completed_prs', []))
+            self.open_pages = [[]]
+            self.views[53] = with_(OPEN, number=53, state=ending)
+            self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 60)
+
+            def advance(seconds):
+                self.t += seconds
+
+            with patch.object(relay, 'pause', advance):
+                self.assertEqual(0, self.r.run())
+            self.assertEqual([53], json.loads(self.r.state_file.read_text())['completed_prs'])
+            self.assertIsNone(self.r.state.get('pr'))
+            self.assertEqual({'claude', 'codex'}, {m['to'] for m in filed if ending in m['subject']})
+        self.assertEqual(2, sum(m['subject'] == 'PR #53 is open' for m in filed))
+
     def test_query_encodes_branch_name(self):
         self.r.branch = 'feature/a&b#c'
         self.assertIsNone(self.r.fetch_pr())
@@ -728,6 +792,24 @@ class BranchState(DeliveryFixture):
     def save_legacy(self, state):
         self.r.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.r.state_file.write_text(json.dumps(state), encoding='utf-8')
+
+    def test_fresh_state_is_scoped_without_a_discard_log(self):
+        self.use_disk_state()
+        self.save_legacy({'announced': [], 'pr': None})
+        self.logs.clear()
+        self.restart_from_disk()
+        self.assertEqual('issue-6', json.loads(self.r.state_file.read_text())['branch'])
+        self.assertFalse(any('discarding saved PR state' in line for line in self.logs))
+
+    def test_unscoped_saved_branch_state_still_logs_its_discard(self):
+        self.use_disk_state()
+        for state in [{'announced': [], 'ignored_prs': [51]},
+                      {'announced': [], 'branch': 'old-branch'}]:
+            self.save_legacy(state)
+            self.logs.clear()
+            self.restart_from_disk()
+            self.assertEqual(1, sum('discarding saved PR state' in line for line in self.logs))
+            self.assertEqual('issue-6', json.loads(self.r.state_file.read_text())['branch'])
 
     def test_legacy_open_observation_survives_an_offline_merge(self):
         self.use_disk_state()
@@ -957,6 +1039,24 @@ class FinalNotices(DeliveryFixture):
         self.assertEqual(2, self.r.fetch_pr.call_count)
         self.assertFalse(any('resuming final notice drain' in line for line in self.logs))
         self.assertEqual(self.r.state, json.loads(self.r.state_file.read_text()))
+
+    def test_persisted_status_reset_blocks_retirement_even_if_its_hold_is_dropped(self):
+        self.prepare_final()
+        self.use_disk_state()
+        self.assertTrue(self.r.watch_pr())
+        self.r.state['announced'] = ['final-claude']
+        self.r.state['reset_pending'] = ['claude']
+        self.r._save()
+        self.restart_from_disk()
+        self.r.holds.clear()  # The mailbox-owned reset must outlive a lost in-memory hold.
+        self.assertEqual(0, self.r.run())
+        self.assertEqual(relay.TERMINAL_DRAIN_TIMEOUT, self.t)
+        self.assertNotIn(7, self.r.state.get('completed_prs', []))
+        self.assertEqual(['claude'], self.r.state['reset_pending'])
+        self.assertIn('claude/', self.logs[-1])
+        self.assertIn('status reset pending', self.logs[-1])
+        self.assertEqual(self.r.state, json.loads(self.r.state_file.read_text()))
+        self.send.assert_not_called()
 
 
 if __name__ == "__main__":

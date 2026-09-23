@@ -54,6 +54,13 @@ def pane_command(script: str, **params: str) -> str:
 
 def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
     args = {"name": name, "cwd": str(cwd), "command": command}
+    pane = agw.my_pane()
+    found = agw.find_pane(pane, agw.tree()) if pane else None
+    workspace = found[0].get('id') if found else None
+    if workspace:
+        args['workspace'] = workspace
+    else:
+        print('wb: caller workspace not found; opening helper in the active workspace', file=sys.stderr)
     if not select:
         args["no-select"] = True
     result = agw.request("session.new", args=args)

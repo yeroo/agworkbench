@@ -54,13 +54,18 @@ class Submission(unittest.TestCase):
         frame = CODEX_QUEUED.replace('step 1:', 'step 2:')
         self.assertEqual('submitted', self.send(FakeAgw(after=lambda f: frame)))
 
-    def test_claude_queued_placeholder_is_empty_and_reports_queued(self):
+    def test_claude_queued_placeholder_after_our_submit_reports_queued(self):
         frame = claude('Press up to edit queued messages')
-        for initial in [CLAUDE_IDLE, frame]:
-            with self.subTest(initial=initial):
-                fake = FakeAgw('claude', frames=[initial, claude(TEXT), frame])
-                self.assertEqual('queued', self.send(fake))
-                self.assertEqual([TEXT, '\n'], fake.keys)
+        fake = FakeAgw('claude', frames=[CLAUDE_IDLE, claude(TEXT), frame])
+        self.assertEqual('queued', self.send(fake))
+        self.assertEqual([TEXT, '\n'], fake.keys)
+
+    def test_claude_queue_placeholder_before_typing_is_refused_as_a_possible_draft(self):
+        frame = claude('Press up to edit queued messages')
+        fake = FakeAgw('claude', frames=[frame])
+        with self.environment(fake), self.assertRaisesRegex(peerchat.Refused, 'not empty'):
+            peerchat.send_once('pane', peerchat.PROFILES['claude'], TEXT, dry_run=False)
+        self.assertEqual([], fake.keys)
 
     def test_claude_queue_placeholder_with_extra_content_is_not_empty(self):
         for extra in [' and an unsent draft', '\n  1. Yes\n  2. No']:
