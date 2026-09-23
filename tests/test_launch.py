@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -844,9 +845,409 @@ class LauncherFlow(LauncherFixtures):
         self.assertEqual(1, result.stdout.count("Launcher failed:"))
 
 
+class AdoptionEntry(LauncherFixtures):
+    CALLER_WS = '55555555-5555-4555-8555-555555555555'
+    REPO_WS = '66666666-6666-4666-8666-666666666666'
+
+    def setUp(self):
+        super().setUp()
+        for key in list(self.env):
+            if key.startswith('CODEX_') or key.startswith('CLAUDE'):
+                self.env.pop(key)
+        self.env.update(CLAUDECODE='1', AGWINTERM_PANE_ID=MAIN_ID, AGWINTERM_SESSION_ID=MAIN_ID)
+        self.scenario['workspace_id'] = self.REPO_WS
+        self.scenario['tree'] = {'workspaces': [{'id': self.CALLER_WS, 'name': 'prepared',
+                                                'sessions': [{'id': MAIN_ID, 'name': 'prepared Claude'}]}]}
+        self.scenario['text'] = {MAIN_ID: 'PS C:\\looks-like-a-shell> '}
+        self.save_scenario()
+        self.effects = self.temp / 'effects.txt'
+        self.fail_registration = self.temp / 'fail-registration'
+        # Real entry point and setup logic; replace only checkout/trust and the interactive
+        # Claude boundary. No network, user trust files, or actual agent can be reached.
+        self.entry_lib = self.temp / 'entry lib'
+        self.entry_lib.mkdir()
+        for name in ['github-workbench.ps1', 'hub.py']:
+            shutil.copyfile(LIB / name, self.entry_lib / name)
+        overrides = (
+            "\nfunction Get-IssueInfo { return @{ title='fix-x'; state='OPEN' } }\n"
+            "function New-IssueCheckout { Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value checkout; "
+            "Connect-LaunchLog " + ps_quote(self.log_path) + "; return @{Dir=" + ps_quote(self.checkout) +
+            "; Branch='issue-7-fix-x'} }\n"
+            "function Grant-CodexTrust { Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value codex-trust }\n"
+            "function Grant-ClaudeTrust { Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value claude-trust }\n"
+            "$script:RealMailbox = ${function:Initialize-Mailbox}\n"
+            "function Initialize-Mailbox { param($Checkout,$ClaudePane,$CodexPane); "
+            "if (Test-Path -LiteralPath " + ps_quote(self.fail_registration) + ") {throw 'registration failed'}; "
+            "& $script:RealMailbox -Checkout $Checkout -ClaudePane $ClaudePane -CodexPane $CodexPane }\n"
+            "function Invoke-ClaudeHere { param($Checkout,$Issue); "
+            "Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value claude-here; "
+            "Write-Output \"CLAUDE-HERE: $Checkout $Issue\"; $global:LASTEXITCODE=0 }\n")
+        (self.entry_lib / 'Workbench.ps1').write_text(
+            (LIB / 'Workbench.ps1').read_text(encoding='utf-8-sig') + overrides, encoding='utf-8')
+
+    def entry(self, *args, shell=PWSH):
+        return subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                               str(self.entry_lib / 'github-workbench.ps1'), 'o/repo#7', *args],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=40)
+
+    def current(self):
+        return json.loads(self.scenario_path.read_text(encoding='utf-8'))
+
+    def assert_caller_untouched(self):
+        self.assertFalse(any(c[:2] in [['session', 'type'], ['session', 'text']] and c[-1] == MAIN_ID
+                             for c in self.calls()), self.calls())
+
+    def assert_refused_without_mutation(self, *args):
+        before = {p: p.read_bytes() for p in self.checkout.rglob('*') if p.is_file()}
+        result = self.entry(*args)
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('Adoption refused:', result.stdout)
+        self.assertNotIn('Launcher stopped', result.stdout)
+        self.assertFalse(self.effects.exists())
+        self.assertTrue(all(c == ['tree', '--json'] for c in self.calls()), self.calls())
+        self.assertEqual(before, {p: p.read_bytes() for p in self.checkout.rglob('*') if p.is_file()})
+        return result
+
+    def test_claude_adopts_once_and_rerun_never_probes_or_types_into_caller(self):
+        first = self.entry()
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.assertIn('WORKBENCH ADOPTED', first.stdout)
+        self.assertIn(str(self.checkout), first.stdout)
+        self.assertNotIn('CLAUDE-HERE:', first.stdout)
+        self.assert_caller_untouched()
+        creates = [c for c in self.calls() if c[:2] == ['session', 'new']]
+        self.assertEqual(1, len(creates))
+        self.assertEqual('#7 relay', creates[0][creates[0].index('--name') + 1])
+        self.assertEqual('repo', creates[0][creates[0].index('--workspace-name') + 1])
+        state = self.current()
+        workspace = next(w for w in state['tree']['workspaces'] if w['id'] == self.REPO_WS)
+        self.assertEqual(['#7 fix-x', '#7 relay'], [s['name'] for s in workspace['sessions']])
+        registry = json.loads(self.registry_path.read_text(encoding='utf-8-sig'))
+        self.assertEqual(MAIN_ID, registry['agents']['claude']['pane'])
+        self.assertEqual(RIGHT_ID, registry['agents']['codex']['pane'])
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+        self.assertEqual(1, sum(c[:3] == ['session', 'split', 'on'] for c in self.calls()))
+        self.assert_caller_untouched()
+
+    def test_shell_starts_claude_after_setup_with_stdout_intact(self):
+        self.env.pop('CLAUDECODE')
+        self.env['CODEX_HOME'] = 'configuration-only'
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('CLAUDE-HERE: ' + str(self.checkout) + ' o/repo#7', result.stdout)
+        self.assertLess(result.stdout.index('WORKBENCH ADOPTED'), result.stdout.index('CLAUDE-HERE:'))
+        self.assertEqual('claude-here', self.effects.read_text(encoding='utf-8-sig').splitlines()[-1])
+        self.assert_caller_untouched()
+
+    def test_shell_dry_run_has_no_mutations_or_claude_invocation(self):
+        self.env.pop('CLAUDECODE')
+        result = self.entry('-DryRun')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('would adopt-fresh', result.stdout)
+        self.assertNotIn('CLAUDE-HERE:', result.stdout)
+        self.assertEqual([['tree', '--json']], self.calls())
+        self.assertFalse(self.effects.exists())
+        self.assertEqual([], list(self.checkout.iterdir()))
+
+    def test_foreign_split_is_refused_before_checkout_or_trust(self):
+        self.scenario['tree']['workspaces'][0]['sessions'][0]['paneIds'] = [MAIN_ID, RIGHT_ID]
+        self.save_scenario()
+        self.assert_refused_without_mutation()
+
+    def test_other_issue_and_helper_callers_are_refused(self):
+        for name in ['#8 another issue', '#7 relay', '#7 revmux r2', '#7 your review', '#7 unknown owner']:
+            with self.subTest(name=name):
+                self.scenario['tree']['workspaces'][0]['sessions'][0]['name'] = name
+                self.save_scenario()
+                self.assert_refused_without_mutation()
+
+    def test_missing_caller_is_refused(self):
+        self.env['AGWINTERM_PANE_ID'] = OTHER_ID
+        self.assert_refused_without_mutation()
+
+    def test_registered_codex_is_refused(self):
+        self.register(claude=OTHER_ID, codex=MAIN_ID)
+        self.assert_refused_without_mutation()
+
+    def test_duplicate_repo_workspaces_are_refused_with_ids(self):
+        self.scenario['tree']['workspaces'].extend([
+            {'name': 'repo', 'id': self.REPO_WS, 'sessions': []},
+            {'name': 'repo', 'id': OTHER_ID, 'sessions': []}])
+        self.save_scenario()
+        result = self.assert_refused_without_mutation()
+        self.assertIn(self.REPO_WS, result.stdout)
+        self.assertIn(OTHER_ID, result.stdout)
+
+    def test_runtime_codex_markers_are_refused(self):
+        self.env.pop('CLAUDECODE')
+        for marker in ['CODEX_SANDBOX', 'CODEX_THREAD_ID']:
+            with self.subTest(marker=marker):
+                self.env[marker] = 'runtime'
+                self.assert_refused_without_mutation()
+                self.env.pop(marker)
+
+    def test_claude_marker_wins_and_another_repo_same_number_does_not_conflict(self):
+        self.env.update(CODEX_HOME='configuration', CODEX_SANDBOX='inherited')
+        self.scenario['tree']['workspaces'].append(
+            {'name': 'another-repo', 'id': OTHER_ID, 'sessions': [{'id': RIGHT_ID, 'name': '#7 elsewhere'}]})
+        # Only the other repo owns RIGHT_ID; give our new split a different id.
+        self.scenario['right_id'] = RELAY_ID
+        self.save_scenario()
+        result = self.entry('-NoRelay')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertNotIn('CLAUDE-HERE:', result.stdout)
+        self.assert_caller_untouched()
+
+    def test_stale_registry_is_ignored(self):
+        self.register(claude=OTHER_ID, codex=RIGHT_ID)
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('stale', self.log())
+        self.assert_caller_untouched()
+
+    def test_registered_own_session_resumes_without_adoption_record(self):
+        self.scenario['tree'] = {'workspaces': [{'name': 'repo', 'id': self.REPO_WS, 'sessions': [
+            {'id': MAIN_ID, 'name': '#7 fix-x', 'paneIds': [MAIN_ID, RIGHT_ID]}]}]}
+        self.scenario['text'][RIGHT_ID] = 'Ask Codex to do anything\ngpt-test'
+        self.save_scenario()
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)
+        result = self.entry('-NoRelay')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse(any(c[:2] in [['workspace', 'new'], ['session', 'move'], ['session', 'type']]
+                             or c[:3] == ['session', 'split', 'on'] for c in self.calls()))
+        self.assert_caller_untouched()
+
+    def recover_ctl_failure(self, pattern, stage):
+        self.env.pop('CLAUDECODE')
+        self.scenario['responses'] = [{'args': pattern, 'stdout': 'injected failure', 'exit': 1, 'once': True}]
+        self.save_scenario()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertIn("stage '" + stage + "'", first.stdout)
+        self.assertIn(MAIN_ID, first.stdout)
+        self.assertNotIn('CLAUDE-HERE:', first.stdout)
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+        self.assertEqual(1, self.effects.read_text(encoding='utf-8-sig').splitlines().count('claude-here'))
+        self.assert_caller_untouched()
+
+    def test_recovers_rename_failure(self):
+        self.recover_ctl_failure(r'^session rename', 'adopt-rename')
+
+    def test_recovers_workspace_creation_failure(self):
+        self.recover_ctl_failure(r'^workspace new', 'adopt-workspace')
+
+    def test_recovers_move_failure(self):
+        self.recover_ctl_failure(r'^session move', 'adopt-move')
+
+    def test_recovers_split_failure(self):
+        self.recover_ctl_failure(r'^session split on', 'split')
+
+    def test_recovers_codex_launch_failure(self):
+        self.recover_ctl_failure(r'^session type', 'codex')
+
+    def test_recovers_relay_failure_without_second_codex(self):
+        self.recover_ctl_failure(r'^session new --name #7 relay', 'relay')
+
+    def test_split_is_saved_before_mailbox_registration(self):
+        self.fail_registration.touch()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        saved = json.loads((self.checkout / '.workbench/state/adoption.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(RIGHT_ID, saved['codexPane'])
+        self.assertEqual('split', saved['stage'])
+        self.fail_registration.unlink()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+        self.assertEqual(1, sum(c[:3] == ['session', 'split', 'on'] for c in self.calls()))
+        self.assert_caller_untouched()
+
+    def test_split_reply_is_saved_before_confirmation(self):
+        self.scenario['fail_split_confirmation'] = True
+        self.save_scenario()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertFalse(self.registry_path.exists())
+        saved = json.loads((self.checkout / '.workbench/state/adoption.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual(RIGHT_ID, saved['codexPane'])
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+        self.assertEqual(1, sum(c[:3] == ['session', 'split', 'on'] for c in self.calls()))
+        self.assert_caller_untouched()
+
+    def test_discovery_failure_retains_known_caller_for_repair(self):
+        self.scenario['fail_move_discovery'] = True
+        self.save_scenario()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertIn("stage 'discovery'", first.stdout)
+        self.assertIn('SessionId: ' + MAIN_ID, first.stdout)
+        self.assertIn('Claude: ' + MAIN_ID, first.stdout)
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+        self.assert_caller_untouched()
+
+    def test_new_codex_prompt_timeout_does_not_start_shell_claude(self):
+        self.env.pop('CLAUDECODE')
+        with (self.entry_lib / 'Workbench.ps1').open('a', encoding='utf-8') as stream:
+            stream.write('\nfunction Wait-ShellPrompt { param($Pane,$TimeoutSeconds,[switch]$Adopted); '
+                         "if ($TimeoutSeconds -ne 90 -or $Adopted) {throw 'incorrect fresh pane wait'}; return $false }\n")
+        result = self.entry('-NoRelay')
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn('new Codex pane did not reach a shell prompt', result.stdout)
+        self.assertNotIn('CLAUDE-HERE:', result.stdout)
+        self.assertFalse(any(c[:2] == ['session', 'type'] for c in self.calls()))
+        self.assert_caller_untouched()
+
+    def test_invalid_workspace_reply_does_not_invent_destination(self):
+        self.scenario['responses'] = [{'args': r'^workspace new', 'stdout': 'created', 'once': True}]
+        self.save_scenario()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertIn('invalid id', first.stdout)
+        self.assertFalse(any(c[:2] == ['session', 'move'] for c in self.calls()))
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual([RIGHT_ID], self.current()['successful_types'])
+
+    def test_saved_record_does_not_authorize_a_different_second_pane(self):
+        self.fail_registration.touch()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        state = self.current()
+        next(s for w in state['tree']['workspaces'] for s in w['sessions'] if s['id'] == MAIN_ID)['paneIds'] = [MAIN_ID, OTHER_ID]
+        self.scenario = state
+        self.save_scenario()
+        self.effects.unlink()
+        self.calls_path.unlink()
+        self.assert_refused_without_mutation()
+
+    def test_new_session_uses_existing_creation_path(self):
+        result = self.entry('-NewSession', '-NoRelay')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertNotIn('WORKBENCH ADOPTED', result.stdout)
+        self.assertNotIn('CLAUDE-HERE:', result.stdout)
+        self.assertTrue(any(c[:2] == ['session', 'new'] for c in self.calls()))
+        self.assertFalse(any(c[:2] in [['session', 'rename'], ['session', 'move'], ['workspace', 'new']]
+                             for c in self.calls()))
+
+    def test_outside_terminal_uses_existing_creation_path(self):
+        self.env['AGWINTERM_ENABLED'] = '0'
+        with (self.entry_lib / 'Workbench.ps1').open('a', encoding='utf-8') as stream:
+            stream.write('\nfunction Test-AgwintermRunning { return $true }\n')
+        result = self.entry('-NoRelay')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertNotIn('WORKBENCH ADOPTED', result.stdout)
+        self.assertTrue(any(c[:2] == ['session', 'new'] for c in self.calls()))
+        self.assertFalse(any(c[:2] in [['session', 'rename'], ['session', 'move']] for c in self.calls()))
+
+    @unittest.skipUnless(WINDOWS_PS, 'Windows PowerShell not installed')
+    def test_windows_powershell_adoption(self):
+        result = self.entry('-NoRelay', shell=WINDOWS_PS)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('WORKBENCH ADOPTED', result.stdout)
+        self.assert_caller_untouched()
+
+    def test_existing_issue_elsewhere_is_refused(self):
+        self.scenario['tree']['workspaces'].append({'name': 'repo', 'id': self.REPO_WS,
+                                                  'sessions': [{'id': OTHER_ID, 'name': '#7 fix-x'}]})
+        self.save_scenario()
+        result = self.assert_refused_without_mutation()
+        self.assertIn(OTHER_ID, result.stdout)
+        self.assertIn('-NewSession', result.stdout)
+
+
+class AdoptionContext(LauncherFixtures):
+    BASH = shutil.which('bash') or next((str(p) for p in [
+        Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe',
+        Path.home() / 'scoop/apps/git/current/bin/bash.exe'] if p.is_file()), None)
+
+    @staticmethod
+    def bash_quote(value):
+        return "'" + str(value).replace("'", "'\\''") + "'"
+
+    def test_context_quotes_and_encoding(self):
+        checkout = self.temp / "it's a checkout"
+        (checkout / '.workbench/state').mkdir(parents=True)
+        workbench = self.temp / "it's the launcher"
+        result = ps('. ./lib/Workbench.ps1; $script:Root = ' + ps_quote(workbench) +
+                    '; Format-AdoptedBlock ' + ps_quote(checkout) + " 'o/repo#7'", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        path = checkout / '.workbench/state/adopted.sh'
+        self.assertFalse(path.read_bytes().startswith(b'\xef\xbb\xbf'))
+        lines = path.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(['cd', '--', checkout.as_posix()], shlex.split(lines[0])[:3])
+        self.assertIn('|| return 1 2>/dev/null || exit 1', lines[0])
+        self.assertEqual(['export', 'AGWORKBENCH=' + str(workbench),
+                          'AI_HUB=' + str(checkout / '.workbench'), 'AI_BOX=claude'], shlex.split(lines[1]))
+        context = next(line.removeprefix('context:  ') for line in result.stdout.splitlines()
+                       if line.startswith('context:  '))
+        self.assertEqual(['.', path.as_posix()], shlex.split(context))
+
+    @unittest.skipUnless(BASH, 'Bash not installed')
+    def test_context_round_trips_quotes_overrides_stale_env_and_fails_closed(self):
+        checkout = self.temp / "it's a checkout"
+        state = checkout / '.workbench/state'
+        state.mkdir(parents=True)
+        workbench = self.temp / "it's the launcher"
+        result = ps('. ./lib/Workbench.ps1; $script:Root = ' + ps_quote(workbench) +
+                    '; Format-AdoptedBlock ' + ps_quote(checkout) + " 'o/repo#7'", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        context = next(line.removeprefix('context:  ') for line in result.stdout.splitlines()
+                       if line.startswith('context:  '))
+        context_file = state / 'adopted.sh'
+        self.assertFalse(context_file.read_bytes().startswith(b'\xef\xbb\xbf'))
+        code = 'import json,os; print(json.dumps([os.getcwd(),os.environ["AGWORKBENCH"],os.environ["AI_HUB"],os.environ["AI_BOX"]]))'
+        command = context + ' && ' + self.bash_quote(Path(sys.executable).as_posix()) + ' -c ' + self.bash_quote(code)
+        env = dict(os.environ, AI_HUB='stale hub', AGWORKBENCH='old launcher', AI_BOX='codex')
+        sourced = subprocess.run([self.BASH, '--noprofile', '--norc', '-c', command], env=env,
+                                 capture_output=True, text=True, timeout=20)
+        if sourced.returncode and 'CreateFileMapping' in sourced.stderr and 'Win32 error 5' in sourced.stderr:
+            self.skipTest('sandbox denies Git Bash shared-memory initialization; run outside sandbox')
+        self.assertEqual(0, sourced.returncode, sourced.stdout + sourced.stderr)
+        cwd, root, hub, box = json.loads(sourced.stdout)
+        self.assertEqual(checkout, Path(cwd))
+        self.assertEqual([str(workbench), str(checkout / '.workbench'), 'claude'], [root, hub, box])
+        # Keep the script accessible but make its guarded cd target unavailable.
+        saved = self.temp / 'saved context.sh'
+        shutil.copyfile(context_file, saved)
+        moved = self.temp / 'moved checkout'
+        self.assertTrue(checkout.resolve().is_relative_to(ROOT))
+        self.assertTrue(moved.resolve().is_relative_to(ROOT))
+        checkout.rename(moved)
+        failed = subprocess.run([self.BASH, '--noprofile', '--norc', '-c',
+                                 '. ' + self.bash_quote(saved.as_posix()) + ' && echo RAN'],
+                                env=env, capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(0, failed.returncode)
+        self.assertNotIn('RAN', failed.stdout)
+
+    def test_structured_claude_invocation_preserves_arguments_and_stdout(self):
+        lib = self.temp / "it's a script directory"
+        lib.mkdir()
+        (lib / 'pane-claude.ps1').write_text(
+            'param($Checkout,$Issue)\n@($Checkout,$Issue) | ConvertTo-Json -Compress\n', encoding='utf-8')
+        checkout = self.temp / "it's the checkout"
+        # Suppress the user's profile in this subprocess while retaining the real argument builder.
+        result = ps('. ./lib/Workbench.ps1; $realArgs = ${function:Get-PaneLaunchArgs}; '
+                    'function Get-PaneLaunchArgs($Script,$Arguments) { $l = & $realArgs $Script $Arguments; '
+                    "$l.Args = @('-NoProfile') + $l.Args; return $l }; $script:Lib = " + ps_quote(lib) +
+                    '; Invoke-ClaudeHere -Checkout ' + ps_quote(checkout) + " -Issue 'o/repo#7'")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertTrue(result.stdout.lstrip().startswith('['), result.stdout + result.stderr)
+        self.assertEqual([str(checkout), 'o/repo#7'], json.loads(result.stdout))
+
+
 class LauncherScript(LauncherFixtures):
     def run_entry(self, *args):
-        return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), *args],
+        legacy = [] if '-Version' in args else ['-NewSession']
+        return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), *args, *legacy],
                               env=self.env, cwd=ROOT, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=20)
 
@@ -891,7 +1292,7 @@ class LauncherScript(LauncherFixtures):
                     "function New-IssueCheckout { Connect-LaunchLog " + ps_quote(self.log_path) +
                     "; return @{Dir=" + ps_quote(self.checkout) + "; Branch='issue-7-fix-x'} }; "
                     "function Grant-CodexTrust {}; function Grant-ClaudeTrust {}; "
-                    "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' }; "
+                    "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' -NewSession }; "
                     "if (-not $ok) {exit 1}", env=self.env)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         creates = [c for c in self.calls() if c[:2] == ["session", "new"]]

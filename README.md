@@ -48,11 +48,19 @@ github-workbench 42                                         # issue 42 of the re
 github-workbench owner/repo#42
 github-workbench https://github.com/owner/repo/issues/42
 github-workbench owner/repo#42 -DryRun                      # show the plan, touch nothing
+github-workbench owner/repo#42 -NewSession                  # separate session, or resume its existing workbench
 github-workbench -Version                                  # installed toolchain, one line per tool
 ```
 
-Inside agwinterm (or agliteterm) the session opens in that window. From any other terminal it
-starts agwinterm — installing it with scoop first if it is not there — and opens the session there.
+Inside agwinterm (or agliteterm), the launcher adopts its current session: it keeps the caller as
+Claude, splits in Codex, renames the session, and moves it to the repository's workspace. An
+already-running Claude's composer is untouched; the launcher prints a context command so that
+Claude continues the issue in its clone with the correct mailbox. From a plain shell, Claude
+starts there after setup. A foreign split, another issue's session, or a conflicting existing
+workbench is refused before setup changes anything. Rerun from the same Claude pane to complete
+a partial adoption. `-NewSession` uses the separate-session/resume behavior. From any other
+terminal, the launcher starts agwinterm — installing it with scoop first if needed — and opens
+the session there.
 
 In PowerShell, a bare `#42` is a comment. Type `42`, or quote it.
 
