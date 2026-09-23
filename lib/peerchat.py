@@ -149,9 +149,16 @@ def compact(text: str) -> str:
 
 
 def owns(content: str, typed: str) -> bool:
-    """All visible content must match a window of our text, allowing wrapping and scrolling."""
+    """Match a visible window; clipped pointers must retain their complete message id."""
     visible, attempted = compact(content), compact(typed)
-    return bool(visible) and len(visible) >= min(FRAGMENT, len(attempted)) and visible in attempted
+    if not visible or len(visible) < min(FRAGMENT, len(attempted)) or visible not in attempted:
+        return False
+    if visible == attempted:
+        return True
+    marker = re.search(r"\[id\s+([^\]\s]+)\]", typed)
+    if marker:
+        return compact(marker.group(0)) in visible
+    return len(visible) * 2 >= len(attempted)
 
 
 def queued_for(text: str, typed: str) -> bool:

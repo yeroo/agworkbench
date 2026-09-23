@@ -83,13 +83,13 @@ def pointer_text(message: dict[str, Any], agmsg: Path, hub_dir: Path) -> str:
             f"python {agmsg} read {mid}  (AI_HUB={hub_dir})")
 
 
-def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[dict[str, str]]:
+def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[dict[str, Any]]:
     """What changed on the PR between two snapshots, as messages worth filing to Claude.
 
     A snapshot is the `gh pr view --json` object plus `inline`, the list of line comments. Only
     changes produce events: the relay can restart and re-read the same PR without re-announcing it.
     """
-    events: list[dict[str, str]] = []
+    events: list[dict[str, Any]] = []
     if new is None:
         return events
     number = new.get("number")
@@ -134,10 +134,10 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     if state != old.get("state"):
         if state == "MERGED":
             events.append({"kind": "note", "subject": f"PR #{number} MERGED - the loop is complete",
-                           "body": f"Merged at {new.get('mergedAt')}. {new.get('url')}"})
+                           "body": f"Merged at {new.get('mergedAt')}. {new.get('url')}", "terminal": True})
         elif state == "CLOSED":
             events.append({"kind": "note", "subject": f"PR #{number} was CLOSED without merging",
-                           "body": new.get("url", "")})
+                           "body": new.get("url", ""), "terminal": True})
     return events
 
 
@@ -178,8 +178,20 @@ class Relay:
         self.state_file = hub_dir / "state" / "relay.json"
         self.stop_file = hub_dir / "state" / "relay.stop"
         self.state = self._load()
+        saved_pr = self.state.get('pr')
+        if saved_pr and saved_pr.get('headRefName') != self.branch:
+            self.log(f"discarding saved PR snapshot for branch {saved_pr.get('headRefName')} "
+                     f"(this relay watches {self.branch})")
+            self.state.pop('pr', None)
+            self.state.pop('terminal_mail', None)
+            if not self.dry_run:
+                self._save()
         self.agmsg = HERE / "agmsg.py"
         self.holds: dict[tuple[str, str], Hold] = {}
+        for box in self.state.get('reset_pending', []):
+            if box in {peer.box for peer in peers}:
+                self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
+                                            last_alert_at=now(), clear_pending=True)
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -238,8 +250,16 @@ class Relay:
                 agw.set_status('idle', pane_id=peer.pane)
             except (agw.CtlError, OSError) as err:
                 entry.clear_pending = True
+                pending = self.state.setdefault('reset_pending', [])
+                if peer.box not in pending:
+                    pending.append(peer.box)
+                    self._save()
                 self.log(f"could not clear relay status for {peer.box}: {err}")
                 return entry
+            pending = self.state.get('reset_pending', [])
+            if peer.box in pending:
+                pending.remove(peer.box)
+                self._save()
         if entry:
             self.holds.pop(key)
             self.log(f"cleared hold {peer.box} for {mid}; last reason: {entry.reason}")
@@ -250,7 +270,13 @@ class Relay:
         import peerchat
         announced = set(self.state.get("announced", []))
         for peer in self.peers:
-            messages = [(path, self.hub.parse_message(path)) for path in self.hub.unread(peer.box)]
+            messages = []
+            for path in self.hub.unread(peer.box):
+                try:
+                    messages.append((path, self.hub.parse_message(path)))
+                except FileNotFoundError:
+                    # Reading mail moves it out of unread; an agent may do that after our glob.
+                    continue
             unread_ids = {message.get('id', path.stem) for path, message in messages}
             for box, mid in list(self.holds):
                 if box == peer.box and (self.holds[(box, mid)].clear_pending or
@@ -269,12 +295,11 @@ class Relay:
                     if self.dry_run:
                         self.log(f"[dry-run] would ring {peer.box}: {text}")
                         continue
-                    else:
-                        outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool], text,
-                                                dry_run=False, retry=False)
-                        held = self.clear(peer, mid)
-                        duration = f" after holding {now() - held.first_at:.0f}s" if held else ''
-                        self.log(f"rang {peer.box} for {mid} ({message.get('subject', '')}) [{outcome}]{duration}")
+                    outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool], text,
+                                            dry_run=False, retry=False)
+                    held = self.clear(peer, mid)
+                    duration = f" after holding {now() - held.first_at:.0f}s" if held else ''
+                    self.log(f"rang {peer.box} for {mid} ({message.get('subject', '')}) [{outcome}]{duration}")
                 except peerchat.Refused as refusal:
                     # nothing was typed; try again next tick
                     self.hold(peer, mid, str(refusal))
@@ -311,7 +336,7 @@ class Relay:
         terminal_mail = list(self.state.get('terminal_mail', []))
         for event in pr_events(self.state.get("pr"), snapshot):
             recipients = ["claude"]
-            terminal = "MERGED" in event["subject"] or "CLOSED" in event["subject"]
+            terminal = event.get('terminal', False)
             if terminal:
                 recipients = [p.box for p in self.peers]
             for box in recipients:
@@ -333,14 +358,19 @@ class Relay:
     def pending_terminal_mail(self) -> set[tuple[str, str]]:
         announced = set(self.state.get('announced', []))
         targets = {tuple(target) for target in self.state.get('terminal_mail', [])}
-        unread = {(box, self.hub.parse_message(path).get('id', path.stem))
+        unread = {(box, path.stem)
                   for box in {box for box, _ in targets} for path in self.hub.unread(box)}
         return {(box, mid) for box, mid in targets & unread if mid not in announced}
 
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
         next_pr = 0.0
-        drain_deadline = None
+        drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT if finished(self.state.get('pr')) else None
+        if drain_deadline is not None:
+            if self.dry_run:
+                self.log('[dry-run] saved PR is finished; no final mail filed')
+                return 0
+            self.log('saved PR is finished; resuming final notice drain')
         while True:
             if self.stop_file.exists():
                 self.log("stop file found; exiting")

@@ -28,7 +28,7 @@ import peerchat
 from frames import CLAUDE_IDLE, CLAUDE_RUNNING, CODEX_IDLE, Clock, FakeAgw, codex
 
 OPEN = {"number": 7, "url": "https://github.com/o/r/pull/7", "state": "OPEN", "reviewDecision": "",
-        "reviews": [], "comments": [], "inline": []}
+        "reviews": [], "comments": [], "inline": [], "headRefName": "issue-6"}
 
 
 def with_(base: dict, **changes) -> dict:
@@ -163,6 +163,24 @@ class DeliveryFixture(unittest.TestCase):
         self.t = instant
         self.r.deliver_mail()
 
+    def use_disk_state(self):
+        folder = Path(__file__).resolve().parent.parent / ('test relay ' + uuid.uuid4().hex)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        self.r.hub_dir = folder
+        self.r.state_file = folder / 'state' / 'relay.json'
+        self.r._save = relay.Relay._save.__get__(self.r)
+
+    def restart_from_disk(self, *, dry_run=False):
+        previous = self.r
+        with patch.dict(os.environ), patch.object(hub, 'reload_paths'), \
+                patch.object(relay.Relay, 'log', side_effect=self.logs.append):
+            self.r = relay.Relay(previous.hub_dir, previous.peers, previous.repo, previous.branch,
+                                 previous.mail_interval, previous.pr_interval, dry_run=dry_run)
+        self.r.hub = previous.hub
+        self.r.log = self.logs.append
+        self.r.fetch_pr = Mock(return_value=None)  # GitHub unavailable after the restart.
+
     def assert_unannounced(self):
         self.assertEqual([], self.r.state['announced'])
         self.r._save.assert_not_called()
@@ -170,6 +188,65 @@ class DeliveryFixture(unittest.TestCase):
 
 
 class Delivery(DeliveryFixture):
+    def test_saved_pr_from_another_branch_is_discarded_before_startup(self):
+        self.use_disk_state()
+        self.r.state = {'pr': with_(OPEN, number=8, state='MERGED', headRefName='issue-3-launcher-log-resume'),
+                        'terminal_mail': [['codex', 'old-final']], 'announced': ['m1'],
+                        'reset_pending': ['codex']}
+        self.r._save()
+        self.restart_from_disk()
+        kept = {'announced': ['m1'], 'reset_pending': ['codex']}
+        self.assertEqual(kept, self.r.state)
+        self.assertEqual(kept, json.loads(self.r.state_file.read_text(encoding='utf-8')))
+        self.assertTrue(self.r.holds[('codex', '')].clear_pending)
+        self.assertIn('discarding saved PR snapshot for branch issue-3-launcher-log-resume '
+                      '(this relay watches issue-6)', self.logs)
+        self.r.fetch_pr.return_value = copy.deepcopy(OPEN)
+        self.r.hub.write_message = Mock(return_value=Path('new-pr.md'))
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.r.fetch_pr.call_count > 0)
+        with patch.object(relay, 'pause'):
+            self.assertEqual(0, self.r.run())
+        self.r.fetch_pr.assert_called_once()
+        self.r.hub.write_message.assert_called_once()
+        self.assertEqual('PR #7 is open', self.r.hub.write_message.call_args.kwargs['subject'])
+        self.assertFalse(any('resuming final notice drain' in line for line in self.logs))
+
+    def test_saved_pr_without_branch_is_also_discarded(self):
+        self.use_disk_state()
+        self.r.state['pr'] = {'number': 8, 'state': 'MERGED'}
+        self.r.state['terminal_mail'] = [['codex', 'old-final']]
+        self.r._save()
+        self.restart_from_disk()
+        self.assertIsNone(self.r.state.get('pr'))
+        self.assertNotIn('terminal_mail', self.r.state)
+
+    def test_dry_run_discards_stale_snapshot_only_in_memory(self):
+        self.use_disk_state()
+        self.r.state['pr'] = with_(OPEN, state='MERGED', headRefName='old-branch')
+        self.r.state['terminal_mail'] = [['codex', 'old-final']]
+        self.r._save()
+        saved = self.r.state_file.read_bytes()
+        self.restart_from_disk(dry_run=True)
+        self.assertIsNone(self.r.state.get('pr'))
+        self.assertNotIn('terminal_mail', self.r.state)
+        self.assertEqual(saved, self.r.state_file.read_bytes())
+
+    def test_mail_moved_between_glob_and_read_is_skipped(self):
+        self.messages['m2'] = {'id': 'm2', 'subject': 'second'}
+        self.unread['codex'].append('m2')
+        self.r.hub.parse_message = Mock(side_effect=[FileNotFoundError('read elsewhere'), self.messages['m2']])
+        self.tick(0)
+        self.assertEqual(['m2'], self.r.state['announced'])
+        self.send.assert_called_once()
+
+    def test_terminal_unread_check_never_opens_message_files(self):
+        self.r.state['terminal_mail'] = [['codex', 'm1']]
+        self.r.hub.parse_message = Mock(side_effect=FileNotFoundError('moved after glob'))
+        self.assertEqual({('codex', 'm1')}, self.r.pending_terminal_mail())
+        self.unread['codex'] = []
+        self.assertEqual(set(), self.r.pending_terminal_mail())
+        self.r.hub.parse_message.assert_not_called()
+
     def test_failed_ring_alerts_throttles_and_recovers(self):
         self.send.side_effect = peerchat.Failed("pointer still unsent in composer: 'the pointer'")
         self.tick(0)
@@ -279,6 +356,37 @@ class Delivery(DeliveryFixture):
         self.tick(10)
         self.assertEqual({}, self.r.holds)
         self.assertEqual(1, self.send.call_count)
+
+    def test_pending_status_reset_survives_a_real_restart(self):
+        self.use_disk_state()
+        self.send.side_effect = peerchat.Failed('submit failed')
+        self.tick(0)
+        self.send.side_effect = None
+        self.status.side_effect = [agw.CtlError('reset unavailable'), agw.CtlError('still unavailable'), None]
+        self.tick(5)
+        stored = json.loads(self.r.state_file.read_text(encoding='utf-8'))
+        self.assertEqual(['codex'], stored['reset_pending'])
+        self.assertEqual(['m1'], stored['announced'])
+        self.restart_from_disk()
+        self.send.reset_mock()
+        self.tick(10)
+        self.assertEqual(['codex'], json.loads(self.r.state_file.read_text(encoding='utf-8'))['reset_pending'])
+        self.tick(15)
+        self.assertEqual([], json.loads(self.r.state_file.read_text(encoding='utf-8'))['reset_pending'])
+        self.assertEqual({}, self.r.holds)
+        self.send.assert_not_called()
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+
+    def test_closed_filename_in_line_comment_is_not_a_terminal_event(self):
+        self.r.peers.append(relay.Peer('claude', 'claude', 'claude-pane'))
+        self.r.state['pr'] = copy.deepcopy(OPEN)
+        inline = {'id': 55, 'user': {'login': 'a'}, 'path': '0004-CLOSED.md', 'line': 12, 'body': 'fix'}
+        self.r.fetch_pr = Mock(return_value=with_(OPEN, inline=[inline]))
+        self.r.hub.write_message = Mock(return_value=Path('comment.md'))
+        self.assertFalse(self.r.watch_pr())
+        self.r.hub.write_message.assert_called_once()
+        self.assertEqual('claude', self.r.hub.write_message.call_args.kwargs['to'])
+        self.assertEqual([], self.r.state['terminal_mail'])
 
     def test_other_alerted_message_prevents_early_status_clear(self):
         self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'second'}
@@ -458,13 +566,32 @@ class FinalNotices(DeliveryFixture):
 
     def test_final_notice_state_can_resume_a_drain_after_restart(self):
         self.prepare_final()
+        self.use_disk_state()
         self.assertTrue(self.r.watch_pr())
-        self.assertEqual([['claude', 'final-claude']], self.r.state['terminal_mail'])
+        saved = json.loads(self.r.state_file.read_text(encoding='utf-8'))
+        self.assertEqual([['claude', 'final-claude']], saved['terminal_mail'])
         self.r.hub.write_message.reset_mock()
-        self.pane.side_effect = [CLAUDE_RUNNING, CLAUDE_IDLE]
+        self.restart_from_disk()
+        self.assertEqual(saved, self.r.state)
+        self.pane.side_effect = lambda pane: CLAUDE_RUNNING if self.t < 15 else CLAUDE_IDLE
         self.assertEqual(0, self.r.run())
+        self.assertEqual(15, self.t)
+        self.assertEqual(4, self.pane.call_count)
+        self.r.fetch_pr.assert_not_called()
         self.r.hub.write_message.assert_not_called()
         self.assertEqual(['final-claude'], self.r.state['announced'])
+
+    def test_restarted_drain_keeps_its_ceiling_without_github(self):
+        self.prepare_final('CLOSED')
+        self.use_disk_state()
+        self.assertTrue(self.r.watch_pr())
+        self.restart_from_disk()
+        self.pane.return_value = CLAUDE_RUNNING
+        self.assertEqual(0, self.r.run())
+        self.assertEqual(relay.TERMINAL_DRAIN_TIMEOUT, self.t)
+        self.assertIn('drain deadline reached', self.logs[-1])
+        self.assertIn('claude/final-claude', self.logs[-1])
+        self.r.fetch_pr.assert_not_called()
 
 
 if __name__ == "__main__":

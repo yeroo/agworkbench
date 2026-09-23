@@ -56,7 +56,7 @@ class Submission(unittest.TestCase):
 
     def test_clipped_queue_prefix_needs_an_id_and_later_entries_are_checked(self):
         clipped = TEXT.split('[id ', 1)[0].rstrip()
-        self.assertTrue(peerchat.owns(clipped, TEXT))
+        self.assertFalse(peerchat.owns(clipped, TEXT))
         queue = '• Queued follow-up inputs\n  ↳ ' + clipped + '\n'
         for entries, outcome in [(queue, 'submitted'), (queue + '  ↳ ' + TEXT + '\n', 'queued')]:
             with self.subTest(outcome=outcome):
@@ -116,13 +116,30 @@ class Submission(unittest.TestCase):
                     self.assertEqual([TEXT] + ([] if before_submit else ['\t']), fake.keys)
 
     def test_short_wrapped_and_clipped_text_can_be_verified(self):
+        marker_start, marker_end = TEXT.index('[id '), TEXT.index(']') + 1
         cases = [('hello', 'hello'), (TEXT, TEXT[:70] + '\n  ' + TEXT[70:]),
-                 (TEXT, TEXT[:90]), (TEXT, TEXT[70:]), (TEXT, TEXT[70:150])]
+                 (TEXT, TEXT[:marker_end]), (TEXT, TEXT[marker_start:]),
+                 (TEXT, TEXT[marker_start:marker_end + 10])]
         for text, rendered in cases:
             with self.subTest(rendered=rendered):
                 fake = FakeAgw(frames=[CODEX_IDLE, codex(rendered), CODEX_IDLE])
                 self.assertEqual('submitted', self.send(fake, text))
                 self.assertEqual([text, '\t'], fake.keys)
+
+    def test_clipped_pointer_without_complete_id_never_authorizes_a_key(self):
+        for visible in [TEXT[:30], TEXT[:TEXT.index('[id ')], TEXT[:TEXT.index(']')]]:
+            with self.subTest(visible=visible):
+                self.assertFalse(peerchat.owns(visible, TEXT))
+                fake = FakeAgw(frames=[CODEX_IDLE, codex(visible)])
+                with self.assertRaises(peerchat.Failed):
+                    self.send(fake)
+                self.assertEqual([TEXT], fake.keys)
+
+    def test_unlabelled_clipped_text_needs_at_least_half_the_message(self):
+        text = 'An ordinary message without an id marker and with sufficient text to clip.'
+        self.assertTrue(peerchat.owns(text, text))
+        self.assertTrue(peerchat.owns(text[:len(text) // 2 + 1], text))
+        self.assertFalse(peerchat.owns(text[:24], text))
 
     def test_captured_unsubmitted_frame_really_holds_a_pointer(self):
         content = peerchat.composer(peerchat.PROFILES['codex'], CODEX_UNSUBMITTED)
