@@ -101,7 +101,7 @@ def default_box(tool: str | None = None, cwd: str | None = None) -> str:
 
 
 def whoami() -> dict[str, Any] | None:
-    """This process's own registry entry, matched on pane id first, then AI_BOX."""
+    """This process's own registry entry, matched on AI_BOX first, then pane id."""
     registry = load_registry()["agents"]
     pane = os.environ.get("AGWINTERM_PANE_ID") or os.environ.get("AGWINTERM_SESSION_ID")
     named = os.environ.get("AI_BOX")

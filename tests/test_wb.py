@@ -115,6 +115,43 @@ class WaitMail(unittest.TestCase):
         self.assertEqual([], self.sleeps)
         self.assertEqual(before, self.files())
 
+    def test_cp1252_output_replaces_unicode_subject_without_losing_wakeup(self):
+        subject = 'review ? \U0001f600 \u0436 \u2192'
+        path = self.post(subject=subject)
+        stdout_bytes, stderr_bytes = io.BytesIO(), io.BytesIO()
+        with io.TextIOWrapper(stdout_bytes, encoding='cp1252', errors='strict') as out, \
+                io.TextIOWrapper(stderr_bytes, encoding='cp1252', errors='strict') as err, \
+                patch.object(sys, 'argv', ['wb', 'wait-mail', '--timeout', '0']), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(0, wb.main())
+            out.flush()
+            err.flush()
+            self.assertEqual([f'NEW MAIL: {path.stem} codex review ? ? ? ?'],
+                             stdout_bytes.getvalue().decode('cp1252').splitlines())
+            self.assertEqual(b'', stderr_bytes.getvalue())
+        self.assertEqual(subject, hub.parse_message(path)['subject'])
+
+    def test_cp1252_stderr_can_report_invalid_unicode_box(self):
+        stderr_bytes = io.BytesIO()
+        with io.TextIOWrapper(stderr_bytes, encoding='cp1252', errors='strict') as err, \
+                patch.object(sys, 'argv', ['wb', 'wait-mail', '--box', '\u0436']), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(2, wb.main())
+            err.flush()
+            self.assertIn('bad box name', stderr_bytes.getvalue().decode('cp1252'))
+
+    def test_interval_and_timeout_upper_bounds_are_inclusive(self):
+        self.post()  # All accepted inputs return immediately, even before the bounds fix.
+        self.assertEqual(0, self.invoke('--interval', '3600', '--timeout', '1440')[0])
+        for option, values in [('interval', ['3600.001', '1e308']), ('timeout', ['1440.001', '1e308'])]:
+            for value in values:
+                with self.subTest(option=option, value=value):
+                    code, output, error = self.invoke(f'--{option}={value}')
+                    self.assertEqual(2, code)
+                    self.assertEqual('', output)
+                    self.assertIn(f'--{option}', error)
+        self.assertEqual([], self.sleeps)
+
     def test_read_and_archived_messages_do_not_wake_but_later_unread_mail_does(self):
         read = self.post(subject='already read')
         archived = self.post(subject='archived')

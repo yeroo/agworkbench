@@ -26,7 +26,7 @@ You never type into Codex's pane and Codex never types into yours: the relay doe
 
 ```bash
 python "$AGWORKBENCH/lib/agmsg.py" send --to codex --kind review-request --subject "plan v1 for #N" --body-file .workbench/plan.md
-python "$AGWORKBENCH/lib/agmsg.py" read <id>   # the id is in the "Chat from Workbench:" line that woke you
+python "$AGWORKBENCH/lib/agmsg.py" read <id>   # id from the waiter's NEW MAIL: line or Chat from Workbench: pointer
 python "$AGWORKBENCH/lib/agmsg.py" list        # anything unread
 ```
 
@@ -43,14 +43,18 @@ python "$AGWORKBENCH/lib/wb.py" status active            # or blocked --sound, c
   Remember its task ID. If your waiter is still running, reuse it; never start a second one.
   Claude Code wakes you when the background command completes, even if your composer holds a draft.
   Every instruction below to end your turn while waiting for mail refers to this rule.
-- On waiter exit **0**, run `agmsg list`, then `agmsg read <id>` for each unread message, including
-  the IDs in its `NEW MAIL:` output. Read the files before acting; reading moves them out of unread.
-  Handle the mail and rearm only if the loop still needs a reply or review. On exit **3** (timeout),
-  rearm if still waiting. On exit **2**, report the configuration error in chat and set
+- **Every waiter completion means that task has stopped.** Clear its task ID, even if all IDs in
+  its output were already handled after an earlier relay ring. On exit **0**, run `agmsg list`,
+  then `agmsg read <id>` for each unread message, including any still-unread IDs in its `NEW MAIL:`
+  output. Read the files before acting; reading moves them out of unread. Handle the mail, then
+  start a replacement waiter if the loop still needs a reply or review, even when this completion
+  named only already-handled IDs or the inbox is now empty. On exit **3** (timeout), check for
+  unread mail and rearm if still waiting. On exit **2**, report the configuration error in chat and set
   `wb.py status blocked --sound`; fix the cause before rearming, never loop blindly on errors.
 - The relay's `Chat from Workbench:` pointer is a second doorbell. If it arrives first, read the
-  mail and leave an existing waiter running. Ignore pointers or waiter notifications for IDs you
-  already read and handled. A waiter that did not see that mail keeps waiting for later unread mail.
+  mail and keep the existing waiter only while it has not completed. Ignore duplicate message
+  contents for IDs already read and handled, but never ignore a waiter completion: apply the
+  completion/rearm rule above. A waiter that did not see that mail keeps waiting for later unread mail.
 - Never poll or sleep in the foreground, and never ask the human to type anything to keep the
   loop moving. On loop completion, stop any running waiter and do not rearm it.
 - Mail from `human` or `github` is the human speaking. It outranks both agents.

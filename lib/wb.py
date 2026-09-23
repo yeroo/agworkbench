@@ -107,10 +107,10 @@ def pause(seconds: float) -> None:
 def cmd_wait_mail(args: argparse.Namespace) -> int:
     """Wake on unread mail, including replies arriving before this process starts. Never consume it."""
     try:
-        if not math.isfinite(args.interval) or args.interval <= 0:
-            raise ValueError('--interval must be finite and greater than zero')
-        if not math.isfinite(args.timeout) or args.timeout < 0:
-            raise ValueError('--timeout must be finite and nonnegative (minutes)')
+        if not math.isfinite(args.interval) or not 0 < args.interval <= 3600:
+            raise ValueError('--interval must be finite, greater than zero and at most 3600 seconds')
+        if not math.isfinite(args.timeout) or not 0 <= args.timeout <= 1440:
+            raise ValueError('--timeout must be finite and between 0 and 1440 minutes')
         root = os.environ.get('AI_HUB')
         if not root or not Path(root).expanduser().is_dir():
             raise ValueError('AI_HUB must name an existing mailbox directory')
@@ -142,6 +142,13 @@ def cmd_wait_mail(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # Redirected Windows streams may use cp1252/cp437; preserve IDs even when prose cannot encode.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(errors='replace')
+            except (ValueError, OSError):
+                pass
     parser = argparse.ArgumentParser(prog="wb")
     subs = parser.add_subparsers(dest="command", required=True)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
@@ -158,8 +165,8 @@ def main() -> int:
     p.set_defaults(func=cmd_status)
     p = subs.add_parser('wait-mail', help='wait for unread mail without using the terminal')
     p.add_argument('--box', help='mailbox (default: AI_BOX, pane registry entry, or claude)')
-    p.add_argument('--timeout', type=float, default=55, metavar='MIN', help='timeout in minutes (default: 55)')
-    p.add_argument('--interval', type=float, default=10, metavar='SEC', help='poll interval in seconds (default: 10)')
+    p.add_argument('--timeout', type=float, default=55, metavar='MIN', help='timeout, 0..1440 minutes (default: 55)')
+    p.add_argument('--interval', type=float, default=10, metavar='SEC', help='poll interval, >0..3600 seconds (default: 10)')
     p.set_defaults(func=cmd_wait_mail)
     args = parser.parse_args()
     try:
