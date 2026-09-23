@@ -12,6 +12,9 @@ Two jobs, one loop, one process per issue, running in its own visible agwinterm 
    message to Claude on every event that needs acting on: a new review, a changed review decision,
    a new comment, a merge, a close. After merge/closure the loop drains its final notices, with
    a bounded wait for recipients whose composers are unavailable.
+   It follows the newest OPEN PR from this repository. A PR already finished before observation
+   is ignored; observation survives restarts, and a fully drained PR is retired so a later run
+   on the same branch can wait for the next PR.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory and the GitHub API, which cannot push to it.
@@ -33,13 +36,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 
-PR_FIELDS = "number,url,state,reviewDecision,mergedAt,reviews,comments,headRefName"
+PR_FIELDS = "number,url,state,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
 HOLD_ALERT_AFTER = 60.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
@@ -93,7 +97,11 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     if new is None:
         return events
     number = new.get("number")
+    if old is not None and old.get('number') != number:
+        old = None
     if old is None:
+        if new.get('state') != 'OPEN':
+            return events
         events.append({"kind": "note", "subject": f"PR #{number} is open",
                        "body": f"{new.get('url')}\n\nThe relay is now watching it for reviews, comments "
                                f"and the merge."})
@@ -155,8 +163,36 @@ def check_panes(claude: str, codex: str) -> None:
         raise SystemExit("relay: Claude and Codex cannot share a pane")
 
 
-def finished(snapshot: dict[str, Any] | None) -> bool:
-    return bool(snapshot) and snapshot.get("state") in ("MERGED", "CLOSED")
+def finished(snapshot: dict[str, Any] | None, seen_open: set[int], completed_prs: set[int]) -> bool:
+    return (bool(snapshot) and snapshot.get('state') in ('MERGED', 'CLOSED')
+            and snapshot.get('number') in seen_open and snapshot.get('number') not in completed_prs)
+
+
+def same_repo(candidate: dict[str, Any], repo: str) -> bool:
+    head_repo = (candidate.get('head') or {}).get('repo') or {}
+    return head_repo.get('full_name', '').casefold() == repo.casefold()
+
+
+def select_open(candidates: list[dict[str, Any]], repo: str) -> dict[str, Any] | None:
+    return max((pr for pr in candidates if pr.get('state') == 'open' and same_repo(pr, repo)),
+               key=lambda pr: pr['number'], default=None)
+
+
+def gh_json(args: list[str]) -> Any:
+    """A failed lookup is unknown, never evidence that the open list is empty."""
+    try:
+        done = subprocess.run(['gh', *args], capture_output=True, text=True,
+                              encoding='utf-8', errors='replace')
+        return json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def gh_pages(endpoint: str) -> list[dict[str, Any]] | None:
+    pages = gh_json(['api', endpoint, '--paginate', '--slurp'])
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        return None
+    return [item for page in pages for item in page]
 
 
 # --- effects ---------------------------------------------------------------------------------
@@ -179,19 +215,35 @@ class Relay:
         self.stop_file = hub_dir / "state" / "relay.stop"
         self.state = self._load()
         saved_pr = self.state.get('pr')
-        if saved_pr and saved_pr.get('headRefName') != self.branch:
-            self.log(f"discarding saved PR snapshot for branch {saved_pr.get('headRefName')} "
-                     f"(this relay watches {self.branch})")
-            self.state.pop('pr', None)
-            self.state.pop('terminal_mail', None)
-            if not self.dry_run:
-                self._save()
+        saved_branch = self.state.get('branch', (saved_pr or {}).get('headRefName'))
+        changed = self.state.get('branch') != self.branch
+        if saved_branch != self.branch or (saved_pr and saved_pr.get('headRefName') != self.branch):
+            branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs')
+            if saved_branch is not None or any(self.state.get(key) for key in branch_keys):
+                stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
+                self.log(f"discarding saved PR state for branch {stale_branch} "
+                         f"(this relay watches {self.branch})")
+            for key in branch_keys:
+                self.state.pop(key, None)
+            saved_pr = None
+            changed = True
+        self.state['branch'] = self.branch
+        if saved_pr and saved_pr.get('state') == 'OPEN' and 'seen_open' not in self.state:
+            self.state['seen_open'] = [saved_pr['number']]
+            changed = True
+        if changed and not self.dry_run:
+            self._save()
         self.agmsg = HERE / "agmsg.py"
         self.holds: dict[tuple[str, str], Hold] = {}
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
                                             last_alert_at=now(), clear_pending=True)
+        # Old terminal notices may have been filed by the preexisting-PR bug. Preserve pending
+        # delivery for compatibility, but never infer OPEN observation from those notices.
+        if (saved_pr and saved_pr.get('state') in ('MERGED', 'CLOSED')
+                and not self.pending_terminal_mail() and not self.state.get('reset_pending')):
+            self.retire(saved_pr['number'])
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -200,6 +252,7 @@ class Relay:
             return {"announced": [], "pr": None}
 
     def _save(self) -> None:
+        self.state['branch'] = self.branch
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
@@ -316,16 +369,53 @@ class Relay:
                 self._save()
 
     # pull request ---------------------------------------------------------------------------
+    def ignore_finished(self, number: int, state: str) -> None:
+        if number in self.state.get('ignored_prs', []) or number in self.state.get('completed_prs', []):
+            return
+        self.log(f"ignoring finished PR #{number} ({state.lower()} before this relay observed it open)")
+        if not self.dry_run:
+            self.state['ignored_prs'] = sorted({*self.state.get('ignored_prs', []), number})
+            self._save()
+
+    def retire(self, number: int) -> None:
+        self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
+        self.state.pop('pr', None)
+        self.state.pop('terminal_mail', None)
+        self.log(f'retired finished PR #{number}; a restart can watch the next PR')
+        if not self.dry_run:
+            self._save()
+
     def fetch_pr(self) -> dict[str, Any] | None:
-        done = subprocess.run(["gh", "pr", "view", self.branch, "--repo", self.repo, "--json", PR_FIELDS],
-                              capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if done.returncode != 0:
-            return None                    # no PR for this branch yet, or gh is unhappy: try later
-        snapshot = json.loads(done.stdout)
-        inline = subprocess.run(["gh", "api", f"repos/{self.repo}/pulls/{snapshot['number']}/comments",
-                                 "--paginate"], capture_output=True, text=True, encoding="utf-8",
-                                errors="replace")
-        snapshot["inline"] = json.loads(inline.stdout) if inline.returncode == 0 and inline.stdout.strip() else []
+        def endpoint(state: str) -> str:
+            query = urlencode({'state': state, 'head': f'{self.repo.split("/")[0]}:{self.branch}',
+                               'per_page': 100})
+            return f'repos/{self.repo}/pulls?{query}'
+
+        candidates = gh_pages(endpoint('open'))
+        if candidates is None:
+            return None
+        selected = select_open(candidates, self.repo)
+        tracked = self.state.get('pr') or {}
+        if selected is not None:
+            number = selected['number']
+        elif (tracked.get('number') in self.state.get('seen_open', [])
+              and tracked.get('number') not in self.state.get('completed_prs', [])):
+            number = tracked['number']
+        else:
+            for pr in gh_pages(endpoint('all')) or []:
+                if pr.get('state') == 'closed' and same_repo(pr, self.repo):
+                    self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
+            return None
+        snapshot = gh_json(['pr', 'view', str(number), '--repo', self.repo, '--json', PR_FIELDS])
+        if snapshot is None:
+            return None
+        if snapshot.get('isCrossRepository') is not False or snapshot.get('headRefName') != self.branch:
+            self.log(f'ignoring PR #{number}: head repository or branch does not match')
+            return None
+        inline = gh_pages(f'repos/{self.repo}/pulls/{number}/comments')
+        if inline is None:
+            return None
+        snapshot['inline'] = inline
         return snapshot
 
     def watch_pr(self) -> bool:
@@ -333,11 +423,17 @@ class Relay:
         snapshot = self.fetch_pr()
         if snapshot is None:
             return False
+        seen_open = set(self.state.get('seen_open', []))
+        completed = set(self.state.get('completed_prs', []))
+        terminal = finished(snapshot, seen_open, completed)
+        if snapshot.get('state') != 'OPEN' and not terminal:
+            self.ignore_finished(snapshot['number'], snapshot.get('state', 'finished'))
+            return False
         terminal_mail = list(self.state.get('terminal_mail', []))
         for event in pr_events(self.state.get("pr"), snapshot):
             recipients = ["claude"]
-            terminal = event.get('terminal', False)
-            if terminal:
+            terminal_event = event.get('terminal', False)
+            if terminal_event:
                 recipients = [p.box for p in self.peers]
             for box in recipients:
                 if self.dry_run:
@@ -345,15 +441,21 @@ class Relay:
                     continue
                 path = self.hub.write_message(to=box, sender="github", subject=event["subject"],
                                               body=event["body"], kind=event["kind"])
-                if terminal:
+                if terminal_event:
                     terminal_mail.append([box, path.stem])
             if not self.dry_run:
                 self.log(f"github: {event['subject']}")
         if not self.dry_run:
+            if snapshot.get('state') == 'OPEN':
+                seen_open.add(snapshot['number'])
+                for key in ('completed_prs', 'ignored_prs'):
+                    if snapshot['number'] in self.state.get(key, []):
+                        self.state[key] = [number for number in self.state[key] if number != snapshot['number']]
+            self.state['seen_open'] = sorted(seen_open)
             self.state["pr"] = snapshot
             self.state['terminal_mail'] = terminal_mail
             self._save()
-        return finished(snapshot)
+        return terminal
 
     def pending_terminal_mail(self) -> set[tuple[str, str]]:
         announced = set(self.state.get('announced', []))
@@ -365,7 +467,9 @@ class Relay:
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
         next_pr = 0.0
-        drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT if finished(self.state.get('pr')) else None
+        saved_terminal = (self.state.get('pr') or {}).get('state') in ('MERGED', 'CLOSED')
+        drain_deadline = (now() + TERMINAL_DRAIN_TIMEOUT if saved_terminal and
+                          (self.pending_terminal_mail() or self.state.get('reset_pending')) else None)
         if drain_deadline is not None:
             if self.dry_run:
                 self.log('[dry-run] saved PR is finished; no final mail filed')
@@ -379,12 +483,19 @@ class Relay:
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()
                 resets = {key for key, held in self.holds.items() if held.clear_pending}
+                resets.update((box, '') for box in self.state.get('reset_pending', []))
                 if not pending and not resets:
+                    self.retire(self.state['pr']['number'])
                     self.log("PR is finished; final notices delivered or read; the relay's job is done")
                     return 0
                 if now() >= drain_deadline:
-                    detail = '; '.join(f"{box}/{mid}: {self.holds[(box, mid)].reason if (box, mid) in self.holds else 'not delivered'}"
-                                       for box, mid in sorted(pending | resets))
+                    details = []
+                    for box, mid in sorted(pending | resets):
+                        held = self.holds.get((box, mid))
+                        reason = (held.reason if held else 'status reset pending' if (box, mid) in resets
+                                  else 'not delivered')
+                        details.append(f'{box}/{mid}: {reason}')
+                    detail = '; '.join(details)
                     self.log(f"PR is finished; drain deadline reached; still held or awaiting status reset: {detail}")
                     return 0
             elif now() >= next_pr:

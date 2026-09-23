@@ -410,6 +410,9 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
             if content is None:
                 if needs_key or now() >= deadline:
                     raise Failed('composer disappeared after submit; further keys withheld')
+            elif profile.tool == 'claude' and content == 'Press up to edit queued messages':
+                # Ambiguous with a literal draft before typing; only accept it after our submit.
+                return 'queued' + suffix
             elif looks_empty(profile, content):
                 outcome = 'queued' if profile.tool == 'codex' and queued_for(frame, typed) else 'submitted'
                 return ('submitted' if returned else outcome) + suffix
