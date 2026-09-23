@@ -439,6 +439,155 @@ function Get-PanePlan($Session, $Registry) {
 
 function Test-ClaudeCaller { return $env:CLAUDECODE -eq '1' }
 
+function Normalize-WorkbenchPath([string] $Path) {
+    if (-not $Path) { throw 'empty path' }
+    return [IO.Path]::GetFullPath($Path.Replace('/', '\')).TrimEnd('\').ToLowerInvariant()
+}
+
+function Test-SessionGuid([string] $Value) {
+    $id = [guid]::Empty
+    return [guid]::TryParse($Value, [ref]$id) -and $id -ne [guid]::Empty
+}
+
+function Get-ClaudeTranscript([string] $SessionId) {
+    if (-not (Test-SessionGuid $SessionId)) { throw "invalid Claude conversation id '$SessionId'" }
+    $root = Join-Path $HOME '.claude'
+    if ($env:CLAUDE_CONFIG_DIR) { $root = $env:CLAUDE_CONFIG_DIR }
+    $projects = Join-Path $root 'projects'
+    if (-not (Test-Path -LiteralPath $projects)) { return $null }
+    foreach ($dir in @(Get-ChildItem -LiteralPath $projects -Directory | Sort-Object Name)) {
+        $path = Join-Path $dir.FullName "$SessionId.jsonl"
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        foreach ($line in [IO.File]::ReadLines($path)) {
+            try { $entry = $line | ConvertFrom-Json } catch { continue }
+            if ($entry.cwd -and [IO.Path]::IsPathRooted([string]$entry.cwd)) {
+                return @{ Path = $path; Cwd = [string]$entry.cwd }
+            }
+        }
+        return @{ Path = $path; Cwd = $null }
+    }
+    return $null
+}
+
+function Get-AdoptedClaudeIdentity {
+    try {
+        $id = $env:CLAUDE_CODE_SESSION_ID
+        if (-not $id) { throw 'CLAUDE_CODE_SESSION_ID is missing' }
+        $transcript = Get-ClaudeTranscript $id
+        if (-not $transcript -or -not $transcript.Cwd) { throw "Claude transcript or cwd missing for '$id'" }
+        return @{ sessionId = $id; cwd = $transcript.Cwd }
+    } catch { throw [AdoptRefused]::new($_.Exception.Message) }
+}
+
+function Read-ClaudeIdentity([string] $Checkout, [string] $Issue) {
+    $path = Join-Path $Checkout '.workbench\state\claude.json'
+    $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+    if (-not (Test-SessionGuid $record.sessionId) -or
+        ($null -ne $record.pane -and -not (Test-SessionGuid $record.pane)) -or
+        -not $record.cwd -or -not [IO.Path]::IsPathRooted([string]$record.cwd) -or
+        $record.origin -notin @('fresh', 'adopted') -or $record.issue -ne $Issue -or
+        (Normalize-WorkbenchPath $record.checkout) -ne (Normalize-WorkbenchPath $Checkout)) {
+        throw "invalid Claude identity in '$path'"
+    }
+    if (-not $record.PSObject.Properties['pane']) { throw "missing pane binding in '$path'" }
+    return $record
+}
+
+function Save-ClaudeIdentity([string] $Checkout, $Record) {
+    $path = Join-Path $Checkout '.workbench\state\claude.json'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    $Record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$path.tmp" -Encoding UTF8
+    Move-Item -LiteralPath "$path.tmp" -Destination $path -Force
+}
+
+function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Pane, $CallerIdentity) {
+    # The caller has established pane ownership through #3/#4 discovery. Registry creation
+    # comes later; it must not invalidate a reservation after a split/mailbox failure.
+    $path = Join-Path $Checkout '.workbench\state\claude.json'
+    $record = $null
+    $changed = $false
+    if (Test-Path -LiteralPath $path) {
+        try { $record = Read-ClaudeIdentity $Checkout $Issue } catch { Write-LaunchLog identity "$_" }
+        if (-not $record -or ($record.pane -and $record.pane -ne $Pane)) {
+            $archive = Join-Path (Split-Path -Parent $path) ("claude.$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')).json")
+            Write-LaunchLog identity "archiving Claude conversation '$($record.sessionId)' from pane '$($record.pane)' to '$archive'"
+            Move-Item -LiteralPath $path -Destination $archive
+            $record = $null
+        }
+    }
+    if (-not $record) {
+        $record = [pscustomobject]@{ pane = $null; sessionId = [guid]::NewGuid().ToString(); cwd = $Checkout;
+            origin = 'fresh'; reservedAt = [DateTime]::UtcNow.ToString('o'); issue = $Issue; checkout = $Checkout }
+        $changed = $true
+    }
+    if ($CallerIdentity -and ($record.sessionId -ne $CallerIdentity.sessionId -or
+        $record.cwd -ne $CallerIdentity.cwd -or $record.origin -ne 'adopted')) {
+        $record.sessionId = $CallerIdentity.sessionId
+        $record.cwd = $CallerIdentity.cwd
+        $record.origin = 'adopted'
+        $changed = $true
+    }
+    if ($Pane -and $record.pane -ne $Pane) { $record.pane = $Pane; $changed = $true }
+    if ($changed) { Save-ClaudeIdentity $Checkout $record }
+    return $record
+}
+
+function Find-CodexSession([string] $Checkout) {
+    $root = Join-Path $HOME '.codex'
+    if ($env:CODEX_HOME) { $root = $env:CODEX_HOME }
+    $wanted = Normalize-WorkbenchPath $Checkout
+    $matches = @()
+    foreach ($file in @(Get-ChildItem -Path (Join-Path $root 'sessions\*\*\*\rollout-*.jsonl') -File -ErrorAction SilentlyContinue)) {
+        try {
+            $entry = Get-Content -LiteralPath $file.FullName -TotalCount 1 -Encoding UTF8 | ConvertFrom-Json
+            $meta = $entry.payload
+            $stamp = [DateTimeOffset]::MinValue
+            # PowerShell 7 deserializes ISO timestamps as DateTime; stringifying that
+            # value loses its fractional seconds and timezone. PS5.1 leaves a string.
+            $validStamp = $false
+            if ($meta.timestamp -is [DateTime]) { $stamp = [DateTimeOffset]$meta.timestamp; $validStamp = $true }
+            else { $validStamp = [DateTimeOffset]::TryParse([string]$meta.timestamp, [ref]$stamp) }
+            if ($entry.type -ne 'session_meta' -or -not (Test-SessionGuid $meta.id) -or
+                $meta.originator -ne 'codex-tui' -or (Normalize-WorkbenchPath $meta.cwd) -ne $wanted -or
+                -not $validStamp) { continue }
+            $matches += [pscustomobject]@{ Id = $meta.id; Timestamp = $stamp; Name = $file.FullName }
+        } catch { continue }
+    }
+    $newest = $matches | Sort-Object Timestamp, Name -Descending | Select-Object -First 1
+    if ($newest) { return $newest.Id }
+    return $null
+}
+
+function Enable-RestoreReplay {
+    Set-LaunchStage restore-config
+    $script:Launch.RestoreRepair = 'agwintermctl config set restore-commands true'
+    $reply = (Invoke-Ctl config get restore-commands --json) | ConvertFrom-Json
+    if ($reply.ok -isnot [bool] -or -not $reply.ok -or $reply.result -isnot [string] -or $reply.result -notin @('true', 'false')) {
+        throw 'cannot read restore-commands as true or false'
+    }
+    if ($reply.result -eq 'false') {
+        Invoke-Ctl config set restore-commands true | Out-Null
+        $reply = (Invoke-Ctl config get restore-commands --json) | ConvertFrom-Json
+        if ($reply.ok -isnot [bool] -or -not $reply.ok -or $reply.result -isnot [string] -or $reply.result -ne 'true') {
+            throw 'restore-commands was not enabled'
+        }
+        Write-Step 'enabled agwinterm restore-commands'
+    }
+    $script:Launch.RestoreConfirmed = $true
+    $script:Launch.Remove('RestoreRepair')
+}
+
+function Set-PaneRestore([string] $Pane, [string] $Command) {
+    if (-not (Test-SessionGuid $Pane)) { throw "invalid restore pane '$Pane'" }
+    Set-LaunchStage restore-pin
+    $script:Launch.RestoreRepair = "agwintermctl session restore $(Quote $Command) --target $(Quote $Pane)"
+    $reply = (Invoke-Ctl session restore $Command --target $Pane) | ConvertFrom-Json
+    if ($reply.action -ne 'pinned' -or $reply.pane -ne $Pane -or $reply.command -ne $Command) {
+        throw "restore pin was not confirmed for '$Pane'"
+    }
+    $script:Launch.Remove('RestoreRepair')
+}
+
 function Get-CallerSession($Tree) {
     $pane = $env:AGWINTERM_PANE_ID
     if (-not $pane) { $pane = $env:AGWINTERM_SESSION_ID }
@@ -516,7 +665,9 @@ function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $RepoName, [int] $
     if ($panes.Count -eq 2) { $codex = @($panes | Where-Object { $_ -ne $caller.Pane })[0] }
     $mode = 'adopt-fresh'
     if ($owned) { $mode = 'resume-own' }
-    return @{ Mode = $mode; Session = $session; CallerPane = $caller.Pane; CodexPane = $codex;
+    $identity = $null
+    if (Test-ClaudeCaller) { $identity = Get-AdoptedClaudeIdentity }
+    return @{ Mode = $mode; Session = $session; CallerPane = $caller.Pane; CodexPane = $codex; ClaudeIdentity = $identity;
               Workspace = $caller.Workspace; TargetWorkspace = $workspaceId }
 }
 
@@ -596,6 +747,8 @@ function Start-WorkbenchSession {
         }
         $session = $livePlan.Session
     } else { $session = Find-IssueSession $tree $RepoName $Number $Slug $registry }
+    if (-not $script:Launch.RestoreConfirmed) { Enable-RestoreReplay }
+    $codexRestore = Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $Checkout; Issue = $script:Launch.IssueRef } -Switches @('Resume')
     $relaySession = $null
     if (-not $NoRelay) {
         $relaySession = Find-RelaySession $tree $RepoName $Number
@@ -604,9 +757,14 @@ function Start-WorkbenchSession {
     $script:Launch.Adopted = $null -ne $session
     if (-not $session) {
         Set-LaunchStage session
+        $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef
         $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
             --workspace-name $RepoName --create-workspace --command $ClaudeLaunch
         $script:Launch.SessionId = ($id -split '\s+')[0]
+        if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
+        $script:Launch.Claude = $script:Launch.SessionId
+        $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
+        Set-PaneRestore $script:Launch.Claude $ClaudeLaunch
         Start-Sleep -Milliseconds 600
         $session = Get-SessionById $script:Launch.SessionId
         if (-not $session) { throw "session $($script:Launch.SessionId) did not appear in the tree" }
@@ -628,6 +786,13 @@ function Start-WorkbenchSession {
     if ($plan.ClaudeSlot -eq 'split') { $claudeSide = 'right'; $codexSide = 'left' }
     $script:Launch.Claude = $plan.Claude
     $script:Launch.Codex = $plan.Codex
+    $callerIdentity = $null
+    if ($AdoptSession) { $callerIdentity = $livePlan.ClaudeIdentity }
+    if ($plan.Claude) {
+        $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $plan.Claude $callerIdentity
+        if ($script:Launch.Adopted) { Set-PaneRestore $plan.Claude $ClaudeLaunch }
+    } else { $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef }
+    if ($plan.Codex) { Set-PaneRestore $plan.Codex $codexRestore }
     # A new Claude pane needs a launch even if its shell never becomes ready.
     # Existing Claude panes become launch candidates only after a shell is proven below.
     $script:Launch.ClaudeLaunchRequired = $plan.NeedSplit -and $plan.NewPaneRole -eq 'Claude'
@@ -638,12 +803,19 @@ function Start-WorkbenchSession {
         }
         $reply = Invoke-Ctl session split on --target $session.id
         $script:Launch[$plan.NewPaneRole] = ($reply -split '\s+')[0]
+        $null = @(Get-PaneIds ([pscustomobject]@{ id = $session.id;
+            paneIds = @($script:Launch.Claude, $script:Launch.Codex) }))
         if ($AdoptSession) {
             $null = @(Get-PaneIds ([pscustomobject]@{ id = $session.id;
                 paneIds = @($CallerPane, $script:Launch.Codex) }))
             Save-AdoptionState $Checkout @{ session = $session.id; claudePane = $CallerPane;
                 codexPane = $script:Launch.Codex; stage = 'split' }
         }
+        if ($plan.NewPaneRole -eq 'Claude') {
+            $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
+            Set-PaneRestore $script:Launch.Claude $ClaudeLaunch
+        } else { Set-PaneRestore $script:Launch.Codex $codexRestore }
+        Set-LaunchStage split
         $confirmed = $false
         foreach ($attempt in 1..30) {
             Start-Sleep -Milliseconds 300
@@ -658,6 +830,12 @@ function Start-WorkbenchSession {
             }
         }
         if (-not $confirmed) { throw "the split did not appear for session $($session.id) (reply: $reply)" }
+    }
+    $relayLine = & $RelayCommand $hub $script:Launch.Claude $script:Launch.Codex
+    if ($relaySession) {
+        $relayPanes = @(Get-PaneIds $relaySession)
+        if ($relayPanes.Count -ne 1) { throw "relay session '$($relaySession.id)' has multiple panes; restart it manually" }
+        Set-PaneRestore $relayPanes[0] $relayLine
     }
     $stopFile = Join-Path $hub 'state\relay.stop'
     $restartRelay = $relaySession -and ($plan.NeedSplit -or -not $script:Launch.Adopted -or
@@ -676,7 +854,7 @@ function Start-WorkbenchSession {
     Set-LaunchStage mailbox
     $hub = Initialize-Mailbox -Checkout $Checkout -ClaudePane $script:Launch.Claude -CodexPane $script:Launch.Codex
     $script:Launch.MailboxReady = $true
-    $script:Launch.RelayCommand = & $RelayCommand $hub $script:Launch.Claude $script:Launch.Codex
+    $script:Launch.RelayCommand = $relayLine
     Write-Done "mailbox ready: $hub"
     $roles = @('Codex')
     # A previous run may have split or registered an empty Claude pane before failing.
@@ -730,6 +908,7 @@ function Start-WorkbenchSession {
             $reply = Invoke-Ctl session new --name "#$Number relay" --cwd $Checkout --workspace-name $RepoName `
                 --no-select --command $relay
             $script:Launch.RelaySession = ($reply -split '\s+')[0]
+            Set-PaneRestore $script:Launch.RelaySession $relay
             $script:Launch.RelayStarted = $true
         }
         if ($script:Launch.RelayStarted) { Write-Done 'relay watching the mailbox and the PR' }
@@ -745,13 +924,14 @@ function Start-WorkbenchSession {
     } elseif ($script:Launch.ClaudeLaunchRequired -and -not $script:Launch.ClaudeTyped) {
         Write-Done "ready: Claude ($claudeSide) still needs starting by hand:`n  $ClaudeLaunch"
     } else {
-        Write-Done "ready: Claude ($claudeSide) is running /start-github-issue $($script:Launch.IssueRef)"
+        Write-Done "ready: existing non-shell panes left untouched; new agent commands launched where needed"
     }
     return $script:Launch
 }
 
 function Format-RepairMessage($Launch) {
     $lines = @("Launcher stopped at stage '$($Launch.Stage)'.")
+    if ($Launch.RestoreRepair) { $lines += "Repair restart configuration: $($Launch.RestoreRepair)" }
     foreach ($key in @('Checkout', 'IssueRef', 'SessionId', 'Claude', 'Codex', 'RelaySession')) {
         if ($Launch[$key]) { $lines += "${key}: $($Launch[$key])" }
     }
@@ -908,7 +1088,7 @@ function Grant-ClaudeTrust {
 
 function Quote([string] $Value) { return "'" + $Value.Replace("'", "''") + "'" }
 
-function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments) {
+function Get-PaneLaunchArgs([string] $Script, [Alias('Parameters')] [hashtable] $Arguments, [string[]] $Switches = @()) {
     # A shell executable run explicitly with -ExecutionPolicy Bypass, so a machine whose policy is
     # Restricted still runs the pane script - `& 'x.ps1'` alone would be refused there.
     $shell = 'powershell.exe'
@@ -921,15 +1101,20 @@ function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments) {
         $parameters += @{ Name = "-$key"; Value = [string]$Arguments[$key] }
         $parts += @("-$key", [string]$Arguments[$key])
     }
-    return @{ Exe = $shell; Prefix = $prefix; ScriptPath = $scriptPath; Parameters = $parameters; Args = $parts }
+    foreach ($name in $Switches) {
+        if ($name -notmatch '^[A-Za-z][A-Za-z0-9]*$') { throw "invalid launch switch '$name'" }
+        $parts += "-$name"
+    }
+    return @{ Exe = $shell; Prefix = $prefix; ScriptPath = $scriptPath; Parameters = $parameters; Switches = $Switches; Args = $parts }
 }
 
-function Get-PaneLaunch([string] $Script, [hashtable] $Arguments) {
-    $launch = Get-PaneLaunchArgs $Script $Arguments
+function Get-PaneLaunch([string] $Script, [Alias('Parameters')] [hashtable] $Arguments, [string[]] $Switches = @()) {
+    $launch = Get-PaneLaunchArgs $Script $Arguments -Switches $Switches
     $parts = @($launch.Exe) + $launch.Prefix + @((Quote $launch.ScriptPath))
     foreach ($parameter in $launch.Parameters) {
         $parts += @($parameter.Name, (Quote $parameter.Value))
     }
+    foreach ($name in $launch.Switches) { $parts += "-$name" }
     return ($parts -join ' ')
 }
 
@@ -954,6 +1139,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession)
     $script:Launch.ClaudeHerePending = $false
+    $script:Launch.RestoreConfirmed = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
     $script:Launch.DryRun = [bool]$DryRun
@@ -1042,6 +1228,16 @@ function Invoke-LauncherBody {
             throw [AdoptRefused]::new('caller panes or workspace eligibility changed during setup; rerun to reassess adoption')
         }
         $adoptionPlan = $currentPlan
+        Enable-RestoreReplay
+        $script:Launch.SessionId = $adoptionPlan.Session.id
+        $script:Launch.Claude = $adoptionPlan.CallerPane
+        $script:Launch.Codex = $adoptionPlan.CodexPane
+        $null = Reserve-ClaudeIdentity $co.Dir $issueRef $adoptionPlan.CallerPane $adoptionPlan.ClaudeIdentity
+        Set-PaneRestore $adoptionPlan.CallerPane $claudeLaunch
+        if ($adoptionPlan.CodexPane) {
+            $codexRestore = Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')
+            Set-PaneRestore $adoptionPlan.CodexPane $codexRestore
+        }
         Initialize-AdoptedSession $adoptionPlan $co.Dir $repoName $ref.Number $slug
         $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane }
     }
