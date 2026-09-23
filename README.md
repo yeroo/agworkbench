@@ -64,7 +64,10 @@ and pane IDs, commands that can be run by hand, and the command to resume. Failu
 checkout exists print the buffered log in the launching shell.
 
 Run the same issue command again to complete an existing session: register its panes, start
-Codex when its pane shows a recognized empty shell prompt, and start or resume its relay. An
+Codex when its pane shows a recognized empty shell prompt, and start or resume its relay. If only
+Codex's pane survives, the new split starts Claude. A relay using replaced panes is asked to stop
+before it is restarted with the current pane IDs; if its shell cannot be confirmed, setup stops
+with repair instructions. An
 unrecognized pane is left alone and the launcher prints the manual launch command. It uses the
 checkout's registered Claude pane to locate the session; the fallback matches the repository's
 workspace name and issue number/title. That fallback cannot distinguish owners with identical

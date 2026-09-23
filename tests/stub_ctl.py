@@ -59,10 +59,23 @@ elif args[:3] == ["session", "split", "on"]:
     scenario["split_pending"] = scenario.get("split_delay", 0)
     finish(scenario["right_id"])
 elif args[:2] == ["session", "text"]:
+    if option("--target") == scenario["relay_id"] and scenario.get("stop_file"):
+        if Path(scenario["stop_file"]).exists():
+            scenario["stop_seen"] = True
+            if not scenario.get("ignore_stop"):
+                scenario.setdefault("text", {})[scenario["relay_id"]] = "PS C:\\relay> "
     finish(scenario.get("text", {}).get(option("--target"), ""))
 elif args[:2] == ["session", "type"]:
     target = option("--target")
-    scenario.setdefault("text", {})[target] = "relay up:" if target == scenario["relay_id"] else "Ask Codex to do anything\ngpt-test"
+    if target == scenario["relay_id"]:
+        if scenario.get("stop_file") and Path(scenario["stop_file"]).exists():
+            finish("relay stop file must be cleared before restarting", 98, True)
+        text = "relay up:"
+    elif "pane-claude.ps1" in option("--select"):
+        text = "Claude running\nbypass permissions on"
+    else:
+        text = "Ask Codex to do anything\ngpt-test"
+    scenario.setdefault("text", {})[target] = text
     finish()
 elif args[:2] in (["session", "select"], ["session", "focus"]):
     finish()

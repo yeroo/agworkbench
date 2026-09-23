@@ -87,6 +87,14 @@ class PaneIdsOfASession(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(["2", MAIN_ID + "," + RIGHT_ID, "String"], result.stdout.split())
 
+    def test_invalid_pane_lists_are_refused(self):
+        for ids in ([], [MAIN_ID, RIGHT_ID, RELAY_ID], [MAIN_ID, MAIN_ID], ["1"], [None]):
+            with self.subTest(ids=ids):
+                result = ps("$ErrorActionPreference='Stop'; . ./lib/Workbench.ps1; Get-PaneIds " +
+                            ps_json({"id": MAIN_ID, "paneIds": ids}))
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(MAIN_ID, result.stderr)
+
 
 class CodexLaunch(unittest.TestCase):
     CHECKOUT = str(ROOT)
@@ -366,23 +374,6 @@ def ps_json(value):
     return "(ConvertFrom-Json " + ps_quote(json.dumps(value)) + ")"
 
 
-class PaneIds(unittest.TestCase):
-    def test_flat_scalar_panes_and_invalid_lists(self):
-        for session, expected in [({"id": MAIN_ID}, [MAIN_ID]),
-                                  ({"id": MAIN_ID, "paneIds": [MAIN_ID, RIGHT_ID]}, [MAIN_ID, RIGHT_ID])]:
-            with self.subTest(session=session):
-                result = ps(". ./lib/Workbench.ps1; $ids = @(Get-PaneIds " + ps_json(session) +
-                            "); ConvertTo-Json -Compress -InputObject $ids")
-                self.assertEqual(0, result.returncode, result.stderr)
-                self.assertEqual(expected, json.loads(result.stdout))
-        for ids in ([], [MAIN_ID, RIGHT_ID, RELAY_ID], [MAIN_ID, MAIN_ID], ["1"], [None]):
-            with self.subTest(ids=ids):
-                result = ps("$ErrorActionPreference='Stop'; . ./lib/Workbench.ps1; Get-PaneIds " +
-                            ps_json({"id": MAIN_ID, "paneIds": ids}))
-                self.assertNotEqual(0, result.returncode)
-                self.assertIn(MAIN_ID, result.stderr)
-
-
 class ShellReady(unittest.TestCase):
     def test_positive_shell_shapes_and_agent_draft_refusals(self):
         frames = [("PS C:\\x> ", True), ("PS C:\\x>", True),
@@ -414,6 +405,7 @@ class LauncherFixtures(unittest.TestCase):
         self.scenario_path = self.temp / "scenario.json"
         self.calls_path = self.temp / "calls.jsonl"
         self.log_path = self.checkout / ".workbench/state/launch.log"
+        self.stop_path = self.checkout / ".workbench/state/relay.stop"
         self.registry_path = self.checkout / ".workbench/state/agents.json"
         self.config_path = self.temp / "config.json"
         self.config_path.write_text(json.dumps({"checkoutRoot": str(self.temp)}), encoding="utf-8")
@@ -432,7 +424,7 @@ class LauncherFixtures(unittest.TestCase):
             " @CtlArgs\nexit $LASTEXITCODE\n", encoding="utf-8")
         self.cmd("python", f'"{sys.executable}" %*')
         self.scenario = {"main_id": MAIN_ID, "right_id": RIGHT_ID, "relay_id": RELAY_ID,
-                         "tree": {"workspaces": []}, "text": {}}
+                         "tree": {"workspaces": []}, "text": {}, "stop_file": str(self.stop_path)}
         self.save_scenario()
 
     def cmd(self, name, body):
@@ -457,11 +449,12 @@ class LauncherFixtures(unittest.TestCase):
     def flow(self, shell=PWSH, no_relay=False):
         script = (self.setup_ps() + "Connect-LaunchLog " + ps_quote(self.log_path) + "; "
                   "$codexLine = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
-                  "; Issue='o/repo#7'}; $builder = { param($Hub,$Left,$Right) "
+                  "; Issue='o/repo#7'}; $claudeLine = Get-PaneLaunch 'pane-claude.ps1' @{Checkout=" +
+                  ps_quote(self.checkout) + "; Issue='o/repo#7'}; $builder = { param($Hub,$Left,$Right) "
                   "'python ' + (Quote 'relay.py') + ' --hub ' + (Quote $Hub) + "
                   "' --claude-pane ' + (Quote $Left) + ' --codex-pane ' + (Quote $Right) }; "
                   "$ok = Invoke-LaunchSafely { Start-WorkbenchSession -Checkout " + ps_quote(self.checkout) +
-                  " -Number 7 -Slug 'fix-x' -RepoName 'repo' -ClaudeLaunch 'claude launch' "
+                  " -Number 7 -Slug 'fix-x' -RepoName 'repo' -ClaudeLaunch $claudeLine "
                   "-CodexLaunch $codexLine -RelayCommand $builder " + ("-NoRelay " if no_relay else "") +
                   "}; if (-not $ok) {exit 1}; $script:Launch | ConvertTo-Json -Compress")
         return subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
@@ -537,17 +530,22 @@ class IssueSessions(LauncherFixtures):
         self.assertIn(MAIN_ID, result.stderr)
 
     def test_pane_roles_use_registry_or_first_pane(self):
-        registry = self.register(claude=RIGHT_ID, codex=MAIN_ID)
-        for session, reg, expected in [({"id": MAIN_ID}, None, (MAIN_ID, None, True, "primary")),
-                                      ({"id": MAIN_ID, "paneIds": [MAIN_ID, RIGHT_ID]}, registry,
-                                       (RIGHT_ID, MAIN_ID, False, "split")),
-                                      ({"id": OTHER_ID, "paneIds": [OTHER_ID, RELAY_ID]}, registry,
-                                       (OTHER_ID, RELAY_ID, False, "primary"))]:
+        claude_known = self.register(claude=MAIN_ID, codex=OTHER_ID)
+        codex_known = self.register(claude=OTHER_ID, codex=MAIN_ID)
+        neither_known = self.register(claude=OTHER_ID, codex=RELAY_ID)
+        one = {"id": MAIN_ID}
+        two = {"id": MAIN_ID, "paneIds": [MAIN_ID, RIGHT_ID]}
+        for session, reg, expected in [(one, claude_known, (MAIN_ID, None, True, "primary", "Codex")),
+                                      (one, codex_known, (None, MAIN_ID, True, "split", "Claude")),
+                                      (one, neither_known, (MAIN_ID, None, True, "primary", "Codex")),
+                                      (two, claude_known, (MAIN_ID, RIGHT_ID, False, "primary", "Codex")),
+                                      (two, codex_known, (RIGHT_ID, MAIN_ID, False, "split", "Codex")),
+                                      (two, neither_known, (MAIN_ID, RIGHT_ID, False, "primary", "Codex"))]:
             result = ps(". ./lib/Workbench.ps1; Get-PanePlan " + ps_json(session) + " " + ps_json(reg) +
                         " | ConvertTo-Json -Compress", env=self.env)
             self.assertEqual(0, result.returncode, result.stderr)
             plan = json.loads(result.stdout)
-            self.assertEqual(expected, tuple(plan[k] for k in ("Claude", "Codex", "NeedSplit", "ClaudeSlot")))
+            self.assertEqual(expected, tuple(plan[k] for k in ("Claude", "Codex", "NeedSplit", "ClaudeSlot", "NewPaneRole")))
 
 
 class LaunchLog(LauncherFixtures):
@@ -589,6 +587,10 @@ class LauncherFlow(LauncherFixtures):
     def test_fresh_then_resume_launches_each_component_once(self):
         first = self.flow()
         self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        launch = json.loads(first.stdout.splitlines()[-1])
+        typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
+        self.assertEqual([["session", "type", "--select", launch["CodexLaunch"] + "\n", "--target", RIGHT_ID]], typed)
+        self.assertIn("pane-codex.ps1'", launch["CodexLaunch"])
         commands = [c[:2] for c in self.calls()]
         self.assertEqual([["tree", "--json"], ["session", "new"], ["tree", "--json"],
                           ["session", "split"], ["tree", "--json"], ["session", "text"],
@@ -608,6 +610,10 @@ class LauncherFlow(LauncherFixtures):
         self.assertIn("not a proven shell", self.log())
         state = json.loads(self.scenario_path.read_text(encoding="utf-8"))
         self.assertEqual(["#7 fix-x", "#7 relay"], [s["name"] for s in state["tree"]["workspaces"][0]["sessions"]])
+        self.assertFalse(state.get("stop_seen"))
+        self.assertFalse(self.stop_path.exists())
+        self.assertNotIn("relay watching", second.stdout)
+        self.assertIn(launch["RelayCommand"], second.stdout)
 
     def test_half_built_session_is_completed(self):
         self.resumed("project 0.282s\n12:00:56\n\u276f", relay=False)
@@ -627,12 +633,12 @@ class LauncherFlow(LauncherFixtures):
 
     def test_one_pane_resume_and_delayed_split_confirmation(self):
         self.resumed(relay=False, panes=1)
-        self.scenario["split_delay"] = 2
+        self.scenario["split_delay"] = 6
         self.save_scenario()
         result = self.flow()
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual(1, sum(c[:2] == ["session", "split"] for c in self.calls()))
-        self.assertEqual(4, sum(c == ["tree", "--json"] for c in self.calls()))
+        self.assertEqual(8, sum(c == ["tree", "--json"] for c in self.calls()))
 
     def test_existing_relay_restarts_in_its_own_shell(self):
         self.resumed()
@@ -641,9 +647,81 @@ class LauncherFlow(LauncherFixtures):
         result = self.flow()
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
-        self.assertEqual(1, len(typed))
-        self.assertEqual(RELAY_ID, typed[0][-1])
+        relay = ("python 'relay.py' --hub " + ps_quote(self.checkout / ".workbench") +
+                 " --claude-pane '" + MAIN_ID + "' --codex-pane '" + RIGHT_ID + "'")
+        self.assertEqual([["session", "type", "--select", relay + "\n", "--target", RELAY_ID]], typed)
         self.assertFalse(any(c[:2] == ["session", "new"] for c in self.calls()))
+
+    def test_surviving_codex_gets_a_new_claude_pane(self):
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)
+        self.scenario.update(main_id=RIGHT_ID, right_id=OTHER_ID,
+                             tree={"workspaces": [{"name": "repo", "sessions": [{"id": RIGHT_ID, "name": "#7 fix-x"}]}]},
+                             text={RIGHT_ID: "Ask Codex to do anything\ngpt-test"})
+        self.save_scenario()
+        result = self.flow(no_relay=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        launch = json.loads(result.stdout.splitlines()[-1])
+        typed = [c for c in self.calls() if c[:2] == ["session", "type"]]
+        self.assertEqual([["session", "type", "--select", launch["ClaudeLaunch"] + "\n", "--target", OTHER_ID]], typed)
+        self.assertIn("pane-claude.ps1'", launch["ClaudeLaunch"])
+        registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(OTHER_ID, registry["agents"]["claude"]["pane"])
+        self.assertEqual(RIGHT_ID, registry["agents"]["codex"]["pane"])
+        self.assertEqual(["session", "focus", "split", "--target", RIGHT_ID], self.calls()[-1])
+
+    def test_changed_panes_stop_running_relay_before_restart(self):
+        self.resumed(panes=1)
+        self.register(claude=MAIN_ID, codex=OTHER_ID)
+        result = self.flow()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        state = json.loads(self.scenario_path.read_text(encoding="utf-8"))
+        self.assertTrue(state["stop_seen"])
+        self.assertFalse(self.stop_path.exists())
+        launch = json.loads(result.stdout.splitlines()[-1])
+        relay_types = [c for c in self.calls() if c[:2] == ["session", "type"] and c[-1] == RELAY_ID]
+        self.assertEqual([["session", "type", "--select", launch["RelayCommand"] + "\n", "--target", RELAY_ID]], relay_types)
+        self.assertIn("--codex-pane '" + RIGHT_ID + "'", launch["RelayCommand"])
+        self.assertNotIn(OTHER_ID, launch["RelayCommand"])
+        self.assertFalse(any(c[:2] == ["session", "new"] for c in self.calls()))
+
+    def test_relay_stop_timeout_never_types_and_retry_consumes_stop_request(self):
+        self.resumed(panes=1)
+        self.register(claude=MAIN_ID, codex=OTHER_ID)
+        self.scenario["ignore_stop"] = True
+        self.save_scenario()
+        result = self.flow()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("within 15 s", result.stdout)
+        self.assertIn("Remove-Item -LiteralPath " + ps_quote(self.stop_path), result.stdout)
+        self.assertNotIn("relay watching", result.stdout)
+        self.assertTrue(self.stop_path.exists())
+        self.assertFalse(any(c[:2] == ["session", "type"] and c[-1] == RELAY_ID for c in self.calls()))
+        self.scenario = json.loads(self.scenario_path.read_text(encoding="utf-8"))
+        self.scenario["ignore_stop"] = False
+        self.save_scenario()
+        retry = self.flow()
+        self.assertEqual(0, retry.returncode, retry.stdout + retry.stderr)
+        self.assertFalse(self.stop_path.exists())
+        self.assertEqual(1, sum(c[:2] == ["session", "type"] and c[-1] == RELAY_ID for c in self.calls()))
+
+    def test_changed_panes_request_relay_stop_before_mailbox_failure(self):
+        self.resumed(panes=1)
+        self.register(claude=MAIN_ID, codex=OTHER_ID)
+        (self.temp / "python.cmd").unlink()
+        result = self.flow()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("stage 'mailbox'", result.stdout)
+        self.assertTrue(self.stop_path.exists())
+        self.assertFalse(any(c[:2] == ["session", "type"] for c in self.calls()))
+
+    def test_new_relay_clears_a_stop_file_from_an_old_session(self):
+        self.resumed(relay=False)
+        self.stop_path.parent.mkdir(parents=True)
+        self.stop_path.write_text("old relay stop request", encoding="utf-8")
+        result = self.flow()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse(self.stop_path.exists())
+        self.assertEqual(1, sum(c[:2] == ["session", "new"] for c in self.calls()))
 
     def test_registry_second_pane_is_focused(self):
         self.resumed()
@@ -718,6 +796,29 @@ class LauncherScript(LauncherFixtures):
         self.assertIn("resolve starting", result.stdout)
         self.assertFalse(self.log_path.exists())
         self.assertFalse(self.calls())
+
+    def test_failed_dry_run_never_suggests_a_real_launch(self):
+        self.cmd("gh", "echo lookup failed\nexit /b 6")
+        result = self.run_entry("o/repo#7", "-DryRun")
+        self.assertEqual(1, result.returncode)
+        self.assertNotIn("incomplete", result.stdout)
+        self.assertNotIn("github-workbench 'o/repo#7'", result.stdout)
+        self.assertNotIn("Resume and complete", result.stdout)
+
+    def test_repair_preserves_no_relay_before_session_setup(self):
+        self.cmd("gh", "echo lookup failed\nexit /b 6")
+        result = self.run_entry("o/repo#7", "-NoRelay")
+        self.assertEqual(1, result.returncode)
+        self.assertIn("github-workbench 'o/repo#7' -NoRelay", result.stdout)
+
+    def test_failed_clone_does_not_poison_the_empty_checkout(self):
+        self.cmd("gh", 'if "%1"=="issue" (\necho {"title":"fix-x","state":"OPEN"}\nexit /b 0\n)\necho clone failed\nexit /b 7')
+        for _ in range(2):
+            result = self.run_entry("o/repo#7")
+            self.assertEqual(1, result.returncode)
+            self.assertIn("gh repo clone failed", result.stdout)
+            self.assertIn("config starting", result.stdout)
+            self.assertEqual([], list(self.checkout.iterdir()))
 
     def test_body_wires_launch_commands_and_repair_boundary(self):
         # Replace only network/checkout/trust boundaries; run the real launcher body,

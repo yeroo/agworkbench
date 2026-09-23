@@ -53,9 +53,9 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
     # Both the entry point and the terminal-free flow tests use this failure boundary.
     try { & $Body | Out-Null; return $true } catch {
         $failure = $_
-        # Clone may have created the directory before reporting a failure.
+        # Logging must not turn an empty failed-clone target into a non-empty one.
         if ($script:LaunchLog -and -not $script:LaunchLog.Path -and $script:Launch.Checkout -and
-            (Test-Path -LiteralPath $script:Launch.Checkout -PathType Container)) {
+            (Test-Path -LiteralPath (Join-Path $script:Launch.Checkout '.git'))) {
             Connect-LaunchLog (Join-Path $script:Launch.Checkout '.workbench\state\launch.log')
         }
         $dump = @($failure.Exception.ToString(), $failure.InvocationInfo.PositionMessage,
@@ -338,8 +338,8 @@ function Test-ShellReady([string] $Text) {
 }
 
 function Wait-ShellPrompt {
-    <# True once the pane's last non-blank row ends in a prompt glyph. An EMPTY pane is not a prompt:
-       a pane that has drawn nothing yet must not have a launch line typed into it. #>
+    <# Newly created panes use the prompt-glyph rule. Adopted panes require Test-ShellReady's
+       recognized empty shell frame; a lone glyph is refused. Empty text never permits typing. #>
     param([string] $Pane, [int] $TimeoutSeconds = 20, [switch] $Adopted)
     $started = Get-Date
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -348,8 +348,8 @@ function Wait-ShellPrompt {
     while ((Get-Date) -lt $deadline) {
         $text = Invoke-Ctl session text --target $Pane
         $tail = ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
-        $ready = $tail -and $tail -match $prompt
         if ($Adopted) { $ready = Test-ShellReady $text }
+        else { $ready = $tail -and $tail -match $prompt }
         if ($ready) {
             Write-LaunchLog prompt-decision "$Pane proven last-row=$tail waited=$([math]::Round(((Get-Date) - $started).TotalSeconds, 2))s"
             return $true
@@ -410,13 +410,20 @@ function Find-RelaySession($Tree, [string] $RepoName, [int] $Number) {
 
 function Get-PanePlan($Session, $Registry) {
     $panes = @(Get-PaneIds $Session)
-    $claude = $panes[0]
-    if ($Registry.agents.claude.pane -in $panes) { $claude = $Registry.agents.claude.pane }
+    $claude = $null
     $codex = $null
-    if ($panes.Count -eq 2) { $codex = @($panes | Where-Object { $_ -ne $claude })[0] }
+    if ($Registry.agents.claude.pane -in $panes) { $claude = $Registry.agents.claude.pane }
+    elseif ($Registry.agents.codex.pane -in $panes) { $codex = $Registry.agents.codex.pane }
+    else { $claude = $panes[0] }
+    if ($panes.Count -eq 2) {
+        if ($claude) { $codex = @($panes | Where-Object { $_ -ne $claude })[0] }
+        else { $claude = @($panes | Where-Object { $_ -ne $codex })[0] }
+    }
+    $newRole = 'Codex'
+    if (-not $claude) { $newRole = 'Claude' }
     $slot = 'primary'
     if ($claude -ne $panes[0]) { $slot = 'split' }
-    return @{ Claude = $claude; Codex = $codex; NeedSplit = $panes.Count -eq 1; ClaudeSlot = $slot }
+    return @{ Claude = $claude; Codex = $codex; NeedSplit = $panes.Count -eq 1; ClaudeSlot = $slot; NewPaneRole = $newRole }
 }
 
 function Start-WorkbenchSession {
@@ -424,10 +431,12 @@ function Start-WorkbenchSession {
           [string] $ClaudeLaunch, [string] $CodexLaunch, [scriptblock] $RelayCommand, [switch] $NoRelay)
     $ErrorActionPreference = 'Stop'
     if (-not $script:Launch) { $script:Launch = @{} }
-    foreach ($key in @('SessionId', 'Claude', 'Codex', 'RelaySession', 'MailboxReady', 'CodexTyped', 'RelayStarted', 'RelayCommand')) {
+    foreach ($key in @('SessionId', 'Claude', 'Codex', 'RelaySession', 'MailboxReady', 'ClaudeTyped', 'CodexTyped',
+            'RelayStarted', 'RelayCommand', 'RelayStopFile', 'ClaudeLaunchRequired')) {
         $script:Launch.Remove($key)
     }
     $script:Launch.Checkout = $Checkout
+    $script:Launch.ClaudeLaunch = $ClaudeLaunch
     $script:Launch.CodexLaunch = $CodexLaunch
     $script:Launch.NoRelay = [bool]$NoRelay
     $hub = Join-Path $Checkout '.workbench'
@@ -464,13 +473,13 @@ function Start-WorkbenchSession {
     if ($plan.ClaudeSlot -eq 'split') { $claudeSide = 'right'; $codexSide = 'left' }
     $script:Launch.Claude = $plan.Claude
     $script:Launch.Codex = $plan.Codex
-    $freshPane = $plan.NeedSplit
+    $script:Launch.ClaudeLaunchRequired = $plan.NeedSplit -and $plan.NewPaneRole -eq 'Claude'
     if ($plan.NeedSplit) {
         Set-LaunchStage split
         $reply = Invoke-Ctl session split on --target $session.id
-        $script:Launch.Codex = ($reply -split '\s+')[0]
+        $script:Launch[$plan.NewPaneRole] = ($reply -split '\s+')[0]
         $confirmed = $false
-        foreach ($attempt in 1..5) {
+        foreach ($attempt in 1..30) {
             Start-Sleep -Milliseconds 300
             $updated = Get-SessionById $session.id
             if ($updated) {
@@ -484,22 +493,44 @@ function Start-WorkbenchSession {
         }
         if (-not $confirmed) { throw "the split did not appear for session $($session.id) (reply: $reply)" }
     }
+    $stopFile = Join-Path $hub 'state\relay.stop'
+    $restartRelay = $relaySession -and ($plan.NeedSplit -or -not $script:Launch.Adopted -or
+        ($registry.agents.claude.pane -and $registry.agents.claude.pane -ne $script:Launch.Claude) -or
+        ($registry.agents.codex.pane -and $registry.agents.codex.pane -ne $script:Launch.Codex) -or
+        (Test-Path -LiteralPath $stopFile))
+    if ($restartRelay) {
+        # Persist the restart before overwriting registry bindings. A later failure must not
+        # make the next run mistake the old relay's argv for the newly registered pane ids.
+        Set-LaunchStage relay-stop
+        $script:Launch.RelayStopFile = $stopFile
+        Write-LaunchLog relay "stopping relay $($relaySession.id); old panes=$($registry.agents.claude.pane),$($registry.agents.codex.pane); new panes=$($script:Launch.Claude),$($script:Launch.Codex)"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stopFile) | Out-Null
+        Set-Content -LiteralPath $stopFile -Value 'launcher: restart with current pane ids' -Encoding UTF8
+    }
     Set-LaunchStage mailbox
     $hub = Initialize-Mailbox -Checkout $Checkout -ClaudePane $script:Launch.Claude -CodexPane $script:Launch.Codex
     $script:Launch.MailboxReady = $true
     $script:Launch.RelayCommand = & $RelayCommand $hub $script:Launch.Claude $script:Launch.Codex
     Write-Done "mailbox ready: $hub"
-    Set-LaunchStage codex
-    Write-Step "waiting for the $codexSide pane's shell prompt"
-    $timeout = 3
-    if ($freshPane) { $timeout = 90 }
-    if (Wait-ShellPrompt -Pane $script:Launch.Codex -TimeoutSeconds $timeout -Adopted:(-not $freshPane)) {
-        Invoke-Ctl session type --select "$CodexLaunch`n" --target $script:Launch.Codex | Out-Null
-        $script:Launch.CodexTyped = $true
-        Write-Done "Codex starting in the $codexSide pane"
-    } else {
-        Write-LaunchLog codex 'pane is not a proven shell; no launch text sent'
-        Write-Warning "the $codexSide pane is not at a proven shell prompt; start Codex there yourself with:`n  $CodexLaunch"
+    $roles = @('Codex')
+    if ($script:Launch.ClaudeLaunchRequired) { $roles = @('Claude', 'Codex') }
+    foreach ($role in $roles) {
+        Set-LaunchStage $role.ToLowerInvariant()
+        $line = $script:Launch["${role}Launch"]
+        $side = $codexSide
+        if ($role -eq 'Claude') { $side = $claudeSide }
+        Write-Step "waiting for the $side pane's shell prompt"
+        $freshPane = $plan.NeedSplit -and $plan.NewPaneRole -eq $role
+        $timeout = 3
+        if ($freshPane) { $timeout = 90 }
+        if (Wait-ShellPrompt -Pane $script:Launch[$role] -TimeoutSeconds $timeout -Adopted:(-not $freshPane)) {
+            Invoke-Ctl session type --select "$line`n" --target $script:Launch[$role] | Out-Null
+            $script:Launch["${role}Typed"] = $true
+            Write-Done "$role starting in the $side pane"
+        } else {
+            Write-LaunchLog $role.ToLowerInvariant() 'pane is not a proven shell; no launch text sent'
+            Write-Warning "the $side pane is not at a proven shell prompt; start $role there yourself with:`n  $line"
+        }
     }
     if (-not $NoRelay) {
         Set-LaunchStage relay
@@ -508,17 +539,30 @@ function Start-WorkbenchSession {
             $script:Launch.RelaySession = $relaySession.id
             $relayPanes = @(Get-PaneIds $relaySession)
             if ($relayPanes.Count -ne 1) { throw "relay session '$($relaySession.id)' has multiple panes; restart it manually" }
-            if (Wait-ShellPrompt -Pane $relayPanes[0] -TimeoutSeconds 3 -Adopted) {
+            $timeout = 3
+            if ($restartRelay) { $timeout = 15 }
+            if (Wait-ShellPrompt -Pane $relayPanes[0] -TimeoutSeconds $timeout -Adopted) {
+                # relay.py leaves its stop file in place. Remove it only once a shell is proven.
+                if ($restartRelay) {
+                    Remove-Item -LiteralPath $stopFile -ErrorAction Stop
+                    $script:Launch.Remove('RelayStopFile')
+                }
                 Invoke-Ctl session type --select "$relay`n" --target $relayPanes[0] | Out-Null
                 $script:Launch.RelayStarted = $true
-            } else { Write-LaunchLog relay 'existing relay is not a proven shell; left running without typing' }
+            } elseif ($restartRelay) {
+                throw "relay session '$($relaySession.id)' did not reach a proven shell within 15 s; stop request remains at '$stopFile'. Wait for it to exit before following the repair commands."
+            } else {
+                Write-LaunchLog relay 'existing relay is not a proven shell; no launch text sent'
+                Write-Warning "relay session '$($relaySession.id)' is not at a proven shell prompt; if it has stopped, run there:`n  $relay"
+            }
         } else {
+            if (Test-Path -LiteralPath $stopFile) { Remove-Item -LiteralPath $stopFile -ErrorAction Stop }
             $reply = Invoke-Ctl session new --name "#$Number relay" --cwd $Checkout --workspace-name $RepoName `
                 --no-select --command $relay
             $script:Launch.RelaySession = ($reply -split '\s+')[0]
             $script:Launch.RelayStarted = $true
         }
-        Write-Done 'relay watching the mailbox and the PR'
+        if ($script:Launch.RelayStarted) { Write-Done 'relay watching the mailbox and the PR' }
     }
     Set-LaunchStage focus
     Invoke-Ctl session select $script:Launch.SessionId | Out-Null
@@ -533,13 +577,24 @@ function Format-RepairMessage($Launch) {
     foreach ($key in @('Checkout', 'IssueRef', 'SessionId', 'Claude', 'Codex', 'RelaySession')) {
         if ($Launch[$key]) { $lines += "${key}: $($Launch[$key])" }
     }
+    if ($Launch.DryRun) { return $lines -join "`n" }
     if ($Launch.MailboxReady) {
+        if ($Launch.ClaudeLaunchRequired) {
+            $lines += "In the Claude pane, once it is at an empty shell prompt: $($Launch.ClaudeLaunch)"
+        }
         $lines += "In the Codex pane, once it is at an empty shell prompt: $($Launch.CodexLaunch)"
         if (-not $Launch.NoRelay -and $Launch.RelayCommand) {
+            if ($Launch.RelayStopFile) {
+                $lines += "Only after the old relay has exited, clear its stop request: Remove-Item -LiteralPath $(Quote $Launch.RelayStopFile)"
+            }
             $lines += "In the relay's shell (only if the relay is not already running): $($Launch.RelayCommand)"
         }
     } else { $lines += 'Session setup or mailbox registration is incomplete; rerun to complete the missing steps.' }
-    if ($Launch.IssueRef) { $lines += "Resume and complete missing steps: github-workbench $(Quote $Launch.IssueRef)" }
+    if ($Launch.IssueRef) {
+        $resume = "Resume and complete missing steps: github-workbench $(Quote $Launch.IssueRef)"
+        if ($Launch.NoRelay) { $resume += ' -NoRelay' }
+        $lines += $resume
+    }
     return $lines -join "`n"
 }
 
@@ -684,6 +739,8 @@ function Get-PaneLaunch([string] $Script, [hashtable] $Arguments) {
 
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay)
+    $script:Launch.DryRun = [bool]$DryRun
+    $script:Launch.NoRelay = [bool]$NoRelay
     Set-LaunchStage config
     $config = Get-WorkbenchConfig
     Set-LaunchStage resolve
