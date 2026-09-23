@@ -97,6 +97,7 @@ CLAUDE_HINTS = (
     re.compile(r"\s*"),
     re.compile(r'Try\s+"[^"]*"\s*'),
     re.compile(r"Ask Claude[A-Za-z .,'…-]*"),
+    re.compile(r"Press up to edit queued messages"),
 )
 CODEX_HINTS = (
     re.compile(r"Ask Codex to do anything\s*"),
@@ -411,7 +412,9 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
                 if needs_key or now() >= deadline:
                     raise Failed('composer disappeared after submit; further keys withheld')
             elif looks_empty(profile, content):
-                outcome = 'queued' if profile.tool == 'codex' and queued_for(frame, typed) else 'submitted'
+                queued = ((profile.tool == 'codex' and queued_for(frame, typed)) or
+                          (profile.tool == 'claude' and content == 'Press up to edit queued messages'))
+                outcome = 'queued' if queued else 'submitted'
                 return ('submitted' if returned else outcome) + suffix
             elif not owns(content, typed):
                 raise Failed(f"composer holds something other than the attempted pointer: {content!r}; further keys withheld")

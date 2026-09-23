@@ -125,6 +125,13 @@ up to 30 minutes, then logs any notices still waiting before exiting. A failed s
 persisted and retried on later ticks, including after a restart. Relay dry runs neither file
 GitHub-event mail nor save announcement state.
 
+The relay follows the newest open PR from the watched repository and branch. A PR already
+finished before the relay observed it open is recorded and ignored. OPEN observation survives
+restarts: if that PR finishes while the relay is offline, its merge or closure still ends the
+loop after the final notices drain. Once those notices and status resets are resolved, the PR
+is retired; restarting on the same branch waits for the next open PR. Pending final notices
+from older relay versions are also drained once for compatibility.
+
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.
 
