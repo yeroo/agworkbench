@@ -8,8 +8,8 @@
   /start-github-issue, which drives the loop: agree a plan with Codex, Codex implements, Claude
   reviews with revmux, Codex fixes, the human reviews with revdiff and merges the PR.
 
-  Run it from PowerShell or cmd. Inside agwinterm or agliteterm it opens the session in that
-  window. From any other terminal it starts agwinterm (installing it with scoop if needed) and opens
+  Run it from PowerShell or cmd. Inside agwinterm or agliteterm it adopts the caller's session;
+  -NewSession keeps the separate-session/resume behavior. From another terminal it starts agwinterm and opens
   the session there.
 
   Each issue gets its own full clone under ~/source/workbench, on branch issue-<n>-<slug>, and its
@@ -29,6 +29,7 @@ param(
     [switch] $DryRun,
     [switch] $Yes,
     [switch] $NoRelay,
+    [switch] $NewSession,
     [switch] $Version
 )
 
@@ -46,7 +47,7 @@ if ($Version) {
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
@@ -55,6 +56,10 @@ if (-not $Issue) {
 $script:Launch = @{ Stage = 'config'; IssueRef = $Issue; DryRun = [bool]$DryRun; NoRelay = [bool]$NoRelay }
 if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
-    Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay
-})) { exit 1 }
+    Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession
+})) { exit $script:Launch.ExitCode }
+if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
+    Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef
+    exit $LASTEXITCODE
+}
 exit 0

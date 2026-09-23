@@ -19,6 +19,23 @@ it first, and what comes back is a located disagreement or a checked fact.
 
 The loop ends when the human has approved **and merged** the PR. Not before.
 
+## Adopted session
+
+If the launcher printed `WORKBENCH ADOPTED`, this existing Claude session now owns that issue.
+Use its printed `context:` line as the prefix of **every shell command** for the rest of this
+loop: `<context line> && <command>`, including the background `wb.py wait-mail` command. It sources
+the generated `adopted.sh`, changes to the issue checkout, and sets `AGWORKBENCH`, `AI_HUB` and
+`AI_BOX=claude`. These values replace any inherited context, even if `AI_HUB` was already set.
+If sourcing or changing directory fails, fix the context before running work commands; never
+continue in the old checkout. Continue this command yourself with the printed issue reference;
+the human does not need to type a slash command into your composer.
+
+Shell context does not change the project root used by Read, Write, Edit, Grep, or other file
+tools. For **every file read or written for this loop**, use an **absolute path under the printed
+`checkout:` directory**, never a relative path. This includes `.workbench/issue.md`, `plan.md`,
+scope and PR body files, and all source files inspected or reviewed. Apply the same rule to file
+paths in shell commands; do not let the original project root select the old checkout.
+
 ## The channel
 
 Everything goes through the workbench mailbox (`$AI_HUB`, the `.workbench/` folder of this clone).
