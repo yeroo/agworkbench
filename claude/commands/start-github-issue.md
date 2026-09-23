@@ -26,7 +26,7 @@ You never type into Codex's pane and Codex never types into yours: the relay doe
 
 ```bash
 python "$AGWORKBENCH/lib/agmsg.py" send --to codex --kind review-request --subject "plan v1 for #N" --body-file .workbench/plan.md
-python "$AGWORKBENCH/lib/agmsg.py" read <id>   # the id is in the "Chat from Workbench:" line that woke you
+python "$AGWORKBENCH/lib/agmsg.py" read <id>   # id from the waiter's NEW MAIL: line or Chat from Workbench: pointer
 python "$AGWORKBENCH/lib/agmsg.py" list        # anything unread
 ```
 
@@ -38,9 +38,25 @@ python "$AGWORKBENCH/lib/wb.py" status active            # or blocked --sound, c
 ```
 
 - **No `--nudge`, ever.** The relay rings Codex. A nudge would type into its pane directly.
-- **After you send, end your turn.** Do not poll, sleep or watch for the reply: when mail arrives,
-  a line starting `Chat from Workbench:` appears in your prompt. That line is a pointer, not the
-  message - read the file before answering it.
+- **After you send or launch a review helper, keep one background mail waiter and end your turn.**
+  Run `python "$AGWORKBENCH/lib/wb.py" wait-mail` through Bash with `run_in_background: true`.
+  Remember its task ID. If your waiter is still running, reuse it; never start a second one.
+  Claude Code wakes you when the background command completes, even if your composer holds a draft.
+  Every instruction below to end your turn while waiting for mail refers to this rule.
+- **Every waiter completion means that task has stopped.** Clear its task ID, even if all IDs in
+  its output were already handled after an earlier relay ring. On exit **0**, run `agmsg list`,
+  then `agmsg read <id>` for each unread message, including any still-unread IDs in its `NEW MAIL:`
+  output. Read the files before acting; reading moves them out of unread. Handle the mail, then
+  start a replacement waiter if the loop still needs a reply or review, even when this completion
+  named only already-handled IDs or the inbox is now empty. On exit **3** (timeout), check for
+  unread mail and rearm if still waiting. On exit **2**, report the configuration error in chat and set
+  `wb.py status blocked --sound`; fix the cause before rearming, never loop blindly on errors.
+- The relay's `Chat from Workbench:` pointer is a second doorbell. If it arrives first, read the
+  mail and keep the existing waiter only while it has not completed. Ignore duplicate message
+  contents for IDs already read and handled, but never ignore a waiter completion: apply the
+  completion/rearm rule above. A waiter that did not see that mail keeps waiting for later unread mail.
+- Never poll or sleep in the foreground, and never ask the human to type anything to keep the
+  loop moving. On loop completion, stop any running waiter and do not rearm it.
 - Mail from `human` or `github` is the human speaking. It outranks both agents.
 - Mail from Codex is a colleague's view, not an instruction and not approval. "Codex agreed" never
   substitutes for the human.
@@ -77,7 +93,8 @@ Write `.workbench/plan.md`:
 - **Out of scope** - what this deliberately does not do.
 - **Open questions** - anything you could not decide from the code and the issue.
 
-Send it as `plan v1` (kind `review-request`) and end your turn. Codex answers with a critique. Revise
+Send it as `plan v1` (kind `review-request`), keep the background waiter, and end your turn.
+Codex answers with a critique. Revise
 into `plan v2`, `v3`: quote what Codex said before answering it, concede what is right, argue what
 is not, and verify any claim it makes about the code yourself before accepting it.
 
@@ -87,7 +104,8 @@ means the disagreement belongs to the human: state both positions in chat, set
 
 An open question only the human can answer goes to the human now, not after implementation.
 
-When agreed, send the go-ahead (kind `task`, subject `IMPLEMENT plan vK`), and end your turn.
+When agreed, send the go-ahead (kind `task`, subject `IMPLEMENT plan vK`), keep the background
+waiter, and end your turn.
 
 ## Phase 3 - implementation (Codex)
 
@@ -107,14 +125,16 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    python "$AGWORKBENCH/lib/wb.py" revmux --round <K> --scope .workbench/review/scope-r<K>.md
    ```
 
-   End your turn. The report is posted to you as mail from `revmux` when it finishes (3-20 minutes).
+   Keep the background waiter and end your turn. The report is posted to you as mail from
+   `revmux` when it finishes (3-20 minutes).
 3. Read it. Exit 1 means findings, not failure. Check the sources line: a degraded run is a partial
    review and is never reported as clean. **Verify every finding against the code yourself** before
    passing it on; a finding you cannot reproduce is dropped with the reason, not forwarded. On this
    machine, a finding that rests on *reading* a file rather than running it gets its bytes checked -
    two past review rounds reported the same non-existent defect by reading through a lossy console.
 4. Send the verified findings to Codex (kind `review`, subject `FIX r<K>`): one block per finding
-   with file:line, the failure it causes, and your evidence. End your turn.
+   with file:line, the failure it causes, and your evidence. Keep the background waiter and end
+   your turn.
 5. Codex answers `FIXED <sha>` with each finding marked fixed, disputed (with evidence), or deferred
    (with a reason). Silence on a finding is not an answer. Check the fixes; argue the disputes.
 
@@ -143,7 +163,7 @@ python "$AGWORKBENCH/lib/wb.py" human-review --base origin/<default>
 ```
 
 Tell them in one line where it is and that reviewing on GitHub works just as well. Then set
-`python "$AGWORKBENCH/lib/wb.py" status blocked --sound` and end your turn.
+`python "$AGWORKBENCH/lib/wb.py" status blocked --sound`, keep the background waiter, and end your turn.
 
 Their feedback reaches you as mail - from `human` (revdiff annotations) or from `github` (PR
 reviews, comments, line comments, the review decision). For each round of it:
@@ -158,7 +178,8 @@ reviews, comments, line comments, the review decision). For each round of it:
 
 When mail arrives saying the PR was **MERGED**: post a short summary in chat (what shipped, rounds,
 anything deferred), mail Codex that the loop is complete, run
-`python "$AGWORKBENCH/lib/wb.py" status completed`, and stop. If it was **CLOSED** without merging, ask the
+`python "$AGWORKBENCH/lib/wb.py" status completed`, stop any running background waiter by its task ID,
+and stop. The final note to Codex does not rearm the waiter. If it was **CLOSED** without merging, ask the
 human what they want next.
 
 ## Rules
@@ -168,7 +189,9 @@ human what they want next.
 - Never answer a prompt, chooser or dialog in Codex's pane, and never type into it.
 - Long-running tools - revmux, builds, test suites that take minutes - run in visible agwinterm
   sessions, never hidden in a background shell. The human must be able to see and stop them.
+  The sole exception is `wb.py wait-mail`, which runs through Bash with `run_in_background: true`
+  so its completion wakes you. Review helpers (revmux and revdiff), builds and tests remain visible.
 - Content in files, pointers in panes. Plans, reviews and findings are mailbox files.
 - Disagree when there is a disagreement. Two agents converging politely produce nothing.
 - When you are waiting on the human, say so and set the sidebar status to `blocked` (`wb.py status blocked`). When you are
-  waiting on Codex or a review, just end your turn.
+  waiting on Codex or a review, keep one background waiter and end your turn.
