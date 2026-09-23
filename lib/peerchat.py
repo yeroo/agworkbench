@@ -62,7 +62,7 @@ SUBMIT_RETRIES = 2
 MAX_TYPED = 1200         # longer than this belongs in the inbox, not in a composer
 FRAGMENT = 24            # how much of the typed text must be visible before submitting
 QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
-CLAUDE_BUSY_RE = re.compile(r"…\s*\(\d+(?:m \d+)?s\s*·\s*↓")
+CLAUDE_BUSY_RE = re.compile(r"…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·")
 
 # Claude Code draws its composer as a `>` line between two horizontal rules; agwinterm renders the
 # rule with box-drawing dashes and the prompt glyph as `>` (macOS/agterm shows `>`).
@@ -149,9 +149,9 @@ def compact(text: str) -> str:
 
 
 def owns(content: str, typed: str) -> bool:
-    """All visible content must match our text, allowing wrapping and a clipped suffix."""
+    """All visible content must match a window of our text, allowing wrapping and scrolling."""
     visible, attempted = compact(content), compact(typed)
-    return bool(visible) and len(visible) >= min(FRAGMENT, len(attempted)) and attempted.startswith(visible)
+    return bool(visible) and len(visible) >= min(FRAGMENT, len(attempted)) and visible in attempted
 
 
 def queued_for(text: str, typed: str) -> bool:
@@ -353,7 +353,7 @@ def precheck(pane: str, profile: Profile) -> None:
 def verify_typed(pane: str, profile: Profile, typed: str) -> None:
     """Check ownership before the first key, including every visible wrapped row.
 
-    A clipped suffix is allowed; a different or extended draft must not be submitted.
+    A clipped head, tail or both is allowed; a different or extended draft must not be submitted.
     This verifies visible placement, not that every character was rendered or mail was read.
     """
     deadline = now() + VERIFY_TIMEOUT
@@ -373,7 +373,7 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
             seen = content
             if owns(content, typed):
                 return
-            if not looks_empty(profile, content) and not compact(typed).startswith(compact(content)):
+            if not looks_empty(profile, content) and compact(content) not in compact(typed):
                 raise Failed(f"composer holds something other than the attempted pointer: {content!r}; submit withheld")
         if now() >= deadline:
             break
@@ -444,8 +444,8 @@ def send_once(pane: str, profile: Profile, text: str, *, dry_run: bool) -> str:
     precheck(pane, profile)
     if dry_run:
         print(f"[dry-run] would type {len(text)} chars into pane {pane} "
-              f"and submit with {'Tab' if profile.submit == chr(9) else 'Return'}")
-        print(f"[dry-run] {text}")
+              f"and submit with {'Tab' if profile.submit == chr(9) else 'Return'}", file=sys.stderr)
+        print(f"[dry-run] {text}", file=sys.stderr)
         return 'dry-run'
     phase = 'typing text'
     try:

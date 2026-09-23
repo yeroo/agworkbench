@@ -119,6 +119,9 @@ per message. Failed rings stay unannounced and can be sent again once the compos
 When alerted mail is delivered or independently read, the relay clears its last outstanding alert
 for that recipient to idle. That reset can race a newer agent-hook status; avoiding the race
 would require terminal support for conditional status ownership.
+After merge or closure, the relay keeps delivering the final notices and alerting on holds for
+up to 30 minutes, then logs any notices still waiting before exiting. A failed status reset is
+retried on later ticks. Relay dry runs neither file GitHub-event mail nor save announcement state.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.

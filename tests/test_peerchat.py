@@ -9,109 +9,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agw
 import peerchat
+import relay
+from frames import (CLAUDE_IDLE, CLAUDE_RUNNING, CODEX_IDLE, CODEX_QUEUED, CODEX_UNSUBMITTED,
+                    TEXT, Clock, FakeAgw, claude, codex)
 
-# Verbatim captured frames supplied with plan v3 (Unicode preserved).
-
-CLAUDE_IDLE = r"""✻ Brewed for 1m 0s · done 4:23 PM
-─────────────────────────────────────────────────────
->
-─────────────────────────────────────────────────────
-  [Fable 5.1] C:\Users\boris\source\workbench\docxy-issue-50 on issue-50-suite-proje…
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
-
-CLAUDE_RUNNING = r"""● Checking mcp/skill coupling, testing dirs, docs mentioning projcore and control verbs
-· Hullaballooing… (2m 30s · ↓ 4.9k tokens · thinking some more with high effort)
-  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current
-     work
-───────────────────────────────────────────────────────────────────────────────────────
->
-───────────────────────────────────────────────────────────────────────────────────────
-  [Fable 5.1] C:\Users\boris\source\workbench\docxy-issue-50 on issue-50-suite-proje…
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
-
-CODEX_IDLE = r"""• No unread mail. Waiting for the next “Chat from Workbench:” notification; no files
-  edited.
-──────────────────────────────────────────────────
-› Ask Codex to do anything
-  gpt-6-astra high · ~\source\workbench\agworkbench-issue-1 · Wait for draft plan"""
-
-CODEX_QUEUED = r"""• Explored
-  └ Read SKILL.md (workbench-implementer skill)
-───────────────────────────────────────────────────────────────────────────────────────
-◦ Working (11s • esc to interrupt)
-• Queued follow-up inputs
-  ↳ Chat from Workbench: workbench mail from claude: plan v1 for #50 (step 1:
-    projcore::editor) [id 20260922T193916Z-claude-1528] - read it with: python C:
-    \Users\boris\source\agworkbench\lib\agmsg.py read 20260922T193916Z-claude-1528
-    …
-    alt + ↑ edit last queued message
-› Ask Codex to do anything
-  gpt-6-astra high · ~\source\workbench\docxy-issue-50 · Wait for implementation plan"""
-
-CODEX_UNSUBMITTED = r"""──────────────────────────────────────────────────
-› Chat from Workbench: workbench mail from claude: plan v1 for #50 step 2 (Project tab
-  kind in the suite) [id 20260922T221152Z-claude-7be1] - read it with: python C:
-  \Users\boris\source\agworkbench\lib\agmsg.py read 20260922T221152Z-claude-7be1
-  (AI_HUB=C:\Users\boris\source\workbench\docxy-issue-50\.workbench)
-  gpt-6-astra high · ~\source\workbench\docxy-issue-50 · Wait for implementation plan"""
-
-
-TEXT = (r"Chat from Workbench: workbench mail from claude: plan v1 for #50 (step 1: "
-        r"projcore::editor) [id 20260922T193916Z-claude-1528] - read it with: python C:\Users\boris\source\agworkbench\lib\agmsg.py "
-        r"read 20260922T193916Z-claude-1528 (AI_HUB=C:\Users\boris\source\workbench\docxy-issue-50\.workbench)")
-
-
-def codex(content, prefix=''):
-    return prefix + '\n' + '─' * 50 + '\n› ' + content + '\n  gpt-6-astra high · fixture'
-
-
-def claude(content):
-    return CLAUDE_IDLE.replace('\n>\n', '\n> ' + content + '\n')
-
-
-class Clock:
-    def __init__(self):
-        self.t = 0.0
-
-    def now(self):
-        return self.t
-
-    def pause(self, seconds):
-        self.t += seconds
-
-
-class FakeAgw:
-    def __init__(self, tool='codex', frames=None, after=None):
-        self.tool = tool
-        self.frames = list(frames) if frames else None
-        self.after = after
-        self.keys = []
-        self.reads = 0
-        self.read_errors = {}
-        self.type_errors = {}
-
-    def pane_text(self, pane):
-        self.reads += 1
-        if self.reads in self.read_errors:
-            raise self.read_errors[self.reads]
-        if self.frames:
-            if len(self.frames) > 1:
-                return self.frames.pop(0)
-            return self.frames[0]
-        if not self.keys:
-            return CODEX_IDLE if self.tool == 'codex' else CLAUDE_IDLE
-        if len(self.keys) == 1:
-            return codex(self.keys[0]) if self.tool == 'codex' else claude(self.keys[0])
-        if self.after:
-            return self.after(self)
-        return CODEX_IDLE if self.tool == 'codex' else CLAUDE_IDLE
-
-    def type_into(self, pane, text):
-        self.keys.append(text)
-        if len(self.keys) in self.type_errors:
-            raise self.type_errors[len(self.keys)]
 
 
 class Submission(unittest.TestCase):
@@ -149,6 +53,15 @@ class Submission(unittest.TestCase):
     def test_queue_label_requires_matching_text_as_well_as_id(self):
         frame = CODEX_QUEUED.replace('step 1:', 'step 2:')
         self.assertEqual('submitted', self.send(FakeAgw(after=lambda f: frame)))
+
+    def test_clipped_queue_prefix_needs_an_id_and_later_entries_are_checked(self):
+        clipped = TEXT.split('[id ', 1)[0].rstrip()
+        self.assertTrue(peerchat.owns(clipped, TEXT))
+        queue = '• Queued follow-up inputs\n  ↳ ' + clipped + '\n'
+        for entries, outcome in [(queue, 'submitted'), (queue + '  ↳ ' + TEXT + '\n', 'queued')]:
+            with self.subTest(outcome=outcome):
+                frame = codex('Ask Codex to do anything', entries)
+                self.assertEqual(outcome, self.send(FakeAgw(after=lambda f: frame)))
 
     def test_submit_and_queue_after_retries_report_the_path(self):
         for retry, completed, expected in [(1, CODEX_IDLE, 'submitted after retry 1'),
@@ -204,7 +117,7 @@ class Submission(unittest.TestCase):
 
     def test_short_wrapped_and_clipped_text_can_be_verified(self):
         cases = [('hello', 'hello'), (TEXT, TEXT[:70] + '\n  ' + TEXT[70:]),
-                 (TEXT, TEXT[:90])]
+                 (TEXT, TEXT[:90]), (TEXT, TEXT[70:]), (TEXT, TEXT[70:150])]
         for text, rendered in cases:
             with self.subTest(rendered=rendered):
                 fake = FakeAgw(frames=[CODEX_IDLE, codex(rendered), CODEX_IDLE])
@@ -269,7 +182,7 @@ class Submission(unittest.TestCase):
 
     def test_dry_run_only_prechecks(self):
         fake = FakeAgw()
-        with self.environment(fake), contextlib.redirect_stdout(io.StringIO()):
+        with self.environment(fake), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual('dry-run', peerchat.send_once('pane', peerchat.PROFILES['codex'], TEXT, dry_run=True))
         self.assertEqual([], fake.keys)
         self.assertEqual(1, fake.reads)
@@ -283,6 +196,19 @@ class Submission(unittest.TestCase):
             self.assertEqual(0, peerchat.main())
         self.assertEqual({'sent': 'submitted', 'to': 'codex', 'pane': 'pane'}, json.loads(output.getvalue()))
 
+    def test_dry_run_cli_stdout_is_json_and_diagnostics_are_stderr(self):
+        fake = FakeAgw()
+        output, diagnostics = io.StringIO(), io.StringIO()
+        with self.environment(fake), patch.object(sys, 'argv', ['peerchat', '--to', 'codex', '--text', 'hello', '--label', '', '--dry-run']), \
+                patch.object(peerchat, 'resolve_target', return_value=('pane', peerchat.PROFILES['codex'], 'codex')), \
+                patch.object(agw, 'my_pane', return_value='other'), contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(diagnostics):
+            self.assertEqual(0, peerchat.main())
+        self.assertEqual({'sent': 'dry-run', 'to': 'codex', 'pane': 'pane'}, json.loads(output.getvalue()))
+        self.assertIn('[dry-run] would type', diagnostics.getvalue())
+        self.assertEqual([], fake.keys)
+        self.assertEqual(1, fake.reads)
+
 
 class CapturedBusyFrames(unittest.TestCase):
     def test_activity_matches_captured_frames(self):
@@ -291,3 +217,15 @@ class CapturedBusyFrames(unittest.TestCase):
                                 (CODEX_UNSUBMITTED, False)]:
             with self.subTest(frame=frame):
                 self.assertEqual(expected, peerchat.is_busy(frame))
+
+    def test_claude_spinner_remains_busy_above_a_tall_tip_block(self):
+        frame = CLAUDE_RUNNING.replace('\n  ⎿', '\n' + '  more tip details\n' * 20 + '  ⎿')
+        self.assertNotIn('Hullaballooing', '\n'.join(frame.splitlines()[-15:]))
+        self.assertTrue(relay.is_busy(frame))
+
+    def test_claude_hours_and_upload_phase_are_busy(self):
+        for activity in ['1h 2m 3s · ↓ 4.9k tokens', '45s · ↑ 1.2k tokens', '2m 30s · thinking']:
+            with self.subTest(activity=activity):
+                frame = CLAUDE_RUNNING.replace('2m 30s · ↓ 4.9k tokens', activity)
+                self.assertTrue(relay.is_busy(frame))
+        self.assertFalse(relay.is_busy(CLAUDE_IDLE))

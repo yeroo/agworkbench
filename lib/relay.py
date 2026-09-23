@@ -10,7 +10,8 @@ Two jobs, one loop, one process per issue, running in its own visible agwinterm 
 
 2. **The pull request.** Once a PR exists for the issue branch, the relay watches it and files a
    message to Claude on every event that needs acting on: a new review, a changed review decision,
-   a new comment, a merge, a close. The loop ends when the PR is merged (or closed).
+   a new comment, a merge, a close. After merge/closure the loop drains its final notices, with
+   a bounded wait for recipients whose composers are unavailable.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory and the GitHub API, which cannot push to it.
@@ -41,6 +42,7 @@ from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 PR_FIELDS = "number,url,state,reviewDecision,mergedAt,reviews,comments,headRefName"
 HOLD_ALERT_AFTER = 60.0
 ALERT_EVERY = 300.0
+TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 
 
 @dataclass(frozen=True)
@@ -56,12 +58,20 @@ def now() -> float:
     return time.monotonic()
 
 
+def pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
 @dataclass
 class Hold:
     first_at: float
     reason: str
     last_alert_at: float | None = None
-    alerted: bool = False
+    clear_pending: bool = False
+
+    @property
+    def alerted(self) -> bool:
+        return self.last_alert_at is not None
 
 
 def pointer_text(message: dict[str, Any], agmsg: Path, hub_dir: Path) -> str:
@@ -199,8 +209,7 @@ class Relay:
                 entry.last_alert_at is None or instant - entry.last_alert_at >= ALERT_EVERY):
             if not self.dry_run:
                 entry.last_alert_at = instant
-                entry.alerted = True
-                self.alert(peer, mid, reason)
+                self.alert(peer, mid, entry.reason)
 
     def alert(self, peer: Peer, mid: str, reason: str) -> None:
         import agw
@@ -220,13 +229,20 @@ class Relay:
         """Clear our last alert for a recipient. Without conditional terminal status ownership,
         this requested idle reset can race a newer status set by the agent's hook."""
         import agw
-        entry = self.holds.pop((peer.box, mid), None)
+        key = (peer.box, mid)
+        entry = self.holds.get(key)
         if entry and entry.alerted and not self.dry_run and not any(
-                box == peer.box and held.alerted for (box, _), held in self.holds.items()):
+                box == peer.box and (box, other_mid) != key and held.alerted
+                for (box, other_mid), held in self.holds.items()):
             try:
                 agw.set_status('idle', pane_id=peer.pane)
             except (agw.CtlError, OSError) as err:
+                entry.clear_pending = True
                 self.log(f"could not clear relay status for {peer.box}: {err}")
+                return entry
+        if entry:
+            self.holds.pop(key)
+            self.log(f"cleared hold {peer.box} for {mid}; last reason: {entry.reason}")
         return entry
 
     def deliver_mail(self) -> None:
@@ -237,11 +253,13 @@ class Relay:
             messages = [(path, self.hub.parse_message(path)) for path in self.hub.unread(peer.box)]
             unread_ids = {message.get('id', path.stem) for path, message in messages}
             for box, mid in list(self.holds):
-                if box == peer.box and (mid not in unread_ids or mid in announced):
+                if box == peer.box and (self.holds[(box, mid)].clear_pending or
+                                        mid not in unread_ids or mid in announced):
                     self.clear(peer, mid)
             for path, message in messages:
                 mid = message.get('id', path.stem)
-                if mid in announced:
+                if mid in announced or (self.holds.get((peer.box, mid)) and
+                                       self.holds[(peer.box, mid)].clear_pending):
                     continue
                 try:
                     if peer.tool == "claude" and is_busy(agw.pane_text(peer.pane)):
@@ -250,6 +268,7 @@ class Relay:
                                                  pointer_text(message, self.agmsg, self.hub_dir))
                     if self.dry_run:
                         self.log(f"[dry-run] would ring {peer.box}: {text}")
+                        continue
                     else:
                         outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool], text,
                                                 dry_run=False, retry=False)
@@ -285,37 +304,72 @@ class Relay:
         return snapshot
 
     def watch_pr(self) -> bool:
-        """Returns True when the loop is over."""
+        """Returns True when the PR is terminal; its filed notices must still be delivered."""
         snapshot = self.fetch_pr()
         if snapshot is None:
             return False
+        terminal_mail = list(self.state.get('terminal_mail', []))
         for event in pr_events(self.state.get("pr"), snapshot):
             recipients = ["claude"]
-            if "MERGED" in event["subject"] or "CLOSED" in event["subject"]:
+            terminal = "MERGED" in event["subject"] or "CLOSED" in event["subject"]
+            if terminal:
                 recipients = [p.box for p in self.peers]
             for box in recipients:
-                self.hub.write_message(to=box, sender="github", subject=event["subject"],
-                                       body=event["body"], kind=event["kind"])
-            self.log(f"github: {event['subject']}")
-        self.state["pr"] = snapshot
-        self._save()
+                if self.dry_run:
+                    self.log(f"[dry-run] would file github mail for {box}: {event['subject']}")
+                    continue
+                path = self.hub.write_message(to=box, sender="github", subject=event["subject"],
+                                              body=event["body"], kind=event["kind"])
+                if terminal:
+                    terminal_mail.append([box, path.stem])
+            if not self.dry_run:
+                self.log(f"github: {event['subject']}")
+        if not self.dry_run:
+            self.state["pr"] = snapshot
+            self.state['terminal_mail'] = terminal_mail
+            self._save()
         return finished(snapshot)
+
+    def pending_terminal_mail(self) -> set[tuple[str, str]]:
+        announced = set(self.state.get('announced', []))
+        targets = {tuple(target) for target in self.state.get('terminal_mail', [])}
+        unread = {(box, self.hub.parse_message(path).get('id', path.stem))
+                  for box in {box for box, _ in targets} for path in self.hub.unread(box)}
+        return {(box, mid) for box, mid in targets & unread if mid not in announced}
 
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
         next_pr = 0.0
+        drain_deadline = None
         while True:
             if self.stop_file.exists():
                 self.log("stop file found; exiting")
                 return 0
             self.deliver_mail()
-            if time.time() >= next_pr:
-                next_pr = time.time() + self.pr_interval
-                if self.watch_pr():
-                    self.deliver_mail()          # announce the merge before leaving
-                    self.log("PR is finished; the relay's job is done")
+            if drain_deadline is not None:
+                pending = self.pending_terminal_mail()
+                resets = {key for key, held in self.holds.items() if held.clear_pending}
+                if not pending and not resets:
+                    self.log("PR is finished; final notices delivered or read; the relay's job is done")
                     return 0
-            time.sleep(self.mail_interval)
+                if now() >= drain_deadline:
+                    detail = '; '.join(f"{box}/{mid}: {self.holds[(box, mid)].reason if (box, mid) in self.holds else 'not delivered'}"
+                                       for box, mid in sorted(pending | resets))
+                    self.log(f"PR is finished; drain deadline reached; still held or awaiting status reset: {detail}")
+                    return 0
+            elif now() >= next_pr:
+                next_pr = now() + self.pr_interval
+                if self.watch_pr():
+                    if self.dry_run:
+                        self.log('[dry-run] PR is finished; no final mail filed')
+                        return 0
+                    drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT
+                    self.log('PR is finished; draining final notices before exit')
+                    continue
+            delay = self.mail_interval
+            if drain_deadline is not None:
+                delay = min(delay, max(0, drain_deadline - now()))
+            pause(delay)
 
 
 def main() -> int:
