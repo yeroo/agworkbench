@@ -18,7 +18,8 @@ refusals; the differences are forced by the terminal:
   * panes are addressed by pane id from `tree --json`, not by `--pane left|right`.
 
 What survives unchanged is the important half: the message is TYPED into a live TUI, so every
-check fails closed, a refusal before typing is retried and a failure after typing never is.
+check fails closed. A send types the text once; only submit keys may be retried, after a fresh
+composer check. A failed send never retypes text into an occupied composer.
 
 Usage:
   peer-chat.py --to codex --stdin < message.txt
@@ -31,6 +32,7 @@ Exit codes: 0 sent, 1 refused or failed, 130 interrupted.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -55,8 +57,12 @@ RETRY_ATTEMPTS = 5       # pre-write refusals only
 RETRY_DELAY = 10.0
 SETTLE = 0.35            # let the TUI redraw before reading it back
 VERIFY_TIMEOUT = 3.0
+SUBMIT_TIMEOUT = 5.0
+SUBMIT_RETRIES = 2
 MAX_TYPED = 1200         # longer than this belongs in the inbox, not in a composer
 FRAGMENT = 24            # how much of the typed text must be visible before submitting
+QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
+CLAUDE_BUSY_RE = re.compile(r"…\s*\(\d+(?:m \d+)?s\s*·\s*↓")
 
 # Claude Code draws its composer as a `>` line between two horizontal rules; agwinterm renders the
 # rule with box-drawing dashes and the prompt glyph as `>` (macOS/agterm shows `>`).
@@ -121,7 +127,59 @@ class Refused(RuntimeError):
 
 
 class Failed(RuntimeError):
-    """Something failed after text was typed. Never retried."""
+    """A send failed after typing started; never retype into the occupied composer."""
+
+
+def now() -> float:
+    return time.monotonic()
+
+
+def pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def is_busy(text: str) -> bool:
+    """Current agent activity, including Claude's elapsed-time/token spinner row."""
+    tail = "\n".join(text.splitlines()[-BOX_LINES:]).lower()
+    return "esc to interrupt" in tail or bool(CLAUDE_BUSY_RE.search(tail))
+
+
+def compact(text: str) -> str:
+    return "".join(text.split())
+
+
+def owns(content: str, typed: str) -> bool:
+    """All visible content must match our text, allowing wrapping and a clipped suffix."""
+    visible, attempted = compact(content), compact(typed)
+    return bool(visible) and len(visible) >= min(FRAGMENT, len(attempted)) and attempted.startswith(visible)
+
+
+def queued_for(text: str, typed: str) -> bool:
+    """Recognize this pointer in a queue entry, including its complete message id."""
+    mid = re.search(r"\[id\s+([^\]\s]+)\]", typed)
+    if not mid:
+        return False
+    entries: list[str] = []
+    in_queue = False
+    for row in text.splitlines():
+        if QUEUED_RE.match(row):
+            in_queue = True
+            continue
+        if not in_queue:
+            continue
+        if CODEX_PROMPT_RE.match(row) or CODEX_SHELL_PROMPT_RE.match(row):
+            break
+        start = re.match(r"^\s*↳\s+(.*)$", row)
+        if start:
+            entries.append(start.group(1))
+        elif row.strip() == '…' or row.strip().startswith('alt +'):
+            continue
+        elif row.startswith('  ') and entries:
+            entries[-1] += row.strip()
+        elif row.strip():
+            break
+    marker = compact(mid.group(0))
+    return any(marker in compact(entry) and owns(entry, typed) for entry in entries)
 
 
 # --- reading the composer -------------------------------------------------------------------
@@ -293,20 +351,12 @@ def precheck(pane: str, profile: Profile) -> None:
 
 
 def verify_typed(pane: str, profile: Profile, typed: str) -> None:
-    """Prove the typed text reached the composer, or raise `Failed` and let the caller stop.
+    """Check ownership before the first key, including every visible wrapped row.
 
-    What is compared is the FIRST `FRAGMENT` characters of the typed text - which, since every
-    send is prefixed with "Chat from X: ", is the label plus about six characters of the message -
-    against the whole joined composer content, wrapped rows included. It is evidence that the
-    message started to land, not that all of it did.
-
-    Widening it to the whole message would be wrong: Codex clips a long composer to a fixed number
-    of visible rows, so a 1200-character send would fail verification with the text already in a
-    live composer. This never raises `Refused` for the same reason - by the time it runs the text
-    is in someone else's input box, and a retry would duplicate it.
+    A clipped suffix is allowed; a different or extended draft must not be submitted.
+    This verifies visible placement, not that every character was rendered or mail was read.
     """
-    fragment = normalize(typed)[:FRAGMENT]
-    deadline = time.time() + VERIFY_TIMEOUT
+    deadline = now() + VERIFY_TIMEOUT
     seen = ""
     while True:
         text = agw.pane_text(pane)
@@ -319,36 +369,99 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
                 "submit withheld. Read the pane before doing anything else."
             )
         content = composer(profile, text)
-        if content:
-            seen = normalize(content)
-            if fragment in seen:
+        if content is not None:
+            seen = content
+            if owns(content, typed):
                 return
-        if time.time() >= deadline:
+            if not looks_empty(profile, content) and not compact(typed).startswith(compact(content)):
+                raise Failed(f"composer holds something other than the attempted pointer: {content!r}; submit withheld")
+        if now() >= deadline:
             break
-        time.sleep(0.25)
+        pause(0.25)
     raise Failed(
         "typed text was not confirmed in the target composer; submit withheld. "
-        f"Looked for {fragment!r}; the pane now shows {seen[:120]!r} - "
+        f"The pane now shows {seen[:120]!r} - "
         "read it before doing anything else."
     )
 
 
-def send_once(pane: str, profile: Profile, text: str, *, dry_run: bool) -> int:
+def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
+    """Verify an empty composer; retry only the key, with a fresh guard before each press."""
+    retries = 0
+    returned = False
+    suffix = ''
+    needs_key = False
+    deadline = now() + SUBMIT_TIMEOUT
+    content = None
+    phase = 'verifying submit'
+    try:
+        while True:
+            frame = agw.pane_text(pane)
+            if dialog_visible(frame):
+                raise Failed('a chooser or approval dialog appeared after submit; further keys withheld')
+            content = composer(profile, frame)
+            if content is None:
+                if needs_key or now() >= deadline:
+                    raise Failed('composer disappeared after submit; further keys withheld')
+            elif looks_empty(profile, content):
+                outcome = 'queued' if profile.tool == 'codex' and queued_for(frame, typed) else 'submitted'
+                return ('submitted' if returned else outcome) + suffix
+            elif not owns(content, typed):
+                raise Failed(f"composer holds something other than the attempted pointer: {content!r}; further keys withheld")
+            elif needs_key:
+                if retries < SUBMIT_RETRIES:
+                    retries += 1
+                    key = profile.submit
+                    phase = f'retry {retries}'
+                    suffix = f' after retry {retries}'
+                elif (profile.tool == 'codex' and not returned and not is_busy(frame)
+                      and 'esc to interrupt' not in frame.lower()
+                      and 'queued follow-up inputs' not in frame.lower()):
+                    key = '\n'
+                    returned = True
+                    phase = 'Return fallback'
+                    suffix = ' after Return'
+                else:
+                    raise Failed(f"pointer still unsent in composer: {content!r}; submit retries exhausted")
+                agw.type_into(pane, key)
+                pause(SETTLE)
+                phase = 'verifying submit' + suffix
+                deadline = now() + SUBMIT_TIMEOUT
+                needs_key = False
+                continue
+            elif now() >= deadline:
+                # Re-read before any additional key: the deadline frame is not authorization
+                # to submit a dialog/draft that appeared just after that frame.
+                needs_key = True
+                continue
+            pause(0.25)
+    except (agw.CtlError, OSError) as err:
+        raise Failed(f"{phase}: {err}; last composer: {content!r}") from err
+
+
+def send_once(pane: str, profile: Profile, text: str, *, dry_run: bool) -> str:
     reject_control_bytes(text)   # defence in depth: every path into a pane passes through here
     precheck(pane, profile)
     if dry_run:
         print(f"[dry-run] would type {len(text)} chars into pane {pane} "
               f"and submit with {'Tab' if profile.submit == chr(9) else 'Return'}")
         print(f"[dry-run] {text}")
-        return 0
-    agw.type_into(pane, text)
-    time.sleep(SETTLE)
-    verify_typed(pane, profile, text)
-    agw.type_into(pane, profile.submit)
-    return len(text)
+        return 'dry-run'
+    phase = 'typing text'
+    try:
+        agw.type_into(pane, text)
+        pause(SETTLE)
+        phase = 'verifying typed text'
+        verify_typed(pane, profile, text)
+        phase = 'submitting'
+        agw.type_into(pane, profile.submit)
+        pause(SETTLE)
+        return verify_submitted(pane, profile, text)
+    except (agw.CtlError, OSError) as err:
+        raise Failed(f"{phase}: {err}") from err
 
 
-def send(pane: str, profile: Profile, text: str, *, dry_run: bool, retry: bool) -> int:
+def send(pane: str, profile: Profile, text: str, *, dry_run: bool, retry: bool) -> str:
     attempts = RETRY_ATTEMPTS if retry else 1
     for attempt in range(1, attempts + 1):
         try:
@@ -358,7 +471,7 @@ def send(pane: str, profile: Profile, text: str, *, dry_run: bool, retry: bool) 
                 raise
             print(f"peer-chat: {refusal} (attempt {attempt}/{attempts}, retrying in "
                   f"{int(RETRY_DELAY)}s)", file=sys.stderr)
-            time.sleep(RETRY_DELAY)
+            pause(RETRY_DELAY)
     raise Refused("unreachable")
 
 
@@ -434,7 +547,7 @@ def main() -> int:
             print("peer-chat: refusing to type into my own pane", file=sys.stderr)
             return 1
         sent = send(pane, profile, text, dry_run=args.dry_run, retry=not args.no_retry)
-        print(f'{{"sent": {sent}, "to": "{name}", "pane": "{pane}"}}')
+        print(json.dumps({"sent": sent, "to": name, "pane": pane}))
         return 0
     except KeyboardInterrupt:
         return 130

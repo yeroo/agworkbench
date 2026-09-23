@@ -17,7 +17,8 @@ relay itself polls the mailbox directory and the GitHub API, which cannot push t
 
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
-refusal before typing is retried on the next tick; a failure after typing is never retried.
+refusal before typing is retried on the next tick. Submit keys are verified and retried by
+peerchat; a failed ring is announced only after a later send succeeds from an empty composer.
 """
 
 from __future__ import annotations
@@ -35,8 +36,11 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
+
 PR_FIELDS = "number,url,state,reviewDecision,mergedAt,reviews,comments,headRefName"
-BUSY_MARKERS = ("esc to interrupt",)     # Claude Code and Codex both draw this while a turn runs
+HOLD_ALERT_AFTER = 60.0
+ALERT_EVERY = 300.0
 
 
 @dataclass(frozen=True)
@@ -48,11 +52,16 @@ class Peer:
 
 # --- pure logic (tested without a terminal or a network) ------------------------------------
 
-def is_busy(pane_text: str) -> bool:
-    """True while an agent is mid-turn. Only matters for Claude: its submit key is Return, which
-    lands INSIDE a running turn, while Codex's Tab queues. So Claude is rung only when idle."""
-    tail = "\n".join(pane_text.splitlines()[-15:]).lower()
-    return any(marker in tail for marker in BUSY_MARKERS)
+def now() -> float:
+    return time.monotonic()
+
+
+@dataclass
+class Hold:
+    first_at: float
+    reason: str
+    last_alert_at: float | None = None
+    alerted: bool = False
 
 
 def pointer_text(message: dict[str, Any], agmsg: Path, hub_dir: Path) -> str:
@@ -160,6 +169,7 @@ class Relay:
         self.stop_file = hub_dir / "state" / "relay.stop"
         self.state = self._load()
         self.agmsg = HERE / "agmsg.py"
+        self.holds: dict[tuple[str, str], Hold] = {}
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -177,37 +187,85 @@ class Relay:
         print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
 
     # mail -----------------------------------------------------------------------------------
+    def hold(self, peer: Peer, mid: str, reason: str, *, failed: bool = False) -> None:
+        instant = now()
+        entry = self.holds.setdefault((peer.box, mid), Hold(instant, reason))
+        entry.reason = reason
+        if failed:
+            self.log(f"FAILED ringing {peer.box} for {mid}: {reason}")
+        else:
+            self.log(f"{peer.box} not ready ({reason}); holding {mid}")
+        if (failed or instant - entry.first_at >= HOLD_ALERT_AFTER) and (
+                entry.last_alert_at is None or instant - entry.last_alert_at >= ALERT_EVERY):
+            if not self.dry_run:
+                entry.last_alert_at = instant
+                entry.alerted = True
+                self.alert(peer, mid, reason)
+
+    def alert(self, peer: Peer, mid: str, reason: str) -> None:
+        import agw
+        message = f"workbench mail for {peer.box} ({mid}) is waiting: {reason}"
+        self.log(f"ALERT {message}")
+        # Attempt the notification even if setting status failed (and vice versa).
+        try:
+            agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not set blocked status for {peer.box}: {err}")
+        try:
+            agw.notify(peer.pane, message, title='workbench relay')
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not notify {peer.box}: {err}")
+
+    def clear(self, peer: Peer, mid: str) -> Hold | None:
+        """Clear our last alert for a recipient. Without conditional terminal status ownership,
+        this requested idle reset can race a newer status set by the agent's hook."""
+        import agw
+        entry = self.holds.pop((peer.box, mid), None)
+        if entry and entry.alerted and not self.dry_run and not any(
+                box == peer.box and held.alerted for (box, _), held in self.holds.items()):
+            try:
+                agw.set_status('idle', pane_id=peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not clear relay status for {peer.box}: {err}")
+        return entry
+
     def deliver_mail(self) -> None:
         import agw
         import peerchat
         announced = set(self.state.get("announced", []))
         for peer in self.peers:
-            for path in self.hub.unread(peer.box):
-                message = self.hub.parse_message(path)
-                mid = message.get("id", path.stem)
+            messages = [(path, self.hub.parse_message(path)) for path in self.hub.unread(peer.box)]
+            unread_ids = {message.get('id', path.stem) for path, message in messages}
+            for box, mid in list(self.holds):
+                if box == peer.box and (mid not in unread_ids or mid in announced):
+                    self.clear(peer, mid)
+            for path, message in messages:
+                mid = message.get('id', path.stem)
                 if mid in announced:
                     continue
                 try:
                     if peer.tool == "claude" and is_busy(agw.pane_text(peer.pane)):
-                        self.log(f"{peer.box} is mid-turn; holding {mid} for the next tick")
-                        continue
+                        raise peerchat.Refused('mid-turn; waiting for the agent to finish')
                     text = peerchat.compose_text("Chat from Workbench: ",
                                                  pointer_text(message, self.agmsg, self.hub_dir))
                     if self.dry_run:
                         self.log(f"[dry-run] would ring {peer.box}: {text}")
                     else:
-                        peerchat.send(peer.pane, peerchat.PROFILES[peer.tool], text,
-                                      dry_run=False, retry=False)
-                        self.log(f"rang {peer.box} for {mid} ({message.get('subject', '')})")
+                        outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool], text,
+                                                dry_run=False, retry=False)
+                        held = self.clear(peer, mid)
+                        duration = f" after holding {now() - held.first_at:.0f}s" if held else ''
+                        self.log(f"rang {peer.box} for {mid} ({message.get('subject', '')}) [{outcome}]{duration}")
                 except peerchat.Refused as refusal:
                     # nothing was typed; try again next tick
-                    self.log(f"{peer.box} not ready ({refusal}); holding {mid}")
+                    self.hold(peer, mid, str(refusal))
                     continue
                 except peerchat.Failed as failure:
-                    # text may be sitting in the composer: never retry, never duplicate
-                    self.log(f"FAILED ringing {peer.box} for {mid} after typing: {failure}")
-                except agw.CtlError as err:
-                    self.log(f"terminal not reachable ({err}); holding {mid}")
+                    # Next tick may retry only through peerchat's empty-composer precheck.
+                    self.hold(peer, mid, str(failure), failed=True)
+                    continue
+                except (agw.CtlError, OSError) as err:
+                    self.hold(peer, mid, f"terminal not reachable: {err}")
                     continue
                 announced.add(mid)
                 self.state["announced"] = sorted(announced)

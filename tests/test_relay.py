@@ -8,12 +8,19 @@ Claude is never rung while it is mid-turn.
 from __future__ import annotations
 
 import sys
+import os
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import relay  # noqa: E402
+import agw
+import hub
+import peerchat
+from tests.test_peerchat import CLAUDE_IDLE, CLAUDE_RUNNING, CODEX_IDLE, Clock, FakeAgw, codex
 
 OPEN = {"number": 7, "url": "https://github.com/o/r/pull/7", "state": "OPEN", "reviewDecision": "",
         "reviews": [], "comments": [], "inline": []}
@@ -121,6 +128,198 @@ class PaneIds(unittest.TestCase):
 
     def test_two_distinct_pane_ids_pass(self):
         relay.check_panes(self.GOOD, "d387360b-a120-4e4b-b7a4-4db3171780ab")
+
+
+class Delivery(unittest.TestCase):
+    def setUp(self):
+        self.peer = relay.Peer('codex', 'codex', 'codex-pane')
+        # Run the constructor, replacing only mailbox storage boundaries. No real hub is touched.
+        with patch.dict(os.environ), patch.object(hub, 'reload_paths'), \
+                patch.object(relay.Relay, '_load', return_value={'announced': [], 'pr': None}):
+            self.r = relay.Relay(Path('fixture-hub'), [self.peer], 'o/r', 'issue-6', 5, 60)
+        self.messages = {'m1': {'id': 'm1', 'from': 'claude', 'subject': 'review'}}
+        self.unread = {'codex': ['m1']}
+        self.r.hub = SimpleNamespace(unread=lambda box: [Path(mid + '.md') for mid in self.unread.get(box, [])],
+                                     parse_message=lambda path: self.messages[path.stem])
+        self.r._save = Mock()
+        self.logs = []
+        self.r.log = self.logs.append
+        self.t = 0
+        self.enterContext(patch.object(relay, 'now', lambda: self.t))
+        # An accidental real terminal request is a hard test failure.
+        self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('real terminal request')))
+        self.status = self.enterContext(patch.object(agw, 'set_status'))
+        self.notify = self.enterContext(patch.object(agw, 'notify'))
+        self.pane = self.enterContext(patch.object(agw, 'pane_text', return_value=CLAUDE_IDLE))
+        self.real_send = peerchat.send
+        self.send = self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
+
+    def tick(self, instant):
+        self.t = instant
+        self.r.deliver_mail()
+
+    def assert_unannounced(self):
+        self.assertEqual([], self.r.state['announced'])
+        self.r._save.assert_not_called()
+        self.assertFalse(any(line.startswith('rang ') for line in self.logs))
+
+    def test_failed_ring_alerts_throttles_and_recovers(self):
+        self.send.side_effect = peerchat.Failed("pointer still unsent in composer: 'the pointer'")
+        self.tick(0)
+        self.assert_unannounced()
+        self.status.assert_called_once_with('blocked', sound=True, blink=True, pane_id=self.peer.pane)
+        self.assertEqual(1, self.notify.call_count)
+        notice = self.notify.call_args.args[1]
+        for text in ['codex', 'm1', 'the pointer']:
+            self.assertIn(text, notice)
+        self.assertTrue(any(line.startswith('FAILED ringing codex for m1:') for line in self.logs))
+        self.tick(299)
+        self.assertEqual(1, self.notify.call_count)
+        self.tick(300)
+        self.assertEqual(2, self.notify.call_count)
+        self.send.side_effect = None
+        self.tick(310)
+        self.assertEqual(['m1'], self.r.state['announced'])
+        self.r._save.assert_called_once()
+        self.assertIn('rang codex for m1 (review) [submitted] after holding 310s', self.logs)
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+        self.assertEqual({}, self.r.holds)
+
+    def test_draft_hold_alerts_after_a_minute_and_clears_on_success(self):
+        self.send.side_effect = peerchat.Refused("composer holds a draft: 'check if codex replied'")
+        self.tick(0)
+        self.tick(30)
+        self.notify.assert_not_called()
+        self.status.assert_not_called()
+        self.tick(61)
+        self.assertEqual(1, self.notify.call_count)
+        self.assertIn('check if codex replied', self.notify.call_args.args[1])
+        self.send.side_effect = None
+        self.tick(90)
+        self.assertIn('rang codex for m1 (review) [submitted] after holding 90s', self.logs)
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+
+    def test_mid_turn_and_changed_reason_share_the_original_hold_and_throttle(self):
+        self.peer = relay.Peer('claude', 'claude', 'claude-pane')
+        self.r.peers = [self.peer]
+        self.unread = {'claude': ['m1']}
+        self.pane.return_value = CLAUDE_RUNNING
+        self.tick(0)
+        self.tick(70)
+        self.send.assert_not_called()
+        self.assertEqual(1, self.notify.call_count)
+        self.assertIn('mid-turn', self.notify.call_args.args[1])
+        self.pane.return_value = CLAUDE_IDLE
+        self.send.side_effect = peerchat.Refused('composer holds a draft')
+        self.tick(80)
+        self.tick(369)
+        self.assertEqual(1, self.notify.call_count)
+        self.tick(370)
+        self.assertEqual(2, self.notify.call_count)
+        self.assertIn('composer holds a draft', self.notify.call_args.args[1])
+        self.assertEqual(0, self.r.holds[('claude', 'm1')].first_at)
+
+    def test_prewrite_terminal_failures_also_alert_after_a_minute(self):
+        self.send.side_effect = agw.CtlError('unreachable')
+        self.tick(0)
+        self.tick(70)
+        self.assert_unannounced()
+        self.assertEqual(1, self.notify.call_count)
+        self.assertIn('terminal not reachable', self.notify.call_args.args[1])
+
+    def test_failed_then_refused_has_one_alert_throttle(self):
+        self.send.side_effect = peerchat.Failed('submit failed')
+        self.tick(0)
+        self.send.side_effect = peerchat.Refused('composer holds the pointer')
+        self.tick(5)
+        self.tick(299)
+        self.assertEqual(1, self.notify.call_count)
+        self.tick(300)
+        self.assertEqual(2, self.notify.call_count)
+        self.assert_unannounced()
+
+    def test_independently_read_mail_clears_its_alert(self):
+        self.send.side_effect = peerchat.Failed('submit failed')
+        self.tick(0)
+        self.unread['codex'] = []
+        self.tick(5)
+        self.assertEqual({}, self.r.holds)
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+        self.assert_unannounced()
+
+    def test_other_alerted_message_prevents_early_status_clear(self):
+        self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'second'}
+        self.unread['codex'].append('m2')
+        self.send.side_effect = peerchat.Failed('submit failed')
+        self.tick(0)
+        self.send.side_effect = ['submitted', peerchat.Refused('holds a draft')]
+        self.tick(5)
+        self.assertEqual(['m1'], self.r.state['announced'])
+        self.assertNotIn(call('idle', pane_id=self.peer.pane), self.status.call_args_list)
+        self.send.side_effect = None
+        self.tick(10)
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+        self.assertEqual(['m1', 'm2'], self.r.state['announced'])
+
+    def test_unalerted_hold_does_not_change_agent_status_on_success(self):
+        self.send.side_effect = peerchat.Refused('a draft')
+        self.tick(0)
+        self.send.side_effect = None
+        self.tick(5)
+        self.status.assert_not_called()
+        self.assertEqual({}, self.r.holds)
+
+    def test_alert_errors_are_independent_and_do_not_end_delivery(self):
+        self.messages['m2'] = {'id': 'm2', 'subject': 'second'}
+        self.unread['codex'].append('m2')
+        self.send.side_effect = [peerchat.Failed('submit failed'), 'submitted']
+        self.status.side_effect = agw.CtlError('status broken')
+        self.notify.side_effect = agw.CtlError('notify broken')
+        self.tick(0)
+        self.notify.assert_called_once()
+        self.assertEqual(['m2'], self.r.state['announced'])
+        self.assertTrue(any('could not set blocked status' in line for line in self.logs))
+        self.assertTrue(any('could not notify' in line for line in self.logs))
+        self.assertIn(('codex', 'm1'), self.r.holds)
+
+    def test_holds_are_keyed_by_recipient_and_message(self):
+        self.r.peers.append(relay.Peer('claude', 'claude', 'claude-pane'))
+        self.unread['claude'] = ['m1']
+        self.send.side_effect = peerchat.Failed('submit failed')
+        self.tick(0)
+        self.assertEqual({('claude', 'm1'), ('codex', 'm1')}, set(self.r.holds))
+        self.assertEqual(2, self.notify.call_count)
+
+    def test_real_send_refuses_stuck_text_then_rerings_after_composer_empties(self):
+        pointer = peerchat.compose_text('Chat from Workbench: ',
+                                        relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
+        fake = FakeAgw(after=lambda f: codex(pointer, 'Working (esc to interrupt)'))
+        clock = Clock()
+        self.send.side_effect = self.real_send
+        with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
+            self.tick(0)
+            self.assert_unannounced()
+            self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
+            self.tick(5)
+            self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
+            self.assertEqual(1, self.notify.call_count)
+            fake.frames = [CODEX_IDLE, codex(pointer), CODEX_IDLE]
+            self.tick(10)
+        self.assertEqual([pointer, '\t', '\t', '\t', pointer, '\t'], fake.keys)
+        self.assertEqual(['m1'], self.r.state['announced'])
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+
+    def test_dry_run_does_not_send_or_raise_terminal_alerts(self):
+        self.r.dry_run = True
+        self.r.peers = [relay.Peer('claude', 'claude', 'claude-pane')]
+        self.unread = {'claude': ['m1']}
+        self.pane.return_value = CLAUDE_RUNNING
+        self.tick(0)
+        self.tick(70)
+        self.send.assert_not_called()
+        self.status.assert_not_called()
+        self.notify.assert_not_called()
 
 
 if __name__ == "__main__":

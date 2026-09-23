@@ -108,7 +108,17 @@ doesn't need to: it writes mail files inside its clone, and the relay rings Clau
 
 **The relay** types only into the two panes of its own session, only into an agent's composer it
 can prove is empty, never into a dialog, and never answers a prompt. A refusal before typing waits
-for the next tick; a failure after typing is never retried, so nothing is ever typed twice.
+for the next tick. After typing a pointer once, it verifies submission from an empty composer
+and records whether the pointer was submitted or queued. A stuck pointer gets up to two more
+submit-key presses, each guarded by a fresh composer check; Codex gets one Return fallback only
+when no running-turn or queued-input evidence is visible. It never submits a changed draft or
+a dialog. This verifies submission, not that the agent has read the mail. Failed submissions
+alert immediately; mail held for a minute also raises a blocked status, sound, blink, and desktop
+notification naming the recipient, message, and reason. Alerts repeat at most every five minutes
+per message. Failed rings stay unannounced and can be sent again once the composer is empty.
+When alerted mail is delivered or independently read, the relay clears its last outstanding alert
+for that recipient to idle. That reset can race a newer agent-hook status; avoiding the race
+would require terminal support for conditional status ownership.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.
