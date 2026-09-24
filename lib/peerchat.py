@@ -7,10 +7,11 @@ A Windows/agwinterm port of umputun's agterm cookbook recipe `two-agent-chat`
 (https://github.com/umputun/agterm/tree/master/cookbook/two-agent-chat). Same idea and the same
 refusals; the differences are forced by the terminal:
 
-  * agterm exposes `surface cursor`, so the original proves an empty composer by reading the caret
-    column. agwinterm 0.17.x has no cursor read, so this port proves it from the rendered composer
-    line instead, against a whitelist of each agent's empty-box placeholder. Anything it does not
-    recognise is a refusal, never a send.
+  * agwinterm exposes `surface cursor`, but a caret at the prompt column can mean either a greyed
+    suggestion or a real draft with its caret moved to the start. Only known empty-box placeholders
+    authorize typing. A one-row Claude composer at the starting column is classified as ambiguous
+    and refused with a distinct reason; other unrecognized content is refused as a draft. Styled
+    reads are needed to distinguish suggestions (yeroo/agwinterm#319).
   * agterm reports the foreground command per pane, so the original checks that the target really
     runs `codex`. agwinterm's tree does not carry that, so the target's tool comes from the hub
     registry (`agmsg register`), which the agent itself writes, plus the composer shape - a Codex
@@ -126,6 +127,13 @@ class Refused(RuntimeError):
     """A pre-write check failed. Nothing was typed, so retrying is safe."""
 
 
+class AmbiguousComposer(Refused):
+    def __init__(self, content: str):
+        self.content = content
+        super().__init__('composer text is ambiguous (possibly a suggestion, or a draft with its caret '
+                         f'at the start); not typing: {content[:60]!r}')
+
+
 class Failed(RuntimeError):
     """A send failed after typing started; never retype into the occupied composer."""
 
@@ -206,8 +214,15 @@ def trailing_block(text: str) -> list[str]:
     return lines[start:]
 
 
-def claude_composer(text: str) -> str | None:
-    """Claude's composer content, read from between the last two rules. None when not visible."""
+@dataclass(frozen=True)
+class ClaudeComposer:
+    content: str
+    rows: int
+    prompt_column: int
+
+
+def parse_claude_composer(text: str) -> ClaudeComposer | None:
+    """Read content and geometry together from the same pair of composer rules."""
     lines = text.splitlines()[-BOX_LINES:]
     rules = [i for i, line in enumerate(lines) if RULE_RE.match(line)]
     if len(rules) < 2:
@@ -219,7 +234,12 @@ def claude_composer(text: str) -> str | None:
     if not first:
         return None
     rows = [first.group(1)] + [line.strip() for line in body[1:]]
-    return " ".join(row for row in rows if row).strip()
+    return ClaudeComposer(" ".join(row for row in rows if row).strip(), len(body), first.start(1))
+
+
+def claude_composer(text: str) -> str | None:
+    body = parse_claude_composer(text)
+    return body.content if body else None
 
 
 def codex_composer(text: str) -> str | None:
@@ -250,14 +270,35 @@ def codex_composer(text: str) -> str | None:
     return " ".join(row for row in rows if row).strip()
 
 
-def composer(profile: Profile, text: str) -> str | None:
-    return claude_composer(text) if profile.tool == "claude" else codex_composer(text)
-
-
 def looks_empty(profile: Profile, content: str) -> bool:
     """True only when the composer holds nothing but a placeholder. fullmatch, never match: a
     prefix match calls "placeholder + a modal choice list" empty, and then peer-chat types."""
     return any(hint.fullmatch(content) for hint in profile.hints)
+
+
+def composer_state(pane: str, profile: Profile, text: str) -> tuple[str | None, str, str]:
+    """Bracket the cursor read with matching composer snapshots before trusting either."""
+    body = parse_claude_composer(text) if profile.tool == 'claude' else None
+    content = body.content if body else (codex_composer(text) if profile.tool == 'codex' else None)
+    state = 'draft'
+    if content is None:
+        state = 'missing'
+    elif looks_empty(profile, content):
+        state = 'empty'
+    elif body and body.rows == 1:
+        try:
+            if agw.cursor_column(pane) == body.prompt_column:
+                state = 'ambiguous'
+        except (agw.CtlError, OSError):
+            pass  # Unavailable or malformed cursor data retains the text-only refusal.
+    fresh = agw.pane_text(pane)
+    fresh_body = parse_claude_composer(fresh) if profile.tool == 'claude' else None
+    fresh_content = fresh_body.content if fresh_body else (codex_composer(fresh) if profile.tool == 'codex' else None)
+    if dialog_visible(text) or dialog_visible(fresh):
+        state = 'dialog'
+    elif (body, content) != (fresh_body, fresh_content):
+        state = 'changing'
+    return fresh_content, state, fresh
 
 
 def dialog_visible(text: str) -> bool:
@@ -350,11 +391,19 @@ def precheck(pane: str, profile: Profile) -> None:
     text = agw.pane_text(pane)
     if dialog_visible(text):
         raise Refused("a chooser or approval dialog is on screen in the target pane")
-    content = composer(profile, text)
+    content, state, _ = composer_state(pane, profile, text)
+    if state == 'dialog':
+        raise Refused('a chooser or approval dialog appeared while checking the target composer')
+    if state == 'changing':
+        raise Refused('the target composer changed while checking it; not typing')
     if content is None:
         raise Refused(f"no {profile.display} composer visible in the target pane")
-    if not looks_empty(profile, content):
-        raise Refused(f"the target composer is not empty: {content[:60]!r}")
+    if state == 'ambiguous':
+        raise AmbiguousComposer(content)
+    if state != 'empty':
+        if profile.tool != 'claude':
+            raise Refused(f"the target composer is not empty: {content[:60]!r}")
+        raise Refused(f"composer holds a draft: {content[:60]!r}")
 
 
 def verify_typed(pane: str, profile: Profile, typed: str) -> None:
@@ -375,12 +424,14 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
                 "a chooser or approval dialog appeared in the target pane after the text was typed; "
                 "submit withheld. Read the pane before doing anything else."
             )
-        content = composer(profile, text)
+        content, state, _ = composer_state(pane, profile, text)
+        if state == 'dialog':
+            raise Failed('a chooser or approval dialog appeared while verifying typed text; submit withheld')
         if content is not None:
             seen = content
-            if owns(content, typed):
+            if state != 'changing' and owns(content, typed):
                 return
-            if not looks_empty(profile, content) and compact(content) not in compact(typed):
+            if state not in {'empty', 'ambiguous', 'changing'} and compact(content) not in compact(typed):
                 raise Failed(f"composer holds something other than the attempted pointer: {content!r}; submit withheld")
         if now() >= deadline:
             break
@@ -406,16 +457,26 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
             frame = agw.pane_text(pane)
             if dialog_visible(frame):
                 raise Failed('a chooser or approval dialog appeared after submit; further keys withheld')
-            content = composer(profile, frame)
-            if content is None:
+            content, state, fresh = composer_state(pane, profile, frame)
+            if state == 'dialog':
+                raise Failed('a chooser or approval dialog appeared while verifying submit; further keys withheld')
+            if state == 'changing':
+                if now() >= deadline:
+                    raise Failed('composer changed while verifying submit; further keys withheld')
+            elif content is None:
                 if needs_key or now() >= deadline:
                     raise Failed('composer disappeared after submit; further keys withheld')
             elif profile.tool == 'claude' and content == 'Press up to edit queued messages':
                 # Ambiguous with a literal draft before typing; only accept it after our submit.
                 return 'queued' + suffix
-            elif looks_empty(profile, content):
-                outcome = 'queued' if profile.tool == 'codex' and queued_for(frame, typed) else 'submitted'
+            elif state == 'empty':
+                outcome = 'queued' if profile.tool == 'codex' and queued_for(fresh, typed) else 'submitted'
                 return ('submitted' if returned else outcome) + suffix
+            elif state == 'ambiguous' and not owns(content, typed):
+                if now() >= deadline:
+                    raise Failed('pointer not confirmed in the composer; composer shows other text with '
+                                 'its caret at the start (possibly a suggestion, or a draft with its caret '
+                                 'at the start); submit not proven')
             elif not owns(content, typed):
                 raise Failed(f"composer holds something other than the attempted pointer: {content!r}; further keys withheld")
             elif needs_key:
@@ -424,9 +485,9 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
                     key = profile.submit
                     phase = f'retry {retries}'
                     suffix = f' after retry {retries}'
-                elif (profile.tool == 'codex' and not returned and not is_busy(frame)
-                      and 'esc to interrupt' not in frame.lower()
-                      and 'queued follow-up inputs' not in frame.lower()):
+                elif (profile.tool == 'codex' and not returned and not any(
+                        is_busy(snapshot) or 'esc to interrupt' in snapshot.lower()
+                        or 'queued follow-up inputs' in snapshot.lower() for snapshot in (frame, fresh))):
                     key = '\n'
                     returned = True
                     phase = 'Return fallback'

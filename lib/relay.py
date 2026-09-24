@@ -45,6 +45,7 @@ from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 
 PR_FIELDS = "number,url,state,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
 HOLD_ALERT_AFTER = 60.0
+AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 
@@ -72,6 +73,8 @@ class Hold:
     reason: str
     last_alert_at: float | None = None
     clear_pending: bool = False
+    condition_since: float | None = None
+    ambiguous_text: str | None = None
 
     @property
     def alerted(self) -> bool:
@@ -262,15 +265,23 @@ class Relay:
         print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
 
     # mail -----------------------------------------------------------------------------------
-    def hold(self, peer: Peer, mid: str, reason: str, *, failed: bool = False) -> None:
+    def hold(self, peer: Peer, mid: str, reason: str, *, failed: bool = False,
+             ambiguous_text: str | None = None) -> None:
         instant = now()
         entry = self.holds.setdefault((peer.box, mid), Hold(instant, reason))
+        if entry.ambiguous_text != ambiguous_text:
+            # Keep alert ownership and total hold duration. Only ambiguity transitions
+            # restart the condition timer; ordinary changes of reason retain it.
+            entry.condition_since = instant
+            entry.ambiguous_text = ambiguous_text
         entry.reason = reason
         if failed:
             self.log(f"FAILED ringing {peer.box} for {mid}: {reason}")
         else:
             self.log(f"{peer.box} not ready ({reason}); holding {mid}")
-        if (failed or instant - entry.first_at >= HOLD_ALERT_AFTER) and (
+        since = entry.condition_since if entry.condition_since is not None else entry.first_at
+        threshold = AMBIGUOUS_ALERT_AFTER if ambiguous_text is not None else HOLD_ALERT_AFTER
+        if (failed or instant - since >= threshold) and (
                 entry.last_alert_at is None or instant - entry.last_alert_at >= ALERT_EVERY):
             if not self.dry_run:
                 entry.last_alert_at = instant
@@ -353,6 +364,9 @@ class Relay:
                     held = self.clear(peer, mid)
                     duration = f" after holding {now() - held.first_at:.0f}s" if held else ''
                     self.log(f"rang {peer.box} for {mid} ({message.get('subject', '')}) [{outcome}]{duration}")
+                except peerchat.AmbiguousComposer as refusal:
+                    self.hold(peer, mid, str(refusal), ambiguous_text=refusal.content)
+                    continue
                 except peerchat.Refused as refusal:
                     # nothing was typed; try again next tick
                     self.hold(peer, mid, str(refusal))

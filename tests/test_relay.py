@@ -26,7 +26,7 @@ import relay  # noqa: E402
 import agw
 import hub
 import peerchat
-from frames import CLAUDE_IDLE, CLAUDE_RUNNING, CODEX_IDLE, Clock, FakeAgw, codex
+from frames import CLAUDE_IDLE, CLAUDE_RUNNING, CLAUDE_SUGGESTION, CODEX_IDLE, Clock, FakeAgw, claude, codex, stable_frames
 
 OPEN = {"number": 7, "url": "https://github.com/o/r/pull/7", "state": "OPEN", "reviewDecision": "",
         "reviews": [], "comments": [], "inline": [], "headRefName": "issue-6", "isCrossRepository": False}
@@ -304,6 +304,115 @@ class Delivery(DeliveryFixture):
         self.assertIn('rang codex for m1 (review) [submitted] after holding 90s', self.logs)
         self.status.assert_called_with('idle', pane_id=self.peer.pane)
 
+    def claude_peer(self):
+        self.peer = relay.Peer('claude', 'claude', 'claude-pane')
+        self.r.peers = [self.peer]
+        self.unread = {'claude': ['m1']}
+
+    def test_real_ambiguous_composer_never_types_and_alerts_after_ten_minutes(self):
+        self.claude_peer()
+        fake = FakeAgw('claude', frames=[CLAUDE_SUGGESTION], cursors=[2])
+        self.send.side_effect = self.real_send
+        with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column):
+            self.tick(0)
+            self.tick(540)
+            self.notify.assert_not_called()
+            self.status.assert_not_called()
+            self.tick(600)
+        self.assertEqual([], fake.keys)
+        self.assertEqual(1, self.notify.call_count)
+        self.status.assert_called_once_with('blocked', sound=True, blink=True, pane_id=self.peer.pane)
+        self.assertIn('possibly a suggestion', self.notify.call_args.args[1])
+        self.assert_unannounced()
+
+    def test_full_ambiguous_text_controls_timer_not_truncated_reason(self):
+        self.claude_peer()
+        first = peerchat.AmbiguousComposer('x' * 60 + 'first')
+        second = peerchat.AmbiguousComposer('x' * 60 + 'second')
+        self.assertEqual(str(first), str(second))
+        self.send.side_effect = first
+        self.tick(0)
+        self.send.side_effect = second
+        self.tick(300)
+        self.tick(600)
+        self.tick(899)
+        self.notify.assert_not_called()
+        entry = self.r.holds[('claude', 'm1')]
+        self.assertEqual(0, entry.first_at)
+        self.assertEqual(300, entry.condition_since)
+        self.assertEqual(second.content, entry.ambiguous_text)
+        self.tick(900)
+        self.assertEqual(1, self.notify.call_count)
+
+    def test_changing_ambiguity_keeps_prewrite_alert_quiet(self):
+        self.claude_peer()
+        for t in range(0, 1801, 200):
+            self.send.side_effect = peerchat.AmbiguousComposer(f'new text at {t}')
+            self.tick(t)
+        self.notify.assert_not_called()
+        self.status.assert_not_called()
+
+    def test_leaving_ambiguity_starts_normal_threshold_without_resetting_total_hold(self):
+        self.claude_peer()
+        self.send.side_effect = peerchat.AmbiguousComposer('text')
+        self.tick(0)
+        self.tick(500)
+        self.send.side_effect = peerchat.Refused('composer holds a draft')
+        self.tick(550)
+        self.tick(609)
+        self.notify.assert_not_called()
+        self.tick(610)
+        self.assertEqual(1, self.notify.call_count)
+        self.assertEqual(0, self.r.holds[('claude', 'm1')].first_at)
+        self.assertEqual(550, self.r.holds[('claude', 'm1')].condition_since)
+
+    def test_alerted_draft_becoming_ambiguous_retains_idle_reset_when_read(self):
+        self.claude_peer()
+        self.send.side_effect = peerchat.Refused('composer holds a draft')
+        self.tick(0)
+        self.tick(60)
+        entry = self.r.holds[('claude', 'm1')]
+        self.send.side_effect = peerchat.AmbiguousComposer('text')
+        self.tick(65)
+        self.assertIs(entry, self.r.holds[('claude', 'm1')])
+        self.assertEqual(60, entry.last_alert_at)
+        self.assertTrue(entry.alerted)
+        self.unread['claude'] = []
+        self.tick(70)
+        self.status.assert_called_with('idle', pane_id=self.peer.pane)
+        self.assertEqual({}, self.r.holds)
+        self.assertEqual(1, self.notify.call_count)
+
+    def test_ambiguity_transitions_preserve_existing_alert_throttle(self):
+        self.claude_peer()
+        self.send.side_effect = peerchat.AmbiguousComposer('text')
+        self.tick(0)
+        self.tick(600)
+        self.send.side_effect = peerchat.Refused('composer holds a draft')
+        self.tick(610)
+        self.tick(670)
+        self.assertEqual(1, self.notify.call_count)
+        self.tick(900)
+        self.assertEqual(2, self.notify.call_count)
+
+    def test_post_submit_ambiguity_still_alerts_failure_immediately(self):
+        self.claude_peer()
+        pointer = peerchat.compose_text('Chat from Workbench: ',
+                                        relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
+        # The relay reads the first frame for busy state before peerchat's own precheck.
+        fake = FakeAgw('claude', frames=[CLAUDE_IDLE] + stable_frames(CLAUDE_IDLE, claude(pointer), CLAUDE_SUGGESTION), cursors=[2])
+        clock = Clock()
+        self.send.side_effect = self.real_send
+        with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column), \
+                patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
+            self.tick(0)
+        self.assertEqual([pointer, '\n'], fake.keys)
+        self.assertEqual(1, self.notify.call_count)
+        self.assertIn('submit not proven', self.notify.call_args.args[1])
+        self.assert_unannounced()
+
     def test_mid_turn_and_changed_reason_share_the_original_hold_and_throttle(self):
         self.peer = relay.Peer('claude', 'claude', 'claude-pane')
         self.r.peers = [self.peer]
@@ -459,6 +568,7 @@ class Delivery(DeliveryFixture):
         clock = Clock()
         self.send.side_effect = self.real_send
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column), \
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
             self.tick(0)
             self.assert_unannounced()
@@ -466,7 +576,7 @@ class Delivery(DeliveryFixture):
             self.tick(5)
             self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
             self.assertEqual(1, self.notify.call_count)
-            fake.frames = [CODEX_IDLE, codex(pointer), CODEX_IDLE]
+            fake.frames = stable_frames(CODEX_IDLE, codex(pointer), CODEX_IDLE)
             self.tick(10)
         self.assertEqual([pointer, '\t', '\t', '\t', pointer, '\t'], fake.keys)
         self.assertEqual(['m1'], self.r.state['announced'])

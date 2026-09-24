@@ -59,6 +59,16 @@ def claude(content):
     return CLAUDE_IDLE.replace('\n>\n', '\n> ' + content + '\n')
 
 
+CLAUDE_SUGGESTION = claude('run a third revmux round before I merge')
+# Same starting column on a later row is not evidence of an empty composer.
+CLAUDE_WRAPPED_DRAFT = claude('x' * 51 + '\n  xx')
+
+
+def stable_frames(*frames):
+    """Two explicit equal reads per observation; raw frame lists can model redraw races."""
+    return [frame for frame in frames for _ in range(2)]
+
+
 class Clock:
     def __init__(self):
         self.t = 0.0
@@ -71,7 +81,7 @@ class Clock:
 
 
 class FakeAgw:
-    def __init__(self, tool='codex', frames=None, after=None):
+    def __init__(self, tool='codex', frames=None, after=None, cursors=None):
         self.tool = tool
         self.frames = list(frames) if frames else None
         self.after = after
@@ -79,8 +89,12 @@ class FakeAgw:
         self.reads = 0
         self.read_errors = {}
         self.type_errors = {}
+        self.cursors = list(cursors) if cursors is not None else None
+        self.cursor_reads = 0
+        self.events = []
 
     def pane_text(self, pane):
+        self.events.append('text')
         self.reads += 1
         if self.reads in self.read_errors:
             raise self.read_errors[self.reads]
@@ -96,7 +110,20 @@ class FakeAgw:
             return self.after(self)
         return CODEX_IDLE if self.tool == 'codex' else CLAUDE_IDLE
 
+    def cursor_column(self, pane):
+        self.events.append('cursor')
+        self.cursor_reads += 1
+        if not self.cursors:
+            # Old fixtures have no cursor evidence; preserve text-only classification.
+            import agw
+            raise agw.CtlError('cursor unavailable in fixture')
+        value = self.cursors.pop(0) if len(self.cursors) > 1 else self.cursors[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
     def type_into(self, pane, text):
+        self.events.append('type')
         self.keys.append(text)
         if len(self.keys) in self.type_errors:
             raise self.type_errors[len(self.keys)]
