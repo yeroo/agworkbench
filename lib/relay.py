@@ -715,19 +715,30 @@ class Relay:
             pause(delay)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="agworkbench relay: mail doorbell + PR watcher")
     parser.add_argument("--hub", required=True, help="the workbench mailbox directory (.workbench)")
     parser.add_argument("--claude-pane", required=True)
-    parser.add_argument("--codex-pane", required=True)
+    parser.add_argument("--codex-pane", required=True, help="the implementer's pane (mailbox box 'codex')")
+    parser.add_argument("--implementer-tool", choices=("codex", "claude"), default="codex",
+                        help="which agent runs the implementer pane; picks the peerchat profile it is rung with")
     parser.add_argument("--repo", required=True, help="owner/name")
     parser.add_argument("--branch", required=True)
     parser.add_argument("--mail-interval", type=float, default=5.0)
     parser.add_argument("--pr-interval", type=float, default=60.0)
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def peers_for(args: argparse.Namespace) -> list[Peer]:
+    """The implementer keeps the box 'codex' whichever agent runs it; its tool picks the profile."""
     check_panes(args.claude_pane, args.codex_pane)
-    peers = [Peer("claude", "claude", args.claude_pane), Peer("codex", "codex", args.codex_pane)]
+    return [Peer("claude", "claude", args.claude_pane), Peer("codex", args.implementer_tool, args.codex_pane)]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    peers = peers_for(args)
     relay = Relay(Path(args.hub), peers, args.repo, args.branch, args.mail_interval,
                   args.pr_interval, dry_run=args.dry_run)
     try:

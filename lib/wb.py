@@ -14,6 +14,7 @@ is three quoting languages deep. Everything here is derived from AI_HUB, which t
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import re
@@ -71,13 +72,24 @@ def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
     return str(result).split()[0] if result else ""
 
 
+def revmux_profile(root: Path) -> str:
+    """The profile the launcher resolved for this checkout (#20): claude-only when Claude is the
+    implementer and Codex may be out of quota, comprehensive otherwise, or the human's revmuxProfile."""
+    try:
+        saved = json.loads((root / ".workbench" / "state" / "implementer.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return "comprehensive"
+    profile = saved.get("revmuxProfile") if isinstance(saved, dict) else None
+    return profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]+", profile) else "comprehensive"
+
+
 def cmd_revmux(args: argparse.Namespace) -> int:
     root = checkout()
     scope = (root / args.scope).resolve() if not Path(args.scope).is_absolute() else Path(args.scope)
     if not scope.is_file():
         raise SystemExit(f"wb: scope file not found: {scope}")
     command = pane_command("run-revmux.ps1", Checkout=str(root), ScopeFile=str(scope),
-                           Round=str(args.round), Profile=args.profile)
+                           Round=str(args.round), Profile=args.profile or revmux_profile(root))
     sid = open_session(f"#{issue_number(root)} revmux r{args.round}", root, command, select=False)
     print(f"revmux round {args.round} running in session {sid}; the report will arrive as mail")
     return 0
@@ -170,7 +182,7 @@ def main() -> int:
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
     p.add_argument("--round", type=int, required=True)
     p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
-    p.add_argument("--profile", default="comprehensive")
+    p.add_argument("--profile", help="revmux profile (default: the one the launcher saved for this checkout)")
     p.set_defaults(func=cmd_revmux)
     p = subs.add_parser("human-review", help="open revdiff for the human, selected")
     p.add_argument("--base", required=True, help="e.g. origin/main")

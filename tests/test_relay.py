@@ -1867,3 +1867,54 @@ class FinalNotices(DeliveryFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeImplementer(DeliveryFixture):
+    """#20: with implementer=claude the box stays 'codex' and the pane takes Claude's profile."""
+    CLAUDE_PANE = "d387360b-a120-4e4b-b7a4-4db3171780ab"
+    RIGHT_PANE = "1f0c2d4e-5a6b-4c7d-8e9f-a0b1c2d3e4f5"
+
+    def peers(self, *extra):
+        args = relay.build_parser().parse_args(['--hub', 'h', '--claude-pane', self.CLAUDE_PANE,
+                                                '--codex-pane', self.RIGHT_PANE, '--repo', 'o/r',
+                                                '--branch', 'b', *extra])
+        return relay.peers_for(args)
+
+    def test_default_rings_the_implementer_as_codex(self):
+        self.assertEqual([relay.Peer('claude', 'claude', self.CLAUDE_PANE),
+                          relay.Peer('codex', 'codex', self.RIGHT_PANE)], self.peers())
+
+    def test_claude_tool_keeps_the_codex_box_with_claudes_profile(self):
+        self.assertEqual(relay.Peer('codex', 'claude', self.RIGHT_PANE),
+                         self.peers('--implementer-tool', 'claude')[1])
+
+    def test_unknown_tool_is_refused(self):
+        with patch('sys.stderr'), self.assertRaises(SystemExit):
+            self.peers('--implementer-tool', 'aider')
+
+    def test_claude_implementer_is_held_mid_turn_then_rung_with_return(self):
+        self.peer = relay.Peer('codex', 'claude', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.pane.return_value = CLAUDE_RUNNING
+        self.tick(0)
+        self.send.assert_not_called()
+        self.assertIn('mid-turn', self.r.holds[('codex', 'm1')].reason)
+        self.pane.return_value = CLAUDE_IDLE
+        self.tick(10)
+        self.send.assert_called_once()
+        self.assertIs(peerchat.PROFILES['claude'], self.send.call_args.args[1])
+        self.assertEqual('\n', peerchat.PROFILES['claude'].submit)
+        self.assertEqual(['m1'], self.r.state['announced'])
+
+    def test_codex_implementer_is_not_busy_checked_and_uses_tab(self):
+        self.pane.return_value = CLAUDE_RUNNING   # never consulted for a Codex pane
+        self.tick(0)
+        self.assertIs(peerchat.PROFILES['codex'], self.send.call_args.args[1])
+
+    def test_ambiguous_claude_implementer_composer_is_held_not_typed(self):
+        self.peer = relay.Peer('codex', 'claude', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.send.side_effect = peerchat.AmbiguousComposer('half a line')
+        self.tick(0)
+        self.assert_unannounced()
+        self.assertEqual('half a line', self.r.holds[('codex', 'm1')].ambiguous_text)

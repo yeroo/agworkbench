@@ -500,6 +500,43 @@ class QueueCase(unittest.TestCase):
         self.assertIsNone(spawn.return_value.communicate.call_args.kwargs['timeout'])
         self.assertEqual(['gh', 'repo', 'clone', 'o/r', 'checkout', '--', '--quiet'], spawn.call_args.args[0])
 
+    # #20: -Implementer on a queue is saved with it and passed to every member launch.
+
+    def launched_args(self):
+        data = self.store.load()
+        m = dict(self.member(1), token=str(uuid.uuid4()))
+        worker = q.Worker(self.store, data['owner']['token'], gh=self.gh, clock=lambda: self.now)
+        with patch.object(q.subprocess, 'Popen') as popen:
+            job = worker.spawn_launcher(data, m)
+        job['stream'].close()
+        return popen.call_args.args[0]
+
+    def test_default_queue_launches_members_without_the_switch(self):
+        self.start('o/r#1')
+        self.assertNotIn('implementer', self.store.load())
+        self.assertNotIn('-Implementer', self.launched_args())
+
+    def test_claude_is_saved_and_passed_to_members(self):
+        self.start('o/r#1', implementer='claude')
+        self.assertEqual('claude', self.store.load()['implementer'])
+        args = self.launched_args()
+        self.assertEqual(['-Implementer', 'claude'], args[args.index('-Implementer'):args.index('-Implementer') + 2])
+
+    def test_append_without_the_switch_keeps_the_saved_choice(self):
+        self.start('o/r#1', implementer='claude')
+        self.start('o/r#2')
+        self.assertEqual('claude', self.store.load()['implementer'])
+
+    def test_invalid_values_are_refused(self):
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#1', implementer='aider')
+        self.start('o/r#1')
+        data = json.loads(self.store.path.read_text())
+        data['implementer'] = 'aider'
+        self.store.path.write_text(json.dumps(data))
+        with self.assertRaises(q.StateError):
+            self.store.load()
+
 
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
@@ -527,3 +564,4 @@ class Specs(unittest.TestCase):
         self.assertEqual(['session', 'new', '--name', '#queue o/r', '--command', "& 'python' 'a b'", '--no-select'], args)
         self.assertEqual(['session', 'restore', 'command', '--target', 'pane'],
                          q.agw._cli_args(dict(cmd='session.restore', target='pane', args={'command': 'command'})))
+

@@ -191,6 +191,8 @@ class Store:
                 raise ValueError('unsupported version or repository')
             if type(data['parallel']) is not int or not 1 <= data['parallel'] <= 8 or type(data['watch']) is not bool:
                 raise ValueError('invalid settings')
+            if data.get('implementer') not in (None, 'codex', 'claude'):
+                raise ValueError('invalid implementer')
             if (not isinstance(data['config'], str) or not Path(data['config']).is_absolute() or
                     type(data['yes']) is not bool or not isinstance(data['members'], list) or
                     (data['watch'] and (not isinstance(data['label'], str) or not data['label']))):
@@ -254,7 +256,8 @@ def pin_conductor(store, owner):
             data['owner']['pinned'] = True
 
 
-def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None):
+def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
+                implementer=None):
     repo, numbers, label = resolve_spec(spec, repo)
     if watch and not label:
         raise UsageError('-Watch requires a label spec')
@@ -262,6 +265,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     store = Store(root / (repo + '.json'))
     if parallel is not None and not 1 <= parallel <= 8:
         raise UsageError('-Parallel must be between 1 and 8')
+    if implementer not in (None, 'codex', 'claude'):
+        raise UsageError('-Implementer must be codex or claude')
     if dry_run:
         data = store._load() if store.path.exists() else None
         validate_append(data, watch, label)
@@ -282,6 +287,9 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
             data['parallel'] = parallel
         if yes:
             data['yes'] = True
+        if implementer:
+            # Applies to members launched from now on; a member's checkout keeps the tool it has.
+            data['implementer'] = implementer
         known = {m['number'] for m in data['members']}
         added = [n for n in numbers if n not in known]
         data['members'].extend(new_member(n, repo, checkout_root(data['config'])) for n in added)
@@ -461,6 +469,8 @@ class Worker:
                 '-QueueAttempt', str(m['attempt']), '-QueueToken', m['token']]
         if data['yes']:
             args.append('-Yes')
+        if data.get('implementer'):
+            args += ['-Implementer', data['implementer']]
         try:
             process = subprocess.Popen(args, cwd=HERE.parent, env=env, stdout=stream, stderr=subprocess.STDOUT)
         except BaseException:
@@ -666,6 +676,7 @@ def main(argv=None):
     start.add_argument('--parallel', type=int)
     for flag in ('watch', 'retry', 'yes', 'dry-run'):
         start.add_argument('--' + flag, action='store_true')
+    start.add_argument('--implementer', choices=('codex', 'claude'))
     run = sub.add_parser('run')
     run.add_argument('--file', required=True)
     run.add_argument('--token', required=True)
@@ -691,7 +702,8 @@ def main(argv=None):
         if args.command == 'start':
             if os.environ.get('AGWINTERM_ENABLED') != '1' or not os.environ.get('AGWINTERM_SESSION_ID'):
                 raise UsageError('queue mode requires running inside agwinterm')
-            return start_queue(args.spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run)
+            return start_queue(args.spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
+                               implementer=args.implementer)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'member-context':

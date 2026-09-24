@@ -8,6 +8,10 @@ class AdoptRefused : System.Exception {
     AdoptRefused([string] $Message) : base($Message) {}
 }
 
+class ImplementerConflict : System.Exception {
+    ImplementerConflict([string] $Message) : base($Message) {}
+}
+
 function Write-Step([string] $Text) { Write-LaunchLog step $Text; Write-Host "  $Text" -ForegroundColor DarkGray }
 function Write-Done([string] $Text) { Write-LaunchLog done $Text; Write-Host "  $Text" -ForegroundColor Green }
 
@@ -64,6 +68,11 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
             Write-Host "Adoption refused: $($failure.Exception.Message)" -ForegroundColor Yellow
             return $false
         }
+        if ($failure.Exception -is [ImplementerConflict]) {
+            $script:Launch.ExitCode = 2
+            Write-Host "Implementer switch refused: $($failure.Exception.Message)" -ForegroundColor Yellow
+            return $false
+        }
         $script:Launch.ExitCode = 1
         # Logging must not turn an empty failed-clone target into a non-empty one.
         if ($script:LaunchLog -and -not $script:LaunchLog.Path -and $script:Launch.Checkout -and
@@ -89,17 +98,35 @@ function Get-WorkbenchConfig {
          claudeArgs     extra arguments for claude, e.g. ["--dangerously-skip-permissions"]
          codexArgs      extra arguments for codex (policy flags are refused - see pane-codex.ps1)
          checkoutRoot   where per-issue clones go (default ~/source/workbench)
-         allowNetwork   let Codex's sandbox reach the network (default false) #>
+         allowNetwork   let Codex's sandbox reach the network (default false)
+         implementer    who runs in the right pane: codex (default) or claude
+         revmuxProfile  revmux profile for review rounds (default: comprehensive with codex,
+                        claude-only with claude) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
-    $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false }
+    $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
+                 implementer = 'codex'; revmuxProfile = $null }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
+    if (-not (Test-ImplementerTool $config.implementer)) {
+        throw "implementer in '$path' must be codex or claude (got '$($config.implementer)')"
+    }
+    if ($null -ne $config.revmuxProfile -and ($config.revmuxProfile -isnot [string] -or $config.revmuxProfile -notmatch '^[A-Za-z0-9._-]+$')) {
+        throw "revmuxProfile in '$path' must be a revmux profile name (got '$($config.revmuxProfile)')"
+    }
     return $config
+}
+
+function Test-ImplementerTool($Value) { return $Value -is [string] -and $Value -cin @('codex', 'claude') }
+
+function Get-RevmuxProfile([string] $Tool, $Configured) {
+    if ($Configured) { return [string]$Configured }
+    if ($Tool -eq 'claude') { return 'claude-only' }
+    return 'comprehensive'
 }
 
 # --- the terminal ----------------------------------------------------------------------------
@@ -492,13 +519,15 @@ function Get-ClaudeTranscript([string] $SessionId) {
     return $null
 }
 
-function Find-LegacyClaudeIdentity([string] $Checkout) {
+function Find-LegacyClaudeIdentity([string] $Checkout, [string[]] $Exclude = @()) {
     $encoded = [IO.Path]::GetFullPath($Checkout).TrimEnd('\', '/') -replace '[^a-zA-Z0-9]', '-'
     $directory = Join-Path (Get-ClaudeProjects) $encoded
     if (-not (Test-Path -LiteralPath $directory)) { return $null }
     $candidates = @()
     foreach ($file in @(Get-ChildItem -LiteralPath $directory -Filter '*.jsonl' -File)) {
         if (-not (Test-SessionGuid $file.BaseName)) { continue }
+        # Another role's conversation shares this cwd; it is never the one being recovered.
+        if ($file.BaseName -in $Exclude) { continue }
         $metadata = Read-SharedText $file.FullName {
             param($reader)
             foreach ($i in 1..100) {
@@ -529,8 +558,26 @@ function Get-AdoptedClaudeIdentity {
     } catch { throw [AdoptRefused]::new($_.Exception.Message) }
 }
 
-function Read-ClaudeIdentity([string] $Checkout, [string] $Issue) {
-    $path = Join-Path $Checkout '.workbench\state\claude.json'
+function Get-ClaudeIdentityPath([string] $Checkout, [string] $Role = 'planner') {
+    # Two Claude roles can share one checkout: the planner (left) and, with implementer=claude,
+    # the implementer (right). Each has its own launcher-owned conversation record.
+    switch ($Role) {
+        'planner' { return Join-Path $Checkout '.workbench\state\claude.json' }
+        'implementer' { return Join-Path $Checkout '.workbench\state\implementer-claude.json' }
+        default { throw "unknown Claude role '$Role'" }
+    }
+}
+
+function Get-RecordedClaudeSessionId([string] $Checkout, [string] $Role) {
+    $path = Get-ClaudeIdentityPath $Checkout $Role
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if (Test-SessionGuid $record.sessionId) { return [string]$record.sessionId }
+    return $null
+}
+
+function Read-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Role = 'planner') {
+    $path = Get-ClaudeIdentityPath $Checkout $Role
     $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
     if (-not (Test-SessionGuid $record.sessionId) -or
         ($null -ne $record.pane -and -not (Test-SessionGuid $record.pane)) -or
@@ -543,9 +590,8 @@ function Read-ClaudeIdentity([string] $Checkout, [string] $Issue) {
     return $record
 }
 
-function Save-ClaudeIdentity([string] $Checkout, $Record) {
-    $path = Join-Path $Checkout '.workbench\state\claude.json'
-    Write-AtomicJson $path $Record
+function Save-ClaudeIdentity([string] $Checkout, $Record, [string] $Role = 'planner') {
+    Write-AtomicJson (Get-ClaudeIdentityPath $Checkout $Role) $Record
 }
 
 function Write-AtomicJson([string] $Path, $Record) {
@@ -575,17 +621,19 @@ function Invoke-WithCheckoutLock([string] $Checkout, [scriptblock] $Body) {
     finally { $script:CheckoutLock = $previous; $stream.Dispose() }
 }
 
-function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Pane, $CallerIdentity, [switch] $ExistingPane) {
+function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Pane, $CallerIdentity, [switch] $ExistingPane,
+                                [string] $Role = 'planner') {
     # The caller has established pane ownership through #3/#4 discovery. Registry creation
     # comes later; it must not invalidate a reservation after a split/mailbox failure.
-    $path = Join-Path $Checkout '.workbench\state\claude.json'
+    $path = Get-ClaudeIdentityPath $Checkout $Role
     $record = $null
     $changed = $false
     if (Test-Path -LiteralPath $path) {
-        try { $record = Read-ClaudeIdentity $Checkout $Issue } catch { Write-LaunchLog identity "$_" }
+        try { $record = Read-ClaudeIdentity $Checkout $Issue $Role } catch { Write-LaunchLog identity "$_" }
         if (-not $record -or ($record.pane -and $record.pane -ne $Pane)) {
-            $archive = Join-Path (Split-Path -Parent $path) ("claude.$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')).json")
-            Write-LaunchLog identity "archiving Claude conversation '$($record.sessionId)' from pane '$($record.pane)' to '$archive'"
+            $prefix = [IO.Path]::GetFileNameWithoutExtension($path)
+            $archive = Join-Path (Split-Path -Parent $path) ("$prefix.$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffffffZ')).json")
+            Write-LaunchLog identity "archiving Claude $Role conversation '$($record.sessionId)' from pane '$($record.pane)' to '$archive'"
             Move-Item -LiteralPath $path -Destination $archive
             $record = $null
         }
@@ -593,7 +641,18 @@ function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $P
     if (-not $record) {
         $recovered = $null
         if ($ExistingPane -and -not $CallerIdentity -and -not (Test-ShellReady (Invoke-Ctl session text --target $Pane))) {
-            try { $recovered = Find-LegacyClaudeIdentity $Checkout }
+            if ($Role -eq 'implementer') {
+                # No implementer Claude predates its record, so there is nothing legacy to recover;
+                # guessing from transcripts could hand it the planner's conversation.
+                Write-Warning "Claude implementer pane '$Pane' has no recorded conversation; leaving it unpinned. Close it and rerun: github-workbench $(Quote $Issue)"
+                return $null
+            }
+            $implementerId = Get-RecordedClaudeSessionId $Checkout 'implementer'
+            if ((Get-SavedImplementerTool $Checkout) -eq 'claude' -and -not $implementerId) {
+                Write-Warning "Claude pane '$Pane' cannot be told apart from the Claude implementer's conversation; leaving it unpinned. In that Claude session, run: github-workbench $(Quote $Issue)"
+                return $null
+            }
+            try { $recovered = Find-LegacyClaudeIdentity $Checkout @($implementerId | Where-Object { $_ }) }
             catch { Write-LaunchLog identity "cannot recover Claude: $_" }
             if (-not $recovered) {
                 Write-Warning "Claude pane '$Pane' has no recoverable conversation; leaving it unpinned. In that Claude session, run: github-workbench $(Quote $Issue)"
@@ -613,7 +672,7 @@ function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $P
         $changed = $true
     }
     if ($Pane -and $record.pane -ne $Pane) { $record.pane = $Pane; $changed = $true }
-    if ($changed) { Save-ClaudeIdentity $Checkout $record }
+    if ($changed) { Save-ClaudeIdentity $Checkout $record $Role }
     return $record
 }
 
@@ -643,6 +702,69 @@ function Find-CodexSession([string] $Checkout) {
     return $null
 }
 
+function Get-ImplementerStatePath([string] $Checkout) { return Join-Path $Checkout '.workbench\state\implementer.json' }
+
+function Get-SavedImplementerTool([string] $Checkout) {
+    <# The tool this checkout's right pane was set up with: state\implementer.json, else - for a
+       checkout set up before that file existed - the mailbox registry's entry for the codex box. #>
+    foreach ($source in @(@{ Path = (Get-ImplementerStatePath $Checkout); Field = 'tool' },
+                          @{ Path = (Join-Path $Checkout '.workbench\state\agents.json'); Field = 'registry' })) {
+        if (-not (Test-Path -LiteralPath $source.Path)) { continue }
+        try { $data = Get-Content -Raw -LiteralPath $source.Path -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $tool = $data.tool
+        if ($source.Field -eq 'registry') { $tool = $data.agents.codex.tool }
+        if (Test-ImplementerTool $tool) { return [string]$tool }
+    }
+    return $null
+}
+
+function Resolve-Implementer {
+    <# Which tool runs in the right pane. A checkout keeps the tool it was set up with, so a repair
+       run without -Implementer never swaps agents under a running loop. An explicit request that
+       differs from the saved tool is honoured only when the right pane holds no agent: it is gone,
+       or it is a proven shell. Otherwise it is refused before anything is changed.
+       Returns @{ Tool; RevmuxProfile; Saved; Conflict }. #>
+    param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe)
+    if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex or claude (got '$Requested')") }
+    $saved = Get-SavedImplementerTool $Checkout
+    $tool = $Config.implementer
+    if ($saved) { $tool = $saved }
+    $conflict = $null
+    if ($Requested -and $saved -and $Requested -ne $saved) {
+        $pane = $null
+        $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
+        if (Test-Path -LiteralPath $registryPath) {
+            try { $pane = (Get-Content -Raw -LiteralPath $registryPath | ConvertFrom-Json).agents.codex.pane } catch { $pane = $null }
+        }
+        $live = $false
+        if ($pane -and -not $NoProbe -and (Find-SessionByPane $Tree $pane)) {
+            $live = -not (Test-ShellReady (Invoke-Ctl session text --target $pane))
+        } elseif ($pane -and $NoProbe) { $live = $true }
+        if ($live) {
+            $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
+        } else { $tool = $Requested }
+    } elseif ($Requested) { $tool = $Requested }
+    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); Saved = $saved; Conflict = $conflict }
+}
+
+function Save-Implementer([string] $Checkout, $Resolved) {
+    $path = Get-ImplementerStatePath $Checkout
+    $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile }
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
+            if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile) { return }
+        } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
+    }
+    Write-AtomicJson $path $record
+    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile))"
+}
+
+function Get-ImplementerName([string] $Tool) {
+    if ($Tool -eq 'claude') { return 'Claude implementer' }
+    return 'Codex'
+}
+
 function Set-PaneRestore([string] $Pane, [string] $Command) {
     if (-not (Test-SessionGuid $Pane)) { throw "invalid restore pane '$Pane'" }
     $stage = $script:Launch.Stage
@@ -655,6 +777,17 @@ function Set-PaneRestore([string] $Pane, [string] $Command) {
         }
         $script:Launch.Remove('RestoreRepair')
     } finally { $script:Launch.Stage = $stage }
+}
+
+function Set-ImplementerRestore([string] $Checkout, [string] $Pane, [string] $Command, [string] $Tool, [switch] $ExistingPane) {
+    # A Claude implementer's pin resumes its own conversation, so the record is bound to the pane
+    # before the pin can fire - the same order #5 keeps for the planner.
+    if ($Tool -eq 'claude') {
+        $identity = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $Pane -ExistingPane:$ExistingPane -Role implementer
+        if (-not $identity) { return $false }
+    }
+    Set-PaneRestore $Pane $Command
+    return $true
 }
 
 function Get-CallerSession($Tree) {
@@ -779,7 +912,7 @@ function Start-WorkbenchSession {
     param([string] $Checkout, [int] $Number, [string] $Slug, [string] $RepoName,
           [string] $ClaudeLaunch, [string] $CodexLaunch, [string] $CodexRestore,
           [scriptblock] $RelayCommand, [switch] $NoRelay,
-          [string] $AdoptSession, [string] $CallerPane)
+          [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex')
     $invokeArgs = @{} + $PSBoundParameters
     Invoke-WithCheckoutLock $Checkout { Start-WorkbenchSessionCore @invokeArgs }
 }
@@ -788,7 +921,7 @@ function Start-WorkbenchSessionCore {
     param([string] $Checkout, [int] $Number, [string] $Slug, [string] $RepoName,
           [string] $ClaudeLaunch, [string] $CodexLaunch, [string] $CodexRestore,
           [scriptblock] $RelayCommand, [switch] $NoRelay,
-          [string] $AdoptSession, [string] $CallerPane)
+          [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex')
     $ErrorActionPreference = 'Stop'
     if (-not $script:Launch) { $script:Launch = @{} }
     $adoptedCodex = $script:Launch.Codex
@@ -806,6 +939,7 @@ function Start-WorkbenchSessionCore {
     $script:Launch.Checkout = $Checkout
     $script:Launch.ClaudeLaunch = $ClaudeLaunch
     $script:Launch.CodexLaunch = $CodexLaunch
+    $script:Launch.ImplementerTool = $ImplementerTool
     $script:Launch.NoRelay = [bool]$NoRelay
     $hub = Join-Path $Checkout '.workbench'
     $registryPath = Join-Path $hub 'state\agents.json'
@@ -887,7 +1021,10 @@ function Start-WorkbenchSessionCore {
         $script:Launch.QueueIncomplete = $true
         throw "Claude identity is unavailable; repair the conversation in '$Checkout' before retrying"
     }
-    if ($plan.Codex -and -not $AdoptSession) { Set-PaneRestore $plan.Codex $CodexRestore }
+    $codexIdentityReady = $true
+    if ($plan.Codex -and -not $AdoptSession) {
+        $codexIdentityReady = Set-ImplementerRestore $Checkout $plan.Codex $CodexRestore $ImplementerTool -ExistingPane
+    }
     # A new Claude pane needs a launch even if its shell never becomes ready.
     # Existing Claude panes become launch candidates only after a shell is proven below.
     $script:Launch.ClaudeLaunchRequired = $plan.NeedSplit -and $plan.NewPaneRole -eq 'Claude'
@@ -908,7 +1045,7 @@ function Start-WorkbenchSessionCore {
             $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
             Set-PaneRestore $script:Launch.Claude $ClaudeLaunch
             $claudeIdentityReady = $true
-        } else { Set-PaneRestore $script:Launch.Codex $codexRestore }
+        } else { $null = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool }
         $confirmed = $false
         foreach ($attempt in 1..30) {
             Start-Sleep -Milliseconds 300
@@ -934,6 +1071,7 @@ function Start-WorkbenchSessionCore {
     $restartRelay = $relaySession -and ($plan.NeedSplit -or -not $script:Launch.Adopted -or
         ($registry.agents.claude.pane -and $registry.agents.claude.pane -ne $script:Launch.Claude) -or
         ($registry.agents.codex.pane -and $registry.agents.codex.pane -ne $script:Launch.Codex) -or
+        ($registry.agents.codex.tool -and $registry.agents.codex.tool -ne $ImplementerTool) -or
         (Test-Path -LiteralPath $stopFile))
     if ($restartRelay) {
         # Persist the restart before overwriting registry bindings. A later failure must not
@@ -945,7 +1083,7 @@ function Start-WorkbenchSessionCore {
         Set-Content -LiteralPath $stopFile -Value 'launcher: restart with current pane ids' -Encoding UTF8
     }
     Set-LaunchStage mailbox
-    $hub = Initialize-Mailbox -Checkout $Checkout -ClaudePane $script:Launch.Claude -CodexPane $script:Launch.Codex
+    $hub = Initialize-Mailbox -Checkout $Checkout -ClaudePane $script:Launch.Claude -CodexPane $script:Launch.Codex -CodexTool $ImplementerTool
     $script:Launch.MailboxReady = $true
     $script:Launch.RelayCommand = $relayLine
     Write-Done "mailbox ready: $hub"
@@ -975,11 +1113,17 @@ function Start-WorkbenchSessionCore {
                     $claudeIdentityReady = $true
                 }
             }
+            if ($role -eq 'Codex' -and -not $codexIdentityReady) {
+                # The pane became a shell after the pin was withheld; it is free to start fresh.
+                $codexIdentityReady = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool
+            }
             $typeSelection = @('--select')
             if ($script:Launch.QueueContext) { $typeSelection = @() }
             Invoke-Ctl session type @typeSelection "$line`n" --target $script:Launch[$role] | Out-Null
             $script:Launch["${role}Typed"] = $true
-            Write-Done "$role starting in the $side pane"
+            $name = $role
+            if ($role -eq 'Codex') { $name = Get-ImplementerName $ImplementerTool }
+            Write-Done "$name starting in the $side pane"
         } else {
             Write-LaunchLog $role.ToLowerInvariant() 'pane is not a proven shell; no launch text sent'
             if ($AdoptSession -and $freshPane) { throw 'new Codex pane did not reach a shell prompt; rerun to complete adoption' }
@@ -988,7 +1132,9 @@ function Start-WorkbenchSessionCore {
                 throw "new $role pane did not reach a proven shell prompt; retry the queue member to finish setup"
             }
             if ($role -ne 'Claude' -or $claudeIdentityReady) {
-                Write-Warning "the $side pane is not at a proven shell prompt; start $role there yourself with:`n  $line"
+                $name = $role
+                if ($role -eq 'Codex') { $name = Get-ImplementerName $ImplementerTool }
+                Write-Warning "the $side pane is not at a proven shell prompt; start $name there yourself with:`n  $line"
             }
         }
     }
@@ -1055,7 +1201,7 @@ function Format-RepairMessage($Launch) {
             $lines += "In the Claude pane, once it is at an empty shell prompt: $($Launch.ClaudeLaunch)"
         }
         if (-not $Launch.CodexTyped) {
-            $lines += "In the Codex pane, once it is at an empty shell prompt: $($Launch.CodexLaunch)"
+            $lines += "In the $(Get-ImplementerName $Launch.ImplementerTool) pane, once it is at an empty shell prompt: $($Launch.CodexLaunch)"
         }
         if (-not $Launch.NoRelay -and $Launch.RelayCommand) {
             if ($Launch.RelayStopFile) {
@@ -1183,7 +1329,10 @@ function New-IssueCheckout {
 }
 
 function Initialize-Mailbox {
-    param([string] $Checkout, [string] $ClaudePane, [string] $CodexPane)
+    # The implementer keeps the box name 'codex' whichever tool runs it; the tool decides how the
+    # relay types into its pane.
+    param([string] $Checkout, [string] $ClaudePane, [string] $CodexPane, [string] $CodexTool = 'codex')
+    if (-not (Test-ImplementerTool $CodexTool)) { throw "invalid implementer tool '$CodexTool'" }
     $hub = Join-Path $Checkout '.workbench'
     New-Item -ItemType Directory -Force -Path $hub | Out-Null
     $env:AI_HUB = $hub
@@ -1191,9 +1340,9 @@ function Initialize-Mailbox {
 import sys; sys.path.insert(0, sys.argv[1])
 import hub; hub.reload_paths()
 hub.register('claude', tool='claude', pane=sys.argv[3], role='planner and reviewer', cwd=sys.argv[2])
-hub.register('codex', tool='codex', pane=sys.argv[4], role='implementer', cwd=sys.argv[2])
+hub.register('codex', tool=sys.argv[5], pane=sys.argv[4], role='implementer', cwd=sys.argv[2])
 "@
-    $py | & python - $script:Lib $Checkout $ClaudePane $CodexPane | Out-Null
+    $py | & python - $script:Lib $Checkout $ClaudePane $CodexPane $CodexTool | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not initialise the workbench mailbox" }
     return $hub
 }
@@ -1278,7 +1427,8 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 }
 
 function Invoke-LauncherBody {
-    param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession)
+    param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
+          [string] $Implementer)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -1334,9 +1484,20 @@ function Invoke-LauncherBody {
     $script:Launch.Checkout = $co.Dir
 
     $claudeLaunch = Get-PaneLaunch 'pane-claude.ps1' @{ Checkout = $co.Dir; Issue = $issueRef }
-    $codexLaunch = Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef }
-    $codexRestore = Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')
+    # The right pane's commands depend on the implementer tool, which is resolved under the checkout
+    # lock below (a dry run resolves it without probing or writing anything).
+    $implementerLines = {
+        param([string] $Tool)
+        if ($Tool -eq 'claude') {
+            $line = Get-PaneLaunch 'pane-implementer-claude.ps1' @{ Checkout = $co.Dir; Issue = $issueRef }
+            return @{ Launch = $line; Restore = $line }
+        }
+        return @{ Launch = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef });
+                  Restore = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')) }
+    }
     if ($DryRun) {
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe
+        $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
             Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$repoName'"
             Write-Step "caller pane '$($adoptionPlan.CallerPane)' preserved; would write adoption state and Bash context"
@@ -1345,8 +1506,12 @@ function Invoke-LauncherBody {
             Write-Step "would open session '#$($ref.Number) $slug' in workspace '$repoName'"
             Write-Step "left pane:  $claudeLaunch"
         }
+        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile))"
+        if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         Write-Step "right pane: $codexLaunch"
-        Write-Step "relay:      python lib\relay.py --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)"
+        $relayTool = ''
+        if ($resolved.Tool -ne 'codex') { $relayTool = " --implementer-tool $($resolved.Tool)" }
+        Write-Step "relay:      python lib\relay.py --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
         return
     }
 
@@ -1354,9 +1519,20 @@ function Invoke-LauncherBody {
         param($Hub, $Left, $Right)
         'python ' + (Quote (Join-Path $script:Lib 'relay.py')) + ' --hub ' + (Quote $Hub) +
             ' --claude-pane ' + (Quote $Left) + ' --codex-pane ' + (Quote $Right) +
-            ' --repo ' + (Quote $ref.Repo) + ' --branch ' + (Quote $co.Branch)
+            ' --repo ' + (Quote $ref.Repo) + ' --branch ' + (Quote $co.Branch) + $relayTool
     }
     Invoke-WithCheckoutLock $co.Dir {
+        # Decided before any pin, identity or registry change, so a refused switch changes nothing.
+        Set-LaunchStage implementer
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree)
+        if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
+        Save-Implementer $co.Dir $resolved
+        $script:Launch.ImplementerTool = $resolved.Tool
+        $lines = & $implementerLines $resolved.Tool
+        $codexLaunch = $lines.Launch
+        $codexRestore = $lines.Restore
+        $relayTool = ''
+        if ($resolved.Tool -ne 'codex') { $relayTool = ' --implementer-tool ' + (Quote $resolved.Tool) }
         $adoptArgs = @{}
         if ($adoptionPlan) {
             Set-LaunchStage adoption-recheck
@@ -1378,14 +1554,14 @@ function Invoke-LauncherBody {
             $null = Reserve-ClaudeIdentity $co.Dir $issueRef $adoptionPlan.CallerPane $adoptionPlan.ClaudeIdentity
             Set-PaneRestore $adoptionPlan.CallerPane $claudeLaunch
             if ($adoptionPlan.CodexPane) {
-                Set-PaneRestore $adoptionPlan.CodexPane $codexRestore
+                $null = Set-ImplementerRestore $co.Dir $adoptionPlan.CodexPane $codexRestore $resolved.Tool -ExistingPane
             }
             Initialize-AdoptedSession $adoptionPlan $co.Dir $repoName $ref.Number $slug
             $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane }
         }
         Start-WorkbenchSession -Checkout $co.Dir -Number $ref.Number -Slug $slug -RepoName $repoName `
             -ClaudeLaunch $claudeLaunch -CodexLaunch $codexLaunch -CodexRestore $codexRestore `
-            -RelayCommand $relayBuilder -NoRelay:$NoRelay @adoptArgs
+            -RelayCommand $relayBuilder -NoRelay:$NoRelay -ImplementerTool $resolved.Tool @adoptArgs
     }
     if ($adoptionPlan) {
         Format-AdoptedBlock $co.Dir $issueRef

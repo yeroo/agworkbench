@@ -450,17 +450,22 @@ class LauncherFixtures(unittest.TestCase):
                 "$script:Launch = @{Stage='config'; IssueRef='o/repo#7'; Checkout=" +
                 ps_quote(self.checkout) + "}; Enable-LaunchLog; ")
 
-    def flow(self, shell=PWSH, no_relay=False, timeout=40):
-        script = (self.setup_ps() + "Connect-LaunchLog " + ps_quote(self.log_path) + "; "
-                  "$codexLine = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
-                  "; Issue='o/repo#7'}; $codexRestore = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
-                  "; Issue='o/repo#7'} -Switches @('Resume'); $claudeLine = Get-PaneLaunch 'pane-claude.ps1' @{Checkout=" +
+    def flow(self, shell=PWSH, no_relay=False, timeout=40, implementer=None):
+        if implementer == 'claude':
+            right = ("$codexLine = Get-PaneLaunch 'pane-implementer-claude.ps1' @{Checkout=" + ps_quote(self.checkout) +
+                     "; Issue='o/repo#7'}; $codexRestore = $codexLine; ")
+        else:
+            right = ("$codexLine = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
+                     "; Issue='o/repo#7'}; $codexRestore = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
+                     "; Issue='o/repo#7'} -Switches @('Resume'); ")
+        script = (self.setup_ps() + "Connect-LaunchLog " + ps_quote(self.log_path) + "; " + right + "$claudeLine = Get-PaneLaunch 'pane-claude.ps1' @{Checkout=" +
                   ps_quote(self.checkout) + "; Issue='o/repo#7'}; $builder = { param($Hub,$Left,$Right) "
                   "'python ' + (Quote 'relay.py') + ' --hub ' + (Quote $Hub) + "
                   "' --claude-pane ' + (Quote $Left) + ' --codex-pane ' + (Quote $Right) }; "
                   "$ok = Invoke-LaunchSafely { Start-WorkbenchSession -Checkout " + ps_quote(self.checkout) +
                   " -Number 7 -Slug 'fix-x' -RepoName 'repo' -ClaudeLaunch $claudeLine "
                   "-CodexLaunch $codexLine -CodexRestore $codexRestore -RelayCommand $builder " + ("-NoRelay " if no_relay else "") +
+                  ("-ImplementerTool " + implementer + " " if implementer else "") +
                   "}; if (-not $ok) {exit 1}; $script:Launch | ConvertTo-Json -Compress")
         return subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
                               env=self.env, cwd=ROOT, capture_output=True, text=True,
@@ -1560,9 +1565,9 @@ class AdoptionEntry(LauncherFixtures):
             "function Grant-CodexTrust { Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value codex-trust }\n"
             "function Grant-ClaudeTrust { Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value claude-trust }\n"
             "$script:RealMailbox = ${function:Initialize-Mailbox}\n"
-            "function Initialize-Mailbox { param($Checkout,$ClaudePane,$CodexPane); "
+            "function Initialize-Mailbox { param($Checkout,$ClaudePane,$CodexPane,$CodexTool='codex'); "
             "if (Test-Path -LiteralPath " + ps_quote(self.fail_registration) + ") {throw 'registration failed'}; "
-            "& $script:RealMailbox -Checkout $Checkout -ClaudePane $ClaudePane -CodexPane $CodexPane }\n"
+            "& $script:RealMailbox -Checkout $Checkout -ClaudePane $ClaudePane -CodexPane $CodexPane -CodexTool $CodexTool }\n"
             "function Invoke-ClaudeHere { param($Checkout,$Issue); "
             "Add-Content -LiteralPath " + ps_quote(self.effects) + " -Value claude-here; "
             "Write-Output \"CLAUDE-HERE: $Checkout $Issue\"; $global:LASTEXITCODE=0 }\n")
@@ -2133,6 +2138,352 @@ class LauncherScript(LauncherFixtures):
         result = self.run_entry("-Version")
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertFalse(self.log_path.exists())
+
+
+class ClaudeImplementer(LauncherFixtures):
+    """#20: the right pane can run Claude Code as the implementer; the checkout keeps that choice."""
+
+    def identity(self, role='implementer', **changes):
+        record = dict(pane=RIGHT_ID, sessionId=OTHER_ID, cwd=str(self.checkout), origin='fresh',
+                      reservedAt='2026-09-23T00:00:00Z', issue='o/repo#7', checkout=str(self.checkout))
+        record.update(changes)
+        name = 'implementer-claude.json' if role == 'implementer' else 'claude.json'
+        path = self.checkout / '.workbench/state' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding='utf-8')
+        return path
+
+    def state(self, name):
+        return json.loads((self.checkout / '.workbench/state' / name).read_text(encoding='utf-8-sig'))
+
+    def pins(self):
+        return {c[-1]: c[2] for c in self.calls() if c[:2] == ['session', 'restore']}
+
+    def body(self, implementer=None, config=None):
+        if config is not None:
+            self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding='utf-8')
+        switch = f" -Implementer {implementer}" if implementer else ''
+        return ps(self.setup_ps() +
+                  "function Get-IssueInfo { return @{title='fix-x'; state='OPEN'} }; "
+                  "function New-IssueCheckout { Connect-LaunchLog " + ps_quote(self.log_path) +
+                  "; return @{Dir=" + ps_quote(self.checkout) + "; Branch='issue-7-fix-x'} }; "
+                  "function Grant-CodexTrust {}; function Grant-ClaudeTrust {}; "
+                  "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' -NewSession" + switch + " }; "
+                  "if (-not $ok) { Write-Output \"EXIT=$($script:Launch.ExitCode)\"; exit 1 }", env=self.env)
+
+    def relay_line(self):
+        creates = [c for c in self.calls() if c[:2] == ['session', 'new']]
+        return creates[1][creates[1].index('--command') + 1]
+
+    def typed_right(self):
+        return [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID]
+
+    def reuse_scenario(self, right_text):
+        self.scenario = json.loads(self.scenario_path.read_text(encoding='utf-8'))
+        self.scenario['text'][RIGHT_ID] = right_text
+        self.scenario['text'][RELAY_ID] = 'PS C:\\relay> '
+        self.save_scenario()
+
+    # --- AC1/AC2: composition -------------------------------------------------------------------
+
+    def test_default_launch_is_codex_with_an_unchanged_relay_line(self):
+        result = self.body()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertNotIn('--implementer-tool', self.relay_line())
+        self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
+        self.assertIn("pane-codex.ps1'", self.typed_right()[0])
+        self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive'}, self.state('implementer.json'))
+        self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
+
+    def test_claude_composes_right_pane_relay_mailbox_identity_and_pin(self):
+        result = self.body('claude')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        line = self.typed_right()[0].rstrip('\n')
+        self.assertIn("pane-implementer-claude.ps1'", line)
+        self.assertNotIn('pane-codex.ps1', line)
+        self.assertEqual(line, self.pins()[RIGHT_ID])
+        self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
+        agents = self.state('agents.json')['agents']
+        self.assertEqual(('claude', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
+        self.assertEqual('claude', agents['claude']['tool'])
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only'}, self.state('implementer.json'))
+        implementer = self.state('implementer-claude.json')
+        planner = self.state('claude.json')
+        self.assertEqual((RIGHT_ID, 'fresh', 'o/repo#7'), (implementer['pane'], implementer['origin'], implementer['issue']))
+        self.assertEqual(MAIN_ID, planner['pane'])
+        self.assertNotEqual(planner['sessionId'], implementer['sessionId'])
+        self.assertIn('Claude implementer starting in the right pane', result.stdout)
+        # The identity is bound before the pin can replay it, and the pin precedes typing.
+        calls = self.calls()
+        restore = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'restore'] and c[-1] == RIGHT_ID)
+        self.assertLess(restore, next(i for i, c in enumerate(calls) if c[:2] == ['session', 'type']))
+
+    def test_config_selects_claude_and_revmux_profile_is_configurable(self):
+        result = self.body(config={'implementer': 'claude', 'revmuxProfile': 'codex-final'})
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final'}, self.state('implementer.json'))
+        self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
+
+    def test_invalid_config_and_switch_values_are_refused(self):
+        bad = self.body(config={'implementer': 'aider'})
+        self.assertEqual(1, bad.returncode)
+        self.assertIn('implementer', bad.stdout)
+        self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp)}), encoding='utf-8')
+        switch = self.body('Claude')   # case matters: the relay and the registry use lowercase names
+        self.assertEqual(1, switch.returncode)
+        self.assertIn('EXIT=2', switch.stdout)
+        self.assertFalse(any(c[:2] in (['session', 'new'], ['session', 'restore']) for c in self.calls()))
+
+    # --- B1: the choice sticks to the checkout ------------------------------------------------------
+
+    def test_relaunch_without_the_switch_keeps_claude(self):
+        first = self.body('claude')
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        session = self.state('implementer-claude.json')['sessionId']
+        self.reuse_scenario('esc to interrupt')   # Claude is mid-turn in the right pane
+        second = self.body(config={})             # the config default is codex
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertIn('pane-implementer-claude.ps1', self.pins()[RIGHT_ID])
+        self.assertEqual('claude', self.state('agents.json')['agents']['codex']['tool'])
+        self.assertEqual('claude', self.state('implementer.json')['tool'])
+        self.assertEqual(session, self.state('implementer-claude.json')['sessionId'])
+        self.assertEqual(1, len(self.typed_right()))
+
+    def test_conflicting_switch_on_a_live_pane_is_refused_before_any_mutation(self):
+        first = self.body('claude')
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.reuse_scenario('esc to interrupt')
+        state = self.checkout / '.workbench/state'
+        before = {p.name: p.read_bytes() for p in state.iterdir() if p.is_file() and p.suffix == '.json'}
+        calls = len(self.calls())
+        result = self.body('codex')
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn('EXIT=2', result.stdout)
+        self.assertIn('Implementer switch refused', result.stdout)
+        self.assertIn('runs claude', result.stdout)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in state.iterdir() if p.is_file() and p.suffix == '.json'})
+        later = self.calls()[calls:]
+        self.assertTrue(all(c[:2] in (['tree', '--json'], ['session', 'text']) for c in later), later)
+
+    def test_pre_20_codex_checkout_is_not_switched_by_a_new_config_default(self):
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)   # an older loop: registry only, no implementer.json
+        self.resumed(right_text='Ask Codex to do anything\ngpt-test', relay=False)
+        result = self.body(config={'implementer': 'claude'})
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+        self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
+
+    def test_switch_is_allowed_when_the_right_pane_is_a_shell(self):
+        first = self.body('claude')
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.reuse_scenario('PS C:\\checkout> ')
+        result = self.body('codex')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('-Resume', self.typed_right()[-1])
+        self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
+        self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive'}, self.state('implementer.json'))
+        # B2: the relay was asked to stop and was restarted without the Claude profile.
+        self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
+        relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
+        self.assertEqual(1, len(relay))
+        self.assertNotIn('--implementer-tool', relay[0])
+
+    def test_dry_run_reports_the_tool_and_writes_nothing(self):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-NewSession', '-DryRun', '-Implementer', 'claude'],
+                                env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('implementer: claude (revmux profile claude-only)', result.stdout)
+        self.assertIn('pane-implementer-claude.ps1', result.stdout)
+        self.assertIn('--implementer-tool claude', result.stdout)
+        self.assertFalse((self.checkout / '.workbench').exists())
+        self.assertFalse(self.calls())
+
+    def test_entry_refuses_an_unknown_implementer(self):
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-Implementer', 'aider'], env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('-Implementer must be codex or claude', result.stdout)
+        self.assertFalse(self.calls())
+
+    # --- B2: relay restart on a tool change, same panes ---------------------------------------------
+
+    def test_tool_change_on_the_same_panes_restarts_the_relay(self):
+        self.resumed(right_text='PS C:\\checkout> ')
+        self.scenario['text'][RELAY_ID] = 'PS C:\\relay> '
+        self.save_scenario()
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)
+        result = self.flow(implementer='claude')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
+        self.assertEqual('claude', self.state('agents.json')['agents']['codex']['tool'])
+        self.assertEqual(RIGHT_ID, self.state('implementer-claude.json')['pane'])
+
+    # --- B3 / AC3: identities of two Claudes in one checkout ----------------------------------------
+
+    def legacy_transcript(self, session_id, mtime):
+        encoded = re.sub('[^a-zA-Z0-9]', '-', str(self.checkout))
+        path = Path(self.env['CLAUDE_CONFIG_DIR']) / 'projects' / encoded / (session_id + '.jsonl')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}\n' + json.dumps(dict(entrypoint='cli', cwd=str(self.checkout))) + '\n', encoding='utf-8')
+        os.utime(path, (mtime, mtime))
+
+    def running_planner_without_record(self):
+        self.resumed(right_text='esc to interrupt', relay=False)
+        self.scenario['text'][MAIN_ID] = 'Claude is working'
+        self.save_scenario()
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)
+        (self.checkout / '.workbench/state/implementer.json').write_text('{"tool": "claude"}', encoding='utf-8')
+
+    def test_planner_recovery_never_takes_the_implementers_conversation(self):
+        self.running_planner_without_record()
+        self.identity(sessionId=RELAY_ID)                  # the implementer's own, newest transcript
+        self.legacy_transcript(OTHER_ID, 1000)
+        self.legacy_transcript(RELAY_ID, 5000)
+        result = self.flow(no_relay=True, implementer='claude')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(OTHER_ID, self.state('claude.json')['sessionId'])
+        self.assertEqual('recovered', self.state('claude.json')['origin'])
+        self.assertEqual(RELAY_ID, self.state('implementer-claude.json')['sessionId'])
+
+    def test_planner_recovery_is_refused_when_the_implementer_record_is_missing(self):
+        self.running_planner_without_record()
+        self.legacy_transcript(OTHER_ID, 1000)
+        result = self.flow(no_relay=True, implementer='claude')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse((self.checkout / '.workbench/state/claude.json').exists())
+        self.assertIn('cannot be told apart', result.stdout)
+        self.assertNotIn(MAIN_ID, self.pins())
+
+    def test_running_implementer_without_record_is_left_unpinned_not_recovered(self):
+        self.running_planner_without_record()
+        self.identity(role='planner', pane=MAIN_ID)
+        self.legacy_transcript(RELAY_ID, 5000)
+        result = self.flow(no_relay=True, implementer='claude')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
+        self.assertIn('Claude implementer pane', result.stdout)
+        self.assertNotIn(RIGHT_ID, self.pins())
+        self.assertFalse(any(c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID for c in self.calls()))
+
+    def test_implementer_record_moved_to_another_pane_is_archived(self):
+        self.identity(pane=OTHER_ID)
+        result = ps(self.setup_ps() + "$r = Reserve-ClaudeIdentity " + ps_quote(self.checkout) +
+                    " 'o/repo#7' " + ps_quote(RIGHT_ID) + " -Role implementer; $r.pane", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(RIGHT_ID, result.stdout.strip().splitlines()[-1])
+        archived = list((self.checkout / '.workbench/state').glob('implementer-claude.*.json'))
+        self.assertEqual(1, len(archived))
+        self.assertFalse((self.checkout / '.workbench/state/claude.json').exists())
+
+    # --- AC3 / B5: the pane script --------------------------------------------------------------
+
+    def pane(self, config=None):
+        if config is not None:
+            self.config_path.write_text(json.dumps(config), encoding='utf-8')
+        return ps('& ./lib/pane-implementer-claude.ps1 -Checkout ' + ps_quote(self.checkout) +
+                  " -Issue 'o/repo#7' -WhatIfOnly", env=self.env)
+
+    def transcript(self, session_id=OTHER_ID):
+        path = Path(self.env['CLAUDE_CONFIG_DIR']) / 'projects/project' / (session_id + '.jsonl')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'cwd': str(self.checkout)}), encoding='utf-8')
+
+    def test_pane_fresh_then_resume_with_its_own_identity(self):
+        path = self.identity()
+        before = path.read_bytes()
+        fresh = self.pane()
+        self.assertEqual(0, fresh.returncode, fresh.stdout + fresh.stderr)
+        self.assertIn("'--session-id' '" + OTHER_ID + "' '/workbench-implementer o/repo#7'", fresh.stdout)
+        self.transcript()
+        resumed = self.pane()
+        self.assertEqual(0, resumed.returncode, resumed.stdout + resumed.stderr)
+        self.assertIn("'--resume' '" + OTHER_ID + "'", resumed.stdout)
+        self.assertIn('IMPLEMENTER', resumed.stdout)
+        self.assertIn('wait-mail --box codex', resumed.stdout)
+        self.assertNotIn('/workbench-implementer o/repo#7', resumed.stdout)
+        self.assertEqual(before, path.read_bytes())
+        self.assertFalse(self.registry_path.exists())
+
+    def test_pane_uses_the_implementer_record_not_the_planners(self):
+        self.identity(role='planner', sessionId=MAIN_ID, pane=MAIN_ID)
+        missing = self.pane()
+        self.assertEqual(1, missing.returncode)
+        self.assertIn('Cannot start the Claude implementer', missing.stdout)
+        self.assertNotIn('would run:', missing.stdout)
+
+    def test_pane_always_denies_push_gh_and_web_first(self):
+        self.identity()
+        line = self.pane({'claudeArgs': ['--dangerously-skip-permissions']}).stdout
+        run = line[line.index('would run: claude '):]
+        self.assertTrue(run.startswith("would run: claude '--disallowedTools' 'Bash(git push:*)' 'Bash(gh:*)' "
+                                       "'WebFetch' 'WebSearch' '--dangerously-skip-permissions' '--session-id'"), run)
+        opened = self.pane({'allowNetwork': True}).stdout
+        self.assertIn("'Bash(gh:*)' '--session-id'", opened)
+        self.assertNotIn('WebFetch', opened)
+
+    def test_pane_refuses_policy_and_identity_arguments(self):
+        self.identity()
+        for flag in ['--add-dir', '--add-dir=C:/', '--permission-mode', '--permission-mode=bypassPermissions',
+                     '--allowedTools', '--allowed-tools=Bash', '--disallowedTools', '--disallowed-tools=x',
+                     '--settings', '--settings=x.json', '--session-id', '--resume', '-r', '-c', '--continue',
+                     '--fork-session']:
+            with self.subTest(flag=flag):
+                result = self.pane({'claudeArgs': [flag]})
+                self.assertNotEqual(0, result.returncode)
+                self.assertNotIn('would run:', result.stdout)
+                self.assertRegex(result.stderr, 'tool policy|conversation identity')
+
+    def test_pane_invocation_sets_the_codex_box_and_the_clone(self):
+        self.identity()
+        self.registry_path.write_text('{}', encoding='utf-8')
+        command = ('function claude { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$AgentArgs); '
+                   '[pscustomobject]@{Args=$AgentArgs; Cwd=(Get-Location).Path; Hub=$env:AI_HUB; '
+                   'Box=$env:AI_BOX; Root=$env:AGWORKBENCH} | ConvertTo-Json -Compress }; '
+                   '& ./lib/pane-implementer-claude.ps1 -Checkout ' + ps_quote(self.checkout) + " -Issue 'o/repo#7'")
+        result = ps(command, env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        capture = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(('codex', str(self.checkout / '.workbench'), str(self.checkout), str(ROOT)),
+                         (capture['Box'], capture['Hub'], capture['Cwd'], capture['Root']))
+        self.assertEqual(['--disallowedTools', 'Bash(git push:*)', 'Bash(gh:*)', 'WebFetch', 'WebSearch',
+                          '--session-id', OTHER_ID, '/workbench-implementer o/repo#7'], capture['Args'])
+
+    def test_codex_is_not_required(self):
+        self.assertIsNone(shutil.which('codex', path=self.env['PATH']))
+        result = self.body('claude')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    # --- adoption and install -------------------------------------------------------------------
+
+    def test_the_claude_implementer_cannot_adopt_its_own_pane(self):
+        self.register(claude=OTHER_ID, codex=MAIN_ID)
+        registry = json.loads(self.registry_path.read_text(encoding='utf-8'))
+        registry['agents']['codex']['tool'] = 'claude'
+        self.registry_path.write_text(json.dumps(registry), encoding='utf-8')
+        self.scenario['tree'] = {'workspaces': [{'id': '55555555-5555-4555-8555-555555555555', 'name': 'repo',
+                                                'sessions': [{'id': OTHER_ID, 'name': '#7 fix-x',
+                                                              'paneIds': [OTHER_ID, MAIN_ID]}]}]}
+        self.save_scenario()
+        env = dict(self.env, CLAUDECODE='1', AGWINTERM_PANE_ID=MAIN_ID, AGWINTERM_SESSION_ID=OTHER_ID)
+        result = ps(". ./lib/Workbench.ps1; try { $null = Get-AdoptionPlan (Get-Tree) " + ps_quote(self.checkout) +
+                    " 'repo' 7; 'adopted' } catch [AdoptRefused] { $_.Exception.Message }", env=env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('registered as Codex', result.stdout)
+
+    def test_installer_ships_the_implementer_command(self):
+        command = (ROOT / 'claude/commands/workbench-implementer.md').read_text(encoding='utf-8')
+        for needle in ['AGREED: plan vK', 'IMPLEMENT plan vK', 'IMPLEMENTED <short sha>', 'FIXED <short sha>',
+                       'wait-mail --box codex', 'Never push', 'Commit your own work', '--body-file']:
+            self.assertIn(needle, command)
+        self.assertIn('claude\\commands\\*.md', (ROOT / 'install.ps1').read_text(encoding='utf-8'))
+        planner = (ROOT / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        self.assertIn('Never\n  commit its uncommitted work yourself', planner)
 
 
 if __name__ == "__main__":
