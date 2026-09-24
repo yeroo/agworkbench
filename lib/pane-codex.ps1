@@ -27,6 +27,7 @@
 #>
 param([Parameter(Mandatory = $true)] [string] $Checkout,
       [Parameter(Mandatory = $true)] [string] $Issue,
+      [switch] $Resume,
       [switch] $WhatIfOnly)
 
 $ErrorActionPreference = 'Stop'
@@ -84,8 +85,22 @@ Right now: wait. Claude will send you a draft plan through the workbench mailbox
 network access and no gh: the issue text will be in .workbench/issue.md once Claude has written it.
 "@
 
+$resumeArgs = @()
+if ($Resume) {
+    $sessionId = Find-CodexSession $Checkout
+    if ($sessionId) {
+        $resumeArgs = @('resume', $sessionId)
+        $prompt = @"
+You were resumed after an agwinterm restart. You are still CODEX, the IMPLEMENTER, in the RIGHT pane for $Issue.
+Use the workbench-implementer skill. If you were implementing or fixing, continue that step and report
+as usual. Otherwise run python "$script:Lib\agmsg.py" list to read unread workbench mail, then wait
+for the next "Chat from Workbench:" line from the relay.
+"@
+    }
+}
+
 if ($WhatIfOnly) {
-    Write-Host ("would run: codex " + (($inject + $policy + $extra) -join ' '))
+    Write-Host ("would run: codex " + (($inject + $resumeArgs + $policy + $extra + @($prompt)) -join ' '))
     return
 }
 
@@ -94,4 +109,4 @@ $env:AI_HUB = $hubDir
 $env:AI_BOX = 'codex'
 Set-Location -LiteralPath $Checkout
 Write-Host "agworkbench: Codex for $Issue - sandbox workspace-write, network $network, root $Checkout" -ForegroundColor DarkGray
-& codex @inject @policy @extra $prompt
+& codex @inject @resumeArgs @policy @extra $prompt

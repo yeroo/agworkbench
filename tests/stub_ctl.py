@@ -33,7 +33,12 @@ for response in scenario.get("responses", []):
 
 tree = scenario.setdefault("tree", {"workspaces": []})
 sessions = [s for w in tree["workspaces"] for s in w["sessions"]]
-if args == ["tree", "--json"]:
+if args[:2] == ['session', 'restore']:
+    pane = option('--target')
+    session = next(s for s in sessions if pane in s.get('paneIds', [s['id']]))
+    session.setdefault('restoreCommands', {})[pane] = args[2]
+    finish(json.dumps({'action': 'pinned', 'pane': pane, 'session': session['id'], 'command': args[2]}))
+elif args == ["tree", "--json"]:
     if scenario.pop('fail_next_tree', False):
         finish('tree failed after split reply', 1)
     snapshot = json.loads(json.dumps(tree))
@@ -47,6 +52,10 @@ if args == ["tree", "--json"]:
 elif args[:2] == ["session", "new"]:
     name = option("--name")
     session_id = scenario["relay_id"] if name.endswith(" relay") else scenario["main_id"]
+    if not name.endswith(' relay'):
+        identity = Path(option('--cwd')) / '.workbench/state/claude.json'
+        scenario.setdefault('created_claude_identities', []).append(
+            json.loads(identity.read_text(encoding='utf-8-sig')) if identity.exists() else None)
     workspace = next((w for w in tree["workspaces"] if w["name"] == option("--workspace-name")), None)
     if workspace is None:
         workspace = {"name": option("--workspace-name"), "sessions": []}
