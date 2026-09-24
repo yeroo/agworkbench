@@ -178,6 +178,35 @@ the policy — not by flag, config key, profile, or alias; the test suite pins e
 Because its sandbox denies the terminal's control pipe, Codex cannot type into any pane — and
 doesn't need to: it writes mail files inside its clone, and the relay rings Claude.
 
+### Claude as the implementer
+
+With `"implementer": "claude"` in `~/.agworkbench.json`, or `github-workbench <issue> -Implementer
+claude` (for example when Codex is out of quota), the right pane runs Claude Code on
+`/workbench-implementer` instead of Codex. The loop does not change: the implementer's mailbox box
+is still `codex`, the relay rings it with Claude's profile (Return submits, the mid-turn hold, the
+ambiguous-composer rules), and it gets its own conversation record
+(`.workbench/state/implementer-claude.json`) and restart pin, like the planner's. Unlike Codex it
+commits its own work, and the planner never commits for it. A queue started with `-Implementer`
+passes the switch to every member.
+
+**A checkout keeps its implementer.** The choice is saved in `.workbench/state/implementer.json`,
+and a later run without `-Implementer` reuses it, so a repair run never swaps the agent under a
+running loop. A run that asks for the other tool is refused (exit 2, nothing changed) while the
+right pane holds a running agent. Close that agent, or leave it at a shell prompt, and rerun.
+
+**It is not sandboxed the way Codex is.** On Windows, Claude Code has no OS sandbox for its shell.
+Also, unlike Codex, it inherits your network and your authenticated `gh`. The launcher always
+passes `--disallowedTools` for `git push`, `gh`, and (unless `allowNetwork`) `WebFetch` and
+`WebSearch`. These deny rules hold under `--dangerously-skip-permissions` too, but they are a
+guardrail, not a boundary: a command can be spelled around a prefix rule. `claudeArgs` applies to
+both Claude panes. For the implementer, flags that would widen its tool policy are refused:
+`--add-dir`, `--permission-mode`, `--allowedTools`, `--disallowedTools` and `--settings`. Without
+`--dangerously-skip-permissions`, it asks before commands, and the loop waits for you.
+
+**Review rounds follow the implementer.** `wb.py revmux` uses the revmux profile saved for the
+checkout: `comprehensive` with Codex, `claude-only` with Claude, so a round never depends on Codex's
+quota. `revmuxProfile` in the config overrides both, and `--profile` overrides it for one round.
+
 **The relay** types only into the two panes of its own session, only into an agent's composer it
 can prove is empty, never into a dialog, and never answers a prompt. A refusal before typing waits
 for the next tick. After typing a pointer once, it verifies submission from an empty composer
@@ -255,7 +284,9 @@ are trusted.
 | `claudeArgs` | `[]` | extra arguments for `claude` — `-Bypass` puts `--dangerously-skip-permissions` here |
 | `codexArgs` | `[]` | extra arguments for `codex`; anything touching the sandbox policy is refused |
 | `checkoutRoot` | `~/source/workbench` | where per-issue clones go |
-| `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch) |
+| `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools |
+| `implementer` | `"codex"` | who runs the right pane: `"codex"` or `"claude"`; `-Implementer` overrides it for one launch or queue |
+| `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
 
 ## Layout
 
@@ -265,6 +296,7 @@ install.ps1                 prerequisites, the Claude command, the Codex skill, 
 lib/github-workbench.ps1    terminal detection, clone, session, split, relay
 lib/pane-claude.ps1         left pane: claude "/start-github-issue <issue>"
 lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer prompt
+lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/workbench-implementer <issue>"
 lib/relay.py                mail doorbell and PR watcher
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude
@@ -272,6 +304,7 @@ lib/wb.py                   opens those sessions for Claude with correct Windows
 lib/agmsg.py, hub.py,       the mailbox and the fail-closed pane messenger, vendored from the
     agw.py, peerchat.py     tested ai-hub tooling
 claude/commands/start-github-issue.md      the loop, from Claude's side
+claude/commands/workbench-implementer.md   the loop, from the implementer's side when it is Claude
 codex/skills/workbench-implementer/        the loop, from Codex's side
 tests/                      python -m unittest discover -s tests   (no terminal needed)
 ```

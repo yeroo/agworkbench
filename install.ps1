@@ -13,6 +13,7 @@
 
   Then the workbench itself:
     ~/.claude/commands/start-github-issue.md     the /start-github-issue slash command
+    ~/.claude/commands/workbench-implementer.md  Claude's side of the loop when "implementer" is "claude"
     ~/.codex/skills/workbench-implementer/       Codex's side of the loop
     this folder on your user PATH                so `github-workbench` works in cmd and PowerShell
     ~/.agworkbench.json                          created with defaults if it does not exist
@@ -118,7 +119,7 @@ if (-not $SkipTools) {
 $claudeCommands = Join-Path $HOME '.claude\commands'
 New-Item -ItemType Directory -Force -Path $claudeCommands | Out-Null
 Copy-Item -Force -Path (Join-Path $PSScriptRoot 'claude\commands\*.md') -Destination $claudeCommands
-Write-Done "claude: /start-github-issue installed"
+Write-Done "claude: /start-github-issue and /workbench-implementer installed"
 
 $codexSkills = Join-Path $HOME '.codex\skills'
 foreach ($skill in Get-ChildItem -Directory (Join-Path $PSScriptRoot 'codex\skills')) {

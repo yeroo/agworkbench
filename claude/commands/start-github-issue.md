@@ -19,6 +19,22 @@ it first, and what comes back is a located disagreement or a checked fact.
 
 The loop ends when the human has approved **and merged** the PR. Not before.
 
+## When the implementer is Claude
+
+The right pane may run **Claude Code** instead of Codex (`implementer: "claude"` in
+`~/.agworkbench.json`, or `github-workbench -Implementer claude`, e.g. when Codex is out of quota).
+`.workbench/state/implementer.json` says which. Everything below still says "Codex" for the
+implementer: its mailbox box stays `codex`, the relay rings it the same way, and the loop is the same.
+The differences:
+
+- It can commit, and it commits its own work on the issue branch. Review its commits. **Never
+  commit its uncommitted work yourself** - both panes share one index; if something is left
+  uncommitted, ask it to commit. It never pushes: pushing and GitHub stay yours.
+- It has the network, but the launcher denies it `git push`, `gh` and (unless `allowNetwork`)
+  the web tools. It still reads the issue from `.workbench/issue.md`.
+- `wb.py revmux` defaults to the `claude-only` revmux profile, so a review round does not depend on
+  Codex's quota (a `revmuxProfile` key in `~/.agworkbench.json` overrides it).
+
 ## Adopted session
 
 If the launcher printed `WORKBENCH ADOPTED`, this existing Claude session now owns that issue.
@@ -139,7 +155,8 @@ waiter, and end your turn.
 
 ## Phase 3 - implementation (Codex)
 
-Codex implements on this clone's `issue-*` branch, commits, runs the tests, and replies
+Codex implements on this clone's `issue-*` branch, commits (see "When the implementer is Claude"
+for who commits), runs the tests, and replies
 `IMPLEMENTED <sha>` with what it did, what it ran, and anything it did not do. Read the diff
 yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
 `git diff origin/<default>...HEAD`.
