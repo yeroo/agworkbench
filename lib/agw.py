@@ -271,6 +271,19 @@ def pane_text(pane_id: str) -> str:
     return str(request("session.text", target=pane_id, timeout=15.0))
 
 
+def cursor_column(pane_id: str) -> int:
+    """Read the zero-based caret column; it does not prove an empty composer."""
+    value = request('surface.cursor', target=pane_id)
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    raise CtlError(f'surface.cursor returned an invalid column: {value!r}')
+
+
 def type_into(pane_id: str, text: str) -> None:
     """Type keystrokes into a pane. A newline is Enter; a tab is Tab."""
     request("session.type", target=pane_id, args={"text": text})

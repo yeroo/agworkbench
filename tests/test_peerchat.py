@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -14,7 +15,7 @@ import agw
 import peerchat
 import relay
 from frames import (CLAUDE_IDLE, CLAUDE_RUNNING, CODEX_IDLE, CODEX_QUEUED, CODEX_UNSUBMITTED,
-                    TEXT, Clock, FakeAgw, claude, codex)
+                    CLAUDE_SUGGESTION, CLAUDE_WRAPPED_DRAFT, TEXT, Clock, FakeAgw, claude, codex)
 
 
 
@@ -25,6 +26,8 @@ class Submission(unittest.TestCase):
     @contextlib.contextmanager
     def environment(self, fake):
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column), \
+                patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
                 patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
             yield
 
@@ -63,7 +66,7 @@ class Submission(unittest.TestCase):
     def test_claude_queue_placeholder_before_typing_is_refused_as_a_possible_draft(self):
         frame = claude('Press up to edit queued messages')
         fake = FakeAgw('claude', frames=[frame])
-        with self.environment(fake), self.assertRaisesRegex(peerchat.Refused, 'not empty'):
+        with self.environment(fake), self.assertRaisesRegex(peerchat.Refused, 'holds a draft'):
             peerchat.send_once('pane', peerchat.PROFILES['claude'], TEXT, dry_run=False)
         self.assertEqual([], fake.keys)
 
@@ -227,6 +230,89 @@ class Submission(unittest.TestCase):
         self.assertEqual([], fake.keys)
         self.assertEqual(1, fake.reads)
 
+    def test_claude_classification_preserves_ambiguous_and_wrapped_drafts(self):
+        for frame, cursor, expected in [
+                (CLAUDE_IDLE, 2, 'empty'), (claude('Try "a suggestion"'), 2, 'empty'),
+                (CLAUDE_SUGGESTION, 2, 'ambiguous'),
+                (claude('a real draft with Home pressed'), 2, 'ambiguous'),
+                (claude('a real draft'), 14, 'draft'), (CLAUDE_WRAPPED_DRAFT, 2, 'draft'),
+                (claude('another draft\n'), 2, 'draft'),
+                (CLAUDE_SUGGESTION, agw.CtlError('unsupported'), 'draft'),
+                (CLAUDE_SUGGESTION, OSError('unavailable'), 'draft'),
+                (CLAUDE_SUGGESTION.replace('\n> ', '\n  > '), 4, 'ambiguous')]:
+            with self.subTest(cursor=cursor, expected=expected):
+                fake = FakeAgw('claude', frames=[frame], cursors=[cursor])
+                with self.environment(fake):
+                    text = agw.pane_text('pane')
+                    content, state = peerchat.composer_state('pane', peerchat.PROFILES['claude'], text)
+                self.assertEqual(expected, state)
+                self.assertEqual(peerchat.claude_composer(frame), content)
+                if fake.cursor_reads:
+                    self.assertEqual(['text', 'cursor'], fake.events)
+
+    def test_ambiguous_and_draft_prechecks_never_type(self):
+        for cursor, error, reason in [(2, peerchat.AmbiguousComposer, 'possibly a suggestion'),
+                                      (30, peerchat.Refused, 'holds a draft')]:
+            fake = FakeAgw('claude', frames=[CLAUDE_SUGGESTION], cursors=[cursor])
+            with self.environment(fake), self.assertRaisesRegex(error, reason) as caught:
+                peerchat.send_once('pane', peerchat.PROFILES['claude'], TEXT, dry_run=False)
+            self.assertEqual([], fake.keys)
+            if error is peerchat.AmbiguousComposer:
+                self.assertEqual(peerchat.claude_composer(CLAUDE_SUGGESTION), caught.exception.content)
+
+    def test_dialog_still_refuses_even_with_cursor_at_start(self):
+        fake = FakeAgw('claude', frames=[CLAUDE_SUGGESTION + '\n> 1. Yes'], cursors=[2])
+        with self.environment(fake), self.assertRaisesRegex(peerchat.Refused, 'dialog'):
+            peerchat.precheck('pane', peerchat.PROFILES['claude'])
+        self.assertEqual([], fake.keys)
+        self.assertEqual(0, fake.cursor_reads)
+
+    def test_malformed_cursor_reply_keeps_text_only_refusal(self):
+        cursor_reader = agw.cursor_column
+        fake = FakeAgw('claude', frames=[CLAUDE_SUGGESTION])
+        with self.environment(fake), patch.object(agw, 'cursor_column', cursor_reader), \
+                patch.object(agw, 'request', return_value={'column': 2}), \
+                self.assertRaisesRegex(peerchat.Refused, 'holds a draft'):
+            peerchat.precheck('pane', peerchat.PROFILES['claude'])
+        self.assertEqual([], fake.keys)
+
+    def test_suggestion_only_after_typing_waits_then_withholds_submit(self):
+        fake = FakeAgw('claude', frames=[CLAUDE_IDLE, CLAUDE_SUGGESTION], cursors=[2])
+        with self.assertRaisesRegex(peerchat.Failed, 'typed text was not confirmed'):
+            self.send(fake)
+        self.assertEqual([TEXT], fake.keys)
+        self.assertGreater(fake.cursor_reads, 1)
+        self.assertAlmostEqual(peerchat.SETTLE + peerchat.VERIFY_TIMEOUT, self.clock.t)
+
+    def test_post_submit_ambiguity_waits_but_does_not_prove_success(self):
+        for other in [CLAUDE_SUGGESTION, claude(TEXT[:30])]:
+            with self.subTest(other=other):
+                self.clock.t = 0
+                fake = FakeAgw('claude', frames=[CLAUDE_IDLE, claude(TEXT), other], cursors=[2])
+                with self.assertRaisesRegex(peerchat.Failed, 'submit not proven'):
+                    self.send(fake)
+                self.assertEqual([TEXT, '\n'], fake.keys)
+                self.assertGreater(fake.cursor_reads, 2)
+                self.assertAlmostEqual(2 * peerchat.SETTLE + peerchat.SUBMIT_TIMEOUT, self.clock.t)
+
+    def test_ambiguity_can_resolve_to_empty_within_submit_window(self):
+        fake = FakeAgw('claude', frames=[CLAUDE_IDLE, claude(TEXT), CLAUDE_SUGGESTION, CLAUDE_IDLE], cursors=[2])
+        self.assertEqual('submitted', self.send(fake))
+        self.assertEqual([TEXT, '\n'], fake.keys)
+
+    def test_own_pointer_at_start_still_uses_only_existing_key_retries(self):
+        fake = FakeAgw('claude', after=lambda f: claude(TEXT), cursors=[2])
+        with self.assertRaisesRegex(peerchat.Failed, 'pointer still unsent'):
+            self.send(fake)
+        self.assertEqual([TEXT, '\n', '\n', '\n'], fake.keys)
+
+    def test_codex_does_not_read_cursor_or_gain_ambiguity(self):
+        fake = FakeAgw('codex', frames=[codex('a real draft')], cursors=[2])
+        with self.environment(fake), self.assertRaisesRegex(peerchat.Refused, 'not empty'):
+            peerchat.precheck('pane', peerchat.PROFILES['codex'])
+        self.assertEqual(0, fake.cursor_reads)
+        self.assertEqual([], fake.keys)
+
     def test_cli_prints_valid_json(self):
         fake = FakeAgw()
         output = io.StringIO()
@@ -248,6 +334,33 @@ class Submission(unittest.TestCase):
         self.assertIn('[dry-run] would type', diagnostics.getvalue())
         self.assertEqual([], fake.keys)
         self.assertEqual(1, fake.reads)
+
+
+class CursorTransport(unittest.TestCase):
+    def test_pipe_accepts_integer_or_decimal_string(self):
+        for value in [0, 2, '2', ' 2\n', 80]:
+            with self.subTest(value=value), patch.object(agw, '_via_pipe', return_value={'ok': True, 'result': value}) as pipe, \
+                    patch.object(agw, '_via_cli', side_effect=AssertionError('unexpected CLI')):
+                self.assertEqual(int(value), agw.cursor_column('pane'))
+                self.assertEqual({'cmd': 'surface.cursor', 'target': 'pane'}, pipe.call_args.args[0])
+
+    def test_refused_and_malformed_replies_are_control_errors(self):
+        replies = [{'ok': False, 'error': 'unsupported'}]
+        replies += [{'ok': True, 'result': value} for value in
+                    [None, True, False, -1, 2.0, '2.0', '-1', '', 'column 2', {}, [2]]]
+        for reply in replies:
+            with self.subTest(reply=reply), patch.object(agw, '_via_pipe', return_value=reply), \
+                    self.assertRaises(agw.CtlError):
+                agw.cursor_column('pane')
+
+    def test_cli_fallback_keeps_cursor_verb_target_and_json_envelope(self):
+        response = subprocess.CompletedProcess([], 0, b'{"ok":true,"result":2}', b'')
+        with patch.object(agw, '_via_pipe', return_value=None), \
+                patch.object(agw, 'ctl_path', return_value='stub-ctl'), \
+                patch.object(agw, '_console_utf8', return_value=lambda: None), \
+                patch.object(agw.subprocess, 'run', return_value=response) as run:
+            self.assertEqual(2, agw.cursor_column('pane'))
+        self.assertEqual(['stub-ctl', 'surface', 'cursor', '--target', 'pane', '--json'], run.call_args.args[0])
 
 
 class CapturedBusyFrames(unittest.TestCase):

@@ -163,7 +163,8 @@ arrives. Claude also keeps one `wb.py wait-mail` command running through its bac
 the command checks its unread inbox immediately and then waits, waking Claude on mail or timeout.
 Reports from revmux and your revdiff annotations arrive through the same mailbox. You never need
 to type anything to keep the loop moving: a draft in Claude's composer only delays the relay's
-ring, which raises an alert after a minute; the background waiter still wakes Claude. Codex uses
+ring, which normally raises an alert after a minute (ambiguous Claude text has a longer delay,
+described below); the background waiter still wakes Claude. Codex uses
 the relay's queued pointers. Claude stops its waiter when the loop is complete.
 
 ## Safety model
@@ -188,6 +189,16 @@ a dialog. This verifies submission, not that the agent has read the mail. Failed
 alert immediately; mail held for a minute also raises a blocked status, sound, blink, and desktop
 notification naming the recipient, message, and reason. Alerts repeat at most every five minutes
 per message. Failed rings stay unannounced and can be sent again once the composer is empty.
+For Claude, unrecognized one-row text with its caret at the starting column is ambiguous: possibly
+a suggestion, or a draft with its caret at the start. The relay still refuses to type, but this
+pre-write hold alerts only after the same full text persists for ten minutes. A change in that text
+restarts the delay; changing from ambiguous text to an ordinary draft starts the one-minute delay,
+subject to the same five-minute notification throttle. Existing alerts keep their status-reset
+bookkeeping. Ambiguous text after a submit does not prove success and still results in a failed
+submission alert. This is a diagnostic and alert mitigation, not the delivery fix requested in
+[#16](https://github.com/yeroo/agworkbench/issues/16), which remains open. Safe delivery through a
+suggestion requires the distinguishing styled read tracked in
+[agwinterm#319](https://github.com/yeroo/agwinterm/issues/319).
 When alerted mail is delivered or independently read, the relay clears its last outstanding alert
 for that recipient to idle. That reset can race a newer agent-hook status; avoiding the race
 would require terminal support for conditional status ownership.
