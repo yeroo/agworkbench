@@ -220,10 +220,16 @@ same way when upgrading state that has no boundary.
 
 OPEN observation also survives restarts: if that PR finishes while the relay is offline, its
 merge or closure still ends the loop after the final notices drain. Once those notices and
-status resets are resolved, the PR is retired. Each run handles one finished PR; if several
-eligible PRs finished between polls, the newest by creation time (then PR number) is handled
+status resets are resolved, the PR is retired. Each run exits after its current watched PR
+finishes; if several eligible PRs finished between polls, the newest by creation time (then PR number) is handled
 first and the others remain available on restart. Pending final notices from older relay
 versions are also drained once for compatibility.
+
+When a newer open PR takes over, the relay checks the previous PR before switching. It files any
+new terminal notice for that PR and retires its watch, or logs that an unresolved watch was
+superseded. PR events are saved in an outbox with stable message IDs before publication. A restart
+replays that outbox without overwriting existing mail or resurrecting mail already read or
+archived, then resumes normal delivery and final-notice draining.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -248,11 +249,19 @@ def ensure_box(box: str) -> Path:
 
 
 def write_message(*, to: str, sender: str, subject: str, body: str, kind: str = "message",
-                  thread: str | None = None, refs: list[str] | None = None) -> Path:
+                  thread: str | None = None, refs: list[str] | None = None,
+                  message_id: str | None = None) -> Path:
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}: one of {', '.join(KINDS)}")
-    ensure_box(to)
-    message_id = new_id(sender)
+    if message_id is not None and not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}', message_id):
+        raise ValueError('bad message id')
+    directory = ensure_box(to)
+    message_id = message_id or new_id(sender)
+    # Replaying an outbox must not overwrite or resurrect an already-read message.
+    for folder in (directory, directory / 'read', directory / 'archive'):
+        existing = folder / f'{message_id}.md'
+        if existing.is_file():
+            return existing
     head = [
         "---",
         f"id: {message_id}",
@@ -269,7 +278,18 @@ def write_message(*, to: str, sender: str, subject: str, body: str, kind: str = 
         head += [f"  - {ref}" for ref in refs]
     head.append("---")
     path = box_dir(to) / f"{message_id}.md"
-    path.write_text("\n".join(head) + "\n\n" + body.rstrip() + "\n", encoding="utf-8")
+    # Publish a complete file without replacing an existing id, even on a concurrent replay.
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
+                                     suffix='.tmp', delete=False) as handle:
+        tmp = Path(handle.name)
+        handle.write("\n".join(head) + "\n\n" + body.rstrip() + "\n")
+    try:
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return path
+    finally:
+        tmp.unlink()
     append_log({"at": now_iso(), "event": "send", "id": message_id, "from": sender, "to": to,
                 "kind": kind, "subject": subject})
     return path

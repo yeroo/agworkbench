@@ -238,6 +238,13 @@ def gh_pages(endpoint: str) -> list[dict[str, Any]] | None:
 
 # --- effects ---------------------------------------------------------------------------------
 
+@dataclass
+class PrFetch:
+    snapshot: dict[str, Any]
+    fast: bool = False
+    previous: dict[str, Any] | None = None
+
+
 class Relay:
     def __init__(self, hub_dir: Path, peers: list[Peer], repo: str, branch: str,
                  mail_interval: float, pr_interval: float, dry_run: bool = False):
@@ -284,6 +291,7 @@ class Relay:
         # Old terminal notices may have been filed by the preexisting-PR bug. Preserve pending
         # delivery for compatibility, but never infer OPEN observation from those notices.
         if (saved_pr and saved_pr.get('state') in ('MERGED', 'CLOSED')
+                and not self.state.get('outbox')
                 and not self.pending_terminal_mail() and not self.state.get('reset_pending')):
             self.retire(saved_pr['number'])
 
@@ -457,7 +465,21 @@ class Relay:
             self._save()  # The boundary must survive a restart before any PR polling.
         return boundary
 
-    def fetch_pr(self) -> dict[str, Any] | None:
+    def view_pr(self, number: int) -> dict[str, Any] | None:
+        snapshot = gh_json(['pr', 'view', str(number), '--repo', self.repo, '--json', PR_FIELDS])
+        if snapshot is None:
+            return None
+        if (snapshot.get('number') != number or snapshot.get('isCrossRepository') is not False
+                or snapshot.get('headRefName') != self.branch):
+            self.log(f'ignoring PR #{number}: view does not match the requested number, head repository or branch')
+            return None
+        inline = gh_pages(f'repos/{self.repo}/pulls/{number}/comments')
+        if inline is None or snapshot.get('state') not in ('OPEN', 'MERGED', 'CLOSED'):
+            return None
+        snapshot['inline'] = inline
+        return snapshot
+
+    def fetch_pr(self) -> PrFetch | None:
         boundary = self.watch_boundary()
         if boundary is None:
             return None
@@ -487,7 +509,9 @@ class Relay:
                         or pr['number'] in self.state.get('completed_prs', [])):
                     continue
                 created = timestamp(pr.get('created_at'))
-                if created is None:
+                if pr['number'] in self.state.get('seen_open', []):
+                    eligible.append((created or boundary, pr['number']))
+                elif created is None:
                     self.log(f'PR #{pr["number"]}: creation time unavailable; will retry')
                 elif created >= boundary:
                     eligible.append((created, pr['number']))
@@ -498,17 +522,10 @@ class Relay:
                     self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
                 return None
             _, number = max(eligible)
-        snapshot = gh_json(['pr', 'view', str(number), '--repo', self.repo, '--json', PR_FIELDS])
+        snapshot = self.view_pr(number)
         if snapshot is None:
             return None
-        if (snapshot.get('number') != number or snapshot.get('isCrossRepository') is not False
-                or snapshot.get('headRefName') != self.branch):
-            self.log(f'ignoring PR #{number}: head repository or branch does not match')
-            return None
-        inline = gh_pages(f'repos/{self.repo}/pulls/{number}/comments')
-        if inline is None:
-            return None
-        snapshot['inline'] = inline
+        fast = False
         if snapshot.get('state') in ('MERGED', 'CLOSED'):
             if number in self.state.get('completed_prs', []):
                 return None
@@ -520,33 +537,55 @@ class Relay:
                 if created < boundary:
                     self.ignore_finished(number, snapshot['state'])
                     return None
-                # Only a validated view with a successful inline fetch can establish
-                # observation. watch_pr commits it with the actual terminal snapshot.
-                snapshot['_observed_after_watch'] = True
-        elif snapshot.get('state') != 'OPEN':
-            return None
+            # A legacy seen_open entry may have lost its snapshot during a PR switch.
+            # It needs explicit terminal events too, regardless of its creation time.
+            fast = tracked.get('number') != number
+        previous = None
+        if tracked and tracked['number'] != number:
+            previous = self.view_pr(tracked['number'])
+            if previous is None:
+                return None  # Resolve the old watch before committing the switch.
         for pr in older:
             self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
-        return snapshot
+        return PrFetch(snapshot, fast, previous)
+
+    def flush_outbox(self) -> None:
+        if self.dry_run or not self.state.get('outbox'):
+            return
+        for message in self.state['outbox']:
+            self.hub.write_message(**message)
+        self.state.pop('outbox')
+        self._save()
 
     def watch_pr(self) -> bool:
         """Returns True when the PR is terminal; its filed notices must still be delivered."""
-        snapshot = self.fetch_pr()
-        if snapshot is None:
+        self.flush_outbox()
+        result = self.fetch_pr()
+        if result is None:
             return False
+        snapshot, fast = result.snapshot, result.fast
         seen_open = set(self.state.get('seen_open', []))
         completed = set(self.state.get('completed_prs', []))
-        fast = snapshot.pop('_observed_after_watch', False) and snapshot['number'] not in seen_open
         if fast:
-            seen_open.add(snapshot['number'])
-            self.log(f'PR #{snapshot["number"]} opened and finished between polls')
-        terminal = finished(snapshot, seen_open, completed)
-        if snapshot.get('state') != 'OPEN' and not terminal:
-            self.ignore_finished(snapshot['number'], snapshot.get('state', 'finished'))
-            return False
+            if snapshot['number'] in seen_open:
+                self.log(f'PR #{snapshot["number"]}: recovering terminal events for a previous watch')
+            else:
+                self.log(f'PR #{snapshot["number"]} opened and finished between polls')
+        terminal = snapshot['state'] in ('MERGED', 'CLOSED')
         terminal_mail = list(self.state.get('terminal_mail', []))
         events = fast_terminal_events(snapshot) if fast else pr_events(self.state.get("pr"), snapshot)
-        for event in events:
+        numbered_events = [(snapshot['number'], event) for event in events]
+        if result.previous:
+            previous = result.previous
+            numbered_events = [(previous['number'], event)
+                               for event in pr_events(self.state.get('pr'), previous)] + numbered_events
+            completed.add(previous['number'])
+            self.log(f'PR #{previous["number"]}: resolved previous watch ({previous["state"]}); '
+                     f'switching to PR #{snapshot["number"]}')
+        outbox = []
+        sequence = self.state.get('event_sequence', 0)
+        for number, event in numbered_events:
+            sequence += 1
             recipients = ["claude"]
             terminal_event = event.get('terminal', False)
             if terminal_event:
@@ -555,22 +594,32 @@ class Relay:
                 if self.dry_run:
                     self.log(f"[dry-run] would file github mail for {box}: {event['subject']}")
                     continue
-                path = self.hub.write_message(to=box, sender="github", subject=event["subject"],
-                                              body=event["body"], kind=event["kind"])
+                # Sequence distinguishes repeated lifecycle events (e.g. close/reopen/close).
+                # It and these ids are checkpointed before any message becomes visible.
+                mid = f'github-pr{number}-{event["kind"]}-{sequence}-{box}'
+                outbox.append(dict(to=box, sender="github", subject=event["subject"],
+                                   body=event["body"], kind=event["kind"], message_id=mid))
                 if terminal_event:
-                    terminal_mail.append([box, path.stem])
+                    terminal_mail.append([box, mid])
             if not self.dry_run:
                 self.log(f"github: {event['subject']}")
         if not self.dry_run:
+            seen_open.add(snapshot['number'])
             if snapshot.get('state') == 'OPEN':
-                seen_open.add(snapshot['number'])
-                for key in ('completed_prs', 'ignored_prs'):
-                    if snapshot['number'] in self.state.get(key, []):
-                        self.state[key] = [number for number in self.state[key] if number != snapshot['number']]
+                completed.discard(snapshot['number'])
+                if snapshot['number'] in self.state.get('ignored_prs', []):
+                    self.state['ignored_prs'] = [number for number in self.state['ignored_prs']
+                                                 if number != snapshot['number']]
             self.state['seen_open'] = sorted(seen_open)
             self.state["pr"] = snapshot
             self.state['terminal_mail'] = terminal_mail
+            if completed or 'completed_prs' in self.state:
+                self.state['completed_prs'] = sorted(completed)
+            self.state['event_sequence'] = sequence
+            if outbox:
+                self.state['outbox'] = outbox
             self._save()
+            self.flush_outbox()
         return terminal
 
     def pending_terminal_mail(self) -> set[tuple[str, str]]:
@@ -582,10 +631,12 @@ class Relay:
 
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
+        self.flush_outbox()  # Recover publication before deciding whether final mail is drained.
         next_pr = 0.0
         saved_terminal = (self.state.get('pr') or {}).get('state') in ('MERGED', 'CLOSED')
-        drain_deadline = (now() + TERMINAL_DRAIN_TIMEOUT if saved_terminal and
-                          (self.pending_terminal_mail() or self.state.get('reset_pending')) else None)
+        # Replayed mail might already be read. Still finish this saved watch without polling
+        # GitHub again; the drain will immediately retire it if no delivery or reset remains.
+        drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT if saved_terminal else None
         if drain_deadline is not None:
             if self.dry_run:
                 self.log('[dry-run] saved PR is finished; no final mail filed')

@@ -225,7 +225,7 @@ class Delivery(DeliveryFixture):
         self.assertTrue(self.r.holds[('codex', '')].clear_pending)
         self.assertIn('discarding saved PR state for branch issue-3-launcher-log-resume '
                       '(this relay watches issue-6)', self.logs)
-        self.r.fetch_pr.return_value = copy.deepcopy(OPEN)
+        self.r.fetch_pr.return_value = relay.PrFetch(copy.deepcopy(OPEN))
         self.r.hub.write_message = Mock(return_value=Path('new-pr.md'))
         self.r.stop_file = SimpleNamespace(exists=lambda: self.r.fetch_pr.call_count > 0)
         with patch.object(relay, 'pause'):
@@ -514,7 +514,7 @@ class Delivery(DeliveryFixture):
         self.r.peers.append(relay.Peer('claude', 'claude', 'claude-pane'))
         self.r.state['pr'] = copy.deepcopy(OPEN)
         inline = {'id': 55, 'user': {'login': 'a'}, 'path': '0004-CLOSED.md', 'line': 12, 'body': 'fix'}
-        self.r.fetch_pr = Mock(return_value=with_(OPEN, inline=[inline]))
+        self.r.fetch_pr = Mock(return_value=relay.PrFetch(with_(OPEN, inline=[inline])))
         self.r.hub.write_message = Mock(return_value=Path('comment.md'))
         self.assertFalse(self.r.watch_pr())
         self.r.hub.write_message.assert_called_once()
@@ -608,7 +608,7 @@ class Delivery(DeliveryFixture):
         original_bytes = self.r.state_file.read_bytes()
         self.r._save = relay.Relay._save.__get__(self.r)
         self.r.hub.write_message = Mock(side_effect=AssertionError('dry run filed mail'))
-        self.r.fetch_pr = Mock(return_value=with_(OPEN, state='MERGED', mergedAt='now'))
+        self.r.fetch_pr = Mock(return_value=relay.PrFetch(with_(OPEN, state='MERGED', mergedAt='now')))
         self.r.dry_run = True
         self.tick(0)
         self.assertTrue(self.r.watch_pr())
@@ -660,7 +660,7 @@ class GithubLookup(DeliveryFixture):
         self.open_pages = [[rest_pr(51)], [rest_pr(53, repo='O/R'), rest_pr(99, repo='o/fork')]]
         self.views[53] = with_(OPEN, number=53)
         self.inline_pages = [[{'id': 1}], [{'id': 2}]]
-        snapshot = self.r.fetch_pr()
+        snapshot = self.r.fetch_pr().snapshot
         self.assertEqual(53, snapshot['number'])
         self.assertEqual([{'id': 1}, {'id': 2}], snapshot['inline'])
         commands = [c.args[0] for c in self.gh.call_args_list]
@@ -678,7 +678,7 @@ class GithubLookup(DeliveryFixture):
         candidate['user'] = {'login': 'another-user'}
         self.open_pages = [[candidate]]
         self.views[53] = with_(OPEN, number=53)
-        self.assertEqual(53, self.r.fetch_pr()['number'])
+        self.assertEqual(53, self.r.fetch_pr().snapshot['number'])
 
     def test_empty_open_list_looks_up_the_watched_number_directly(self):
         self.r.state.update(pr=with_(OPEN, number=53), seen_open=[53])
@@ -793,7 +793,7 @@ class GithubLookup(DeliveryFixture):
         filed = []
 
         def write(**message):
-            mid = f'reopened-{len(filed)}'
+            mid = message['message_id']
             filed.append(message)
             self.messages[mid] = dict(message, id=mid)
             self.unread[message['to']].append(mid)
@@ -850,7 +850,7 @@ class GithubLookup(DeliveryFixture):
         filed = []
 
         def write(**message):
-            mid = f'event-{len(filed)}'
+            mid = message['message_id']
             filed.append(message)
             self.messages[mid] = dict(message, id=mid)
             self.unread[message['to']].append(mid)
@@ -917,7 +917,7 @@ class GithubLookup(DeliveryFixture):
         filed = []
 
         def write(**message):
-            mid = f'fast-{len(filed)}'
+            mid = message['message_id']
             filed.append(message)
             self.messages[mid] = dict(message, id=mid)
             self.unread[message['to']].append(mid)
@@ -993,6 +993,7 @@ class GithubLookup(DeliveryFixture):
             self.views[53].update(changes)
             self.assertFalse(self.r.watch_pr())
             self.assertEqual(before, self.r.state)
+            self.assertIn('view does not match the requested number, head repository or branch', self.logs[-1])
         self.r.hub.write_message.assert_not_called()
 
     def test_fast_events_commit_terminal_snapshot_and_do_not_repeat_after_restart(self):
@@ -1011,7 +1012,9 @@ class GithubLookup(DeliveryFixture):
 
         self.r._save = save
         self.assertTrue(self.r.watch_pr())
-        self.assertEqual(1, len(saved))
+        self.assertEqual(2, len(saved))  # planned outbox, then publication checkpoint
+        self.assertEqual(6, len(saved[0]['outbox']))
+        self.assertNotIn('outbox', saved[1])
         self.assertEqual('MERGED', saved[0]['pr']['state'])
         self.assertEqual([53], saved[0]['seen_open'])
         self.assertEqual(2, len(saved[0]['terminal_mail']))
@@ -1135,6 +1138,175 @@ class GithubLookup(DeliveryFixture):
         self.assertEqual(54, self.r.state['pr']['number'])
         self.assertNotIn('ignored_prs', self.r.state)
 
+    def test_switch_files_previous_close_once_and_restart_keeps_waiting(self):
+        self.use_disk_state()
+        filed = self.record_mail()
+        self.open_pages = [[rest_pr(51)]]
+        self.views[51] = with_(OPEN, number=51)
+        self.assertFalse(self.r.watch_pr())
+        self.open_pages = [[rest_pr(53)]]
+        self.views[51]['state'] = 'CLOSED'
+        self.views[53] = with_(OPEN, number=53)
+        self.assertFalse(self.r.watch_pr())
+        self.assertEqual([51], self.r.state['completed_prs'])
+        self.assertEqual(53, self.r.state['pr']['number'])
+        for box in ['claude', 'codex']:
+            self.assertEqual(1, sum(m['subject'] == 'PR #51 was CLOSED without merging'
+                                    and m['to'] == box for m in filed))
+        self.open_pages = [[]]
+        self.views[53]['state'] = 'MERGED'
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 30)
+
+        def advance(seconds):
+            self.t += seconds
+
+        with patch.object(relay, 'pause', advance):
+            self.assertEqual(0, self.r.run())
+        self.assertEqual([51, 53], self.r.state['completed_prs'])
+        self.history_pages = [[rest_pr(51, state='closed'), rest_pr(53, state='closed')]]
+        self.restart_from_disk()
+        self.r.fetch_pr = relay.Relay.fetch_pr.__get__(self.r)
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 30)
+        before = len(filed)
+        with patch.object(relay, 'pause', advance):
+            self.assertEqual(0, self.r.run())
+        self.assertEqual(30, self.t)
+        self.assertEqual(before, len(filed))
+        self.assertEqual('stop file found; exiting', self.logs[-1])
+
+    def test_switch_marks_unresolved_previous_pr_completed_with_reason(self):
+        self.r.state.update(pr=with_(OPEN, number=51), seen_open=[51])
+        self.open_pages = [[rest_pr(53)]]
+        self.views.update({51: with_(OPEN, number=51), 53: with_(OPEN, number=53)})
+        self.assertFalse(self.r.watch_pr())
+        self.assertEqual([51], self.r.state['completed_prs'])
+        self.assertTrue(any('previous watch (OPEN); switching to PR #53' in line for line in self.logs))
+
+    def test_failed_previous_view_defers_switch_without_committing(self):
+        self.r.state.update(pr=with_(OPEN, number=51), seen_open=[51])
+        self.open_pages = [[rest_pr(53)]]
+        self.views.update({51: None, 53: with_(OPEN, number=53)})
+        before = copy.deepcopy(self.r.state)
+        self.assertFalse(self.r.watch_pr())
+        self.assertEqual(before, self.r.state)
+        self.r.hub.write_message.assert_not_called()
+
+    def test_legacy_orphan_seen_open_gets_terminal_events_even_before_boundary(self):
+        self.r.state['seen_open'] = [53]
+        self.fast_candidate(created=OLD_CREATED, state='CLOSED')
+        filed = self.record_mail()
+        self.assertTrue(self.r.watch_pr())
+        self.assertEqual(3, len(filed))
+        self.assertEqual('PR #53 was CLOSED without merging', filed[-1]['subject'])
+        self.assertTrue(self.r.watch_pr())
+        self.assertEqual(3, len(filed))
+
+    def use_disk_mail(self):
+        directory = self.r.hub_dir
+        for name, path in [('INBOX', directory / 'inbox'), ('STATE', directory / 'state'),
+                           ('LOG', directory / 'state' / 'log.jsonl')]:
+            self.enterContext(patch.object(hub, name, path))
+        self.r.peers = [self.peer, relay.Peer('claude', 'claude', 'claude-pane')]
+        self.r.hub = SimpleNamespace(unread=hub.unread, parse_message=hub.parse_message,
+                                     write_message=hub.write_message)
+
+    def test_outbox_recovers_crashes_before_during_and_after_publication(self):
+        initial = copy.deepcopy(self.r.state)
+        for crash_after in range(7):
+            with self.subTest(crash_after=crash_after):
+                self.r.state = copy.deepcopy(initial)
+                self.r.fetch_pr = relay.Relay.fetch_pr.__get__(self.r)
+                self.use_disk_state()
+                self.use_disk_mail()
+                self.fast_candidate()
+                self.views[53].update(reviews=[{'id': 'R1', 'body': 'review'}],
+                                      comments=[{'id': 'C1', 'body': 'comment'}])
+                self.inline_pages = [[{'id': 1, 'body': 'inline'}]]
+                publications = []
+
+                def write(**message):
+                    if len(publications) == crash_after:
+                        raise RuntimeError('crash during publication')
+                    path = hub.write_message(**message)
+                    publications.append(path)
+                    return path
+
+                self.r.hub.write_message = write
+                real_save = self.r._save
+
+                def save():
+                    if crash_after == 6 and 'outbox' not in self.r.state:
+                        raise RuntimeError('crash before publication checkpoint')
+                    real_save()
+
+                self.r._save = save
+                with self.assertRaises(RuntimeError):
+                    self.r.watch_pr()
+                saved = json.loads(self.r.state_file.read_text())
+                self.assertEqual('MERGED', saved['pr']['state'])
+                self.assertEqual([53], saved['seen_open'])
+                self.assertEqual(6, len(saved['outbox']))
+                self.assertEqual(2, len(saved['terminal_mail']))
+                self.assertEqual(crash_after, len(publications))
+                # An agent may have read a partially-published batch before the crash.
+                if crash_after == 6:
+                    publications = [hub.mark_read(path) for path in publications]
+                elif publications:
+                    publications[0] = hub.mark_read(publications[0])
+                original = {path: path.read_bytes() for path in publications}
+                self.r.hub.write_message = hub.write_message
+                self.restart_from_disk()
+                self.assertNotIn(53, self.r.state.get('completed_prs', []))
+                self.r.stop_file = SimpleNamespace(exists=lambda: False)
+                with patch.object(relay, 'pause', side_effect=AssertionError('unexpected wait')):
+                    self.assertEqual(0, self.r.run())
+                self.r.fetch_pr.assert_not_called()
+                self.assertEqual([53], self.r.state['completed_prs'])
+                self.assertNotIn('outbox', self.r.state)
+                paths = list((self.r.hub_dir / 'inbox').rglob('*.md'))
+                self.assertEqual(6, len(paths))
+                self.assertEqual(6, len({p.stem for p in paths}))
+                self.assertEqual(6, len(hub.LOG.read_text().splitlines()))
+                for path, contents in original.items():
+                    self.assertEqual(contents, path.read_bytes())
+
+    def test_explicit_mail_id_is_idempotent_in_inbox_read_and_archive(self):
+        self.use_disk_state()
+        self.use_disk_mail()
+        message = dict(to='claude', sender='github', subject='original', body='first',
+                       message_id='github-pr53-note-1-claude')
+        path = hub.write_message(**message)
+        contents = path.read_bytes()
+        for folder in ['', 'read', 'archive']:
+            target = hub.INBOX / 'claude' / folder / path.name
+            if path != target:
+                path.rename(target)
+                path = target
+            duplicate = hub.write_message(**dict(message, subject='changed', body='different'))
+            self.assertEqual(path, duplicate)
+            self.assertEqual(contents, path.read_bytes())
+        self.assertEqual(1, len(hub.LOG.read_text().splitlines()))
+        for invalid in ['../escape', 'x/y', 'x\\y', '.']:
+            with self.assertRaises(ValueError):
+                hub.write_message(**dict(message, message_id=invalid))
+
+    def test_dry_run_does_not_publish_or_clear_a_saved_outbox(self):
+        self.use_disk_state()
+        self.fast_candidate()
+        self.r.flush_outbox = Mock(side_effect=RuntimeError('crash'))
+        # The first flush precedes fetching; allow that one and fail after the checkpoint.
+        self.r.flush_outbox.side_effect = [None, RuntimeError('crash')]
+        with self.assertRaises(RuntimeError):
+            self.r.watch_pr()
+        disk = self.r.state_file.read_bytes()
+        self.restart_from_disk(dry_run=True)
+        before = copy.deepcopy(self.r.state)
+        self.r.hub.write_message.reset_mock()
+        self.assertEqual(0, self.r.run())
+        self.r.hub.write_message.assert_not_called()
+        self.assertEqual(before, self.r.state)
+        self.assertEqual(disk, self.r.state_file.read_bytes())
+
     def test_fast_terminal_drain_waits_for_hold_and_failed_status_reset(self):
         self.fast_candidate()
         filed = self.record_mail()
@@ -1190,7 +1362,7 @@ class BranchState(DeliveryFixture):
         self.save_legacy({'pr': copy.deepcopy(OPEN), 'announced': []})
         self.restart_from_disk()
         self.assertEqual([7], self.r.state['seen_open'])
-        self.r.fetch_pr.return_value = with_(OPEN, state='MERGED')
+        self.r.fetch_pr.return_value = relay.PrFetch(with_(OPEN, state='MERGED'))
         self.r.hub.write_message = Mock(return_value=Path('terminal.md'))
         self.assertTrue(self.r.watch_pr())
         self.assertEqual('PR #7 MERGED - the loop is complete',
@@ -1262,11 +1434,11 @@ class FinalNotices(DeliveryFixture):
         self.messages = {}
         self.r.state = {'pr': copy.deepcopy(OPEN), 'announced': [], 'seen_open': [7], 'branch': 'issue-6'}
         self.r.holds.clear()
-        self.r.fetch_pr = Mock(return_value=with_(OPEN, state=state, mergedAt='now'))
+        self.r.fetch_pr = Mock(return_value=relay.PrFetch(with_(OPEN, state=state, mergedAt='now')))
         self.r.stop_file = SimpleNamespace(exists=lambda: False)
 
         def write(**message):
-            mid = 'final-' + message['to']
+            mid = message['message_id']
             self.messages[mid] = dict(message, id=mid)
             self.unread[message['to']].append(mid)
             return Path(mid + '.md')
@@ -1287,7 +1459,7 @@ class FinalNotices(DeliveryFixture):
                 before = self.send.call_count
                 self.assertEqual(0, self.r.run())
                 self.assertEqual(before + 2, self.send.call_count)
-                self.assertEqual(['final-claude', 'final-codex'], self.r.state['announced'])
+                self.assertEqual(['github-pr7-note-1-claude', 'github-pr7-note-1-codex'], self.r.state['announced'])
                 self.r.fetch_pr.assert_called_once()
                 self.assertFalse(self.r.pending_terminal_mail())
 
@@ -1298,7 +1470,7 @@ class FinalNotices(DeliveryFixture):
         self.assertEqual(1, self.notify.call_count)
         self.assertIn('mid-turn', self.notify.call_args.args[1])
         self.status.assert_called_with('idle', pane_id=self.peer.pane)
-        self.assertEqual(['final-claude'], self.r.state['announced'])
+        self.assertEqual(['github-pr7-note-1-claude'], self.r.state['announced'])
 
     def test_drain_waits_for_a_failed_idle_reset_without_ringing_again(self):
         self.prepare_final()
@@ -1317,7 +1489,7 @@ class FinalNotices(DeliveryFixture):
         self.assertEqual(relay.TERMINAL_DRAIN_TIMEOUT, self.t)
         self.assertEqual([], self.r.state['announced'])
         self.assertIn('drain deadline reached', self.logs[-1])
-        self.assertIn('claude/final-claude', self.logs[-1])
+        self.assertIn('claude/github-pr7-note-1-claude', self.logs[-1])
         self.assertIn('mid-turn', self.logs[-1])
         self.r.fetch_pr.assert_called_once()
         self.assertNotIn(7, self.r.state.get('completed_prs', []))
@@ -1342,7 +1514,7 @@ class FinalNotices(DeliveryFixture):
         self.use_disk_state()
         self.assertTrue(self.r.watch_pr())
         saved = json.loads(self.r.state_file.read_text(encoding='utf-8'))
-        self.assertEqual([['claude', 'final-claude']], saved['terminal_mail'])
+        self.assertEqual([['claude', 'github-pr7-note-1-claude']], saved['terminal_mail'])
         self.r.hub.write_message.reset_mock()
         self.restart_from_disk()
         self.assertEqual(saved, self.r.state)
@@ -1352,7 +1524,7 @@ class FinalNotices(DeliveryFixture):
         self.assertEqual(4, self.pane.call_count)
         self.r.fetch_pr.assert_not_called()
         self.r.hub.write_message.assert_not_called()
-        self.assertEqual(['final-claude'], self.r.state['announced'])
+        self.assertEqual(['github-pr7-note-1-claude'], self.r.state['announced'])
 
     def test_restarted_drain_keeps_its_ceiling_without_github(self):
         self.prepare_final('CLOSED')
@@ -1363,7 +1535,7 @@ class FinalNotices(DeliveryFixture):
         self.assertEqual(0, self.r.run())
         self.assertEqual(relay.TERMINAL_DRAIN_TIMEOUT, self.t)
         self.assertIn('drain deadline reached', self.logs[-1])
-        self.assertIn('claude/final-claude', self.logs[-1])
+        self.assertIn('claude/github-pr7-note-1-claude', self.logs[-1])
         self.r.fetch_pr.assert_not_called()
 
     def test_legacy_pending_terminal_notices_drain_without_seeding_observation(self):
@@ -1386,7 +1558,7 @@ class FinalNotices(DeliveryFixture):
         self.prepare_final()
         self.use_disk_state()
         self.assertTrue(self.r.watch_pr())
-        self.r.state['announced'] = ['final-claude']
+        self.r.state['announced'] = ['github-pr7-note-1-claude']
         self.r.state['reset_pending'] = ['claude']
         self.r._save()
         self.restart_from_disk()
@@ -1402,7 +1574,7 @@ class FinalNotices(DeliveryFixture):
         self.prepare_final()
         self.use_disk_state()
         self.assertTrue(self.r.watch_pr())
-        self.r.state['announced'] = ['final-claude']
+        self.r.state['announced'] = ['github-pr7-note-1-claude']
         self.r._save()  # Simulate a stop after delivery was saved but before drain retirement.
         self.restart_from_disk()
         self.assertEqual([7], self.r.state['completed_prs'])
@@ -1418,7 +1590,7 @@ class FinalNotices(DeliveryFixture):
         self.prepare_final()
         self.use_disk_state()
         self.assertTrue(self.r.watch_pr())
-        self.r.state['announced'] = ['final-claude']
+        self.r.state['announced'] = ['github-pr7-note-1-claude']
         self.r.state['reset_pending'] = ['claude']
         self.r._save()
         self.restart_from_disk()
