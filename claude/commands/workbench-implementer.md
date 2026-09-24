@@ -100,4 +100,5 @@ When mail says the loop is complete, stop your waiter and stop.
 - edit outside this clone, disable or delete tests to get green, or weaken a check to pass it;
 - type into the planner's pane, or answer any prompt or dialog on anyone's behalf;
 - run `github-workbench` from this pane (it would try to adopt this pane as the planner);
-- treat the planner's agreement as the human's approval: only the human approves and merges.
+- treat the planner's agreement as the human's approval: only the human approves and merges;
+- merge anything. Auto-merge (#23), when the human turned it on, is the planner's act, never yours.
