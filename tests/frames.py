@@ -64,6 +64,11 @@ CLAUDE_SUGGESTION = claude('run a third revmux round before I merge')
 CLAUDE_WRAPPED_DRAFT = claude('x' * 51 + '\n  xx')
 
 
+def stable_frames(*frames):
+    """Two explicit equal reads per observation; raw frame lists can model redraw races."""
+    return [frame for frame in frames for _ in range(2)]
+
+
 class Clock:
     def __init__(self):
         self.t = 0.0

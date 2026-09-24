@@ -26,7 +26,7 @@ import relay  # noqa: E402
 import agw
 import hub
 import peerchat
-from frames import CLAUDE_IDLE, CLAUDE_RUNNING, CLAUDE_SUGGESTION, CODEX_IDLE, Clock, FakeAgw, claude, codex
+from frames import CLAUDE_IDLE, CLAUDE_RUNNING, CLAUDE_SUGGESTION, CODEX_IDLE, Clock, FakeAgw, claude, codex, stable_frames
 
 OPEN = {"number": 7, "url": "https://github.com/o/r/pull/7", "state": "OPEN", "reviewDecision": "",
         "reviews": [], "comments": [], "inline": [], "headRefName": "issue-6", "isCrossRepository": False}
@@ -401,7 +401,7 @@ class Delivery(DeliveryFixture):
         pointer = peerchat.compose_text('Chat from Workbench: ',
                                         relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
         # The relay reads the first frame for busy state before peerchat's own precheck.
-        fake = FakeAgw('claude', frames=[CLAUDE_IDLE, CLAUDE_IDLE, claude(pointer), CLAUDE_SUGGESTION], cursors=[2])
+        fake = FakeAgw('claude', frames=[CLAUDE_IDLE] + stable_frames(CLAUDE_IDLE, claude(pointer), CLAUDE_SUGGESTION), cursors=[2])
         clock = Clock()
         self.send.side_effect = self.real_send
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
@@ -576,7 +576,7 @@ class Delivery(DeliveryFixture):
             self.tick(5)
             self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
             self.assertEqual(1, self.notify.call_count)
-            fake.frames = [CODEX_IDLE, codex(pointer), CODEX_IDLE]
+            fake.frames = stable_frames(CODEX_IDLE, codex(pointer), CODEX_IDLE)
             self.tick(10)
         self.assertEqual([pointer, '\t', '\t', '\t', pointer, '\t'], fake.keys)
         self.assertEqual(['m1'], self.r.state['announced'])

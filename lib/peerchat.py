@@ -270,31 +270,35 @@ def codex_composer(text: str) -> str | None:
     return " ".join(row for row in rows if row).strip()
 
 
-def composer(profile: Profile, text: str) -> str | None:
-    return claude_composer(text) if profile.tool == "claude" else codex_composer(text)
-
-
 def looks_empty(profile: Profile, content: str) -> bool:
     """True only when the composer holds nothing but a placeholder. fullmatch, never match: a
     prefix match calls "placeholder + a modal choice list" empty, and then peer-chat types."""
     return any(hint.fullmatch(content) for hint in profile.hints)
 
 
-def composer_state(pane: str, profile: Profile, text: str) -> tuple[str | None, str]:
-    """Classify an already-read frame; a later cursor read can only mark ambiguity."""
+def composer_state(pane: str, profile: Profile, text: str) -> tuple[str | None, str, str]:
+    """Bracket the cursor read with matching composer snapshots before trusting either."""
     body = parse_claude_composer(text) if profile.tool == 'claude' else None
     content = body.content if body else (codex_composer(text) if profile.tool == 'codex' else None)
+    state = 'draft'
     if content is None:
-        return None, 'missing'
-    if looks_empty(profile, content):
-        return content, 'empty'
-    if body and body.rows == 1:
+        state = 'missing'
+    elif looks_empty(profile, content):
+        state = 'empty'
+    elif body and body.rows == 1:
         try:
             if agw.cursor_column(pane) == body.prompt_column:
-                return content, 'ambiguous'
+                state = 'ambiguous'
         except (agw.CtlError, OSError):
             pass  # Unavailable or malformed cursor data retains the text-only refusal.
-    return content, 'draft'
+    fresh = agw.pane_text(pane)
+    fresh_body = parse_claude_composer(fresh) if profile.tool == 'claude' else None
+    fresh_content = fresh_body.content if fresh_body else (codex_composer(fresh) if profile.tool == 'codex' else None)
+    if dialog_visible(text) or dialog_visible(fresh):
+        state = 'dialog'
+    elif (body, content) != (fresh_body, fresh_content):
+        state = 'changing'
+    return fresh_content, state, fresh
 
 
 def dialog_visible(text: str) -> bool:
@@ -387,7 +391,11 @@ def precheck(pane: str, profile: Profile) -> None:
     text = agw.pane_text(pane)
     if dialog_visible(text):
         raise Refused("a chooser or approval dialog is on screen in the target pane")
-    content, state = composer_state(pane, profile, text)
+    content, state, _ = composer_state(pane, profile, text)
+    if state == 'dialog':
+        raise Refused('a chooser or approval dialog appeared while checking the target composer')
+    if state == 'changing':
+        raise Refused('the target composer changed while checking it; not typing')
     if content is None:
         raise Refused(f"no {profile.display} composer visible in the target pane")
     if state == 'ambiguous':
@@ -416,12 +424,14 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
                 "a chooser or approval dialog appeared in the target pane after the text was typed; "
                 "submit withheld. Read the pane before doing anything else."
             )
-        content, state = composer_state(pane, profile, text)
+        content, state, _ = composer_state(pane, profile, text)
+        if state == 'dialog':
+            raise Failed('a chooser or approval dialog appeared while verifying typed text; submit withheld')
         if content is not None:
             seen = content
-            if owns(content, typed):
+            if state != 'changing' and owns(content, typed):
                 return
-            if state not in {'empty', 'ambiguous'} and compact(content) not in compact(typed):
+            if state not in {'empty', 'ambiguous', 'changing'} and compact(content) not in compact(typed):
                 raise Failed(f"composer holds something other than the attempted pointer: {content!r}; submit withheld")
         if now() >= deadline:
             break
@@ -447,15 +457,20 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
             frame = agw.pane_text(pane)
             if dialog_visible(frame):
                 raise Failed('a chooser or approval dialog appeared after submit; further keys withheld')
-            content, state = composer_state(pane, profile, frame)
-            if content is None:
+            content, state, fresh = composer_state(pane, profile, frame)
+            if state == 'dialog':
+                raise Failed('a chooser or approval dialog appeared while verifying submit; further keys withheld')
+            if state == 'changing':
+                if now() >= deadline:
+                    raise Failed('composer changed while verifying submit; further keys withheld')
+            elif content is None:
                 if needs_key or now() >= deadline:
                     raise Failed('composer disappeared after submit; further keys withheld')
             elif profile.tool == 'claude' and content == 'Press up to edit queued messages':
                 # Ambiguous with a literal draft before typing; only accept it after our submit.
                 return 'queued' + suffix
             elif state == 'empty':
-                outcome = 'queued' if profile.tool == 'codex' and queued_for(frame, typed) else 'submitted'
+                outcome = 'queued' if profile.tool == 'codex' and queued_for(fresh, typed) else 'submitted'
                 return ('submitted' if returned else outcome) + suffix
             elif state == 'ambiguous' and not owns(content, typed):
                 if now() >= deadline:
@@ -470,9 +485,9 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
                     key = profile.submit
                     phase = f'retry {retries}'
                     suffix = f' after retry {retries}'
-                elif (profile.tool == 'codex' and not returned and not is_busy(frame)
-                      and 'esc to interrupt' not in frame.lower()
-                      and 'queued follow-up inputs' not in frame.lower()):
+                elif (profile.tool == 'codex' and not returned and not any(
+                        is_busy(snapshot) or 'esc to interrupt' in snapshot.lower()
+                        or 'queued follow-up inputs' in snapshot.lower() for snapshot in (frame, fresh))):
                     key = '\n'
                     returned = True
                     phase = 'Return fallback'

@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -107,11 +108,15 @@ def _via_pipe(payload: dict[str, Any], timeout: float) -> dict[str, Any] | None:
     if not raw:
         raise CtlError("no response from the control pipe")
     try:
-        return json.loads(raw.decode("utf-8", errors="replace"))
+        envelope = json.loads(raw.decode("utf-8", errors="replace"))
     except json.JSONDecodeError as err:
         # The CLI transport wraps this. The pipe used to let a ValueError escape, so a caller
         # catching CtlError saw a different exception depending on which transport answered.
         raise CtlError(f"control pipe returned non-JSON: {raw[:200]!r}") from err
+    # None is reserved for an unavailable pipe, not a decoded JSON null.
+    if not isinstance(envelope, Mapping):
+        raise CtlError(f'control pipe returned a non-object envelope: {envelope!r}')
+    return envelope
 
 
 def ctl_path() -> str:
@@ -208,6 +213,8 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
     envelope = _via_pipe(payload, timeout)
     if envelope is None:
         envelope = _via_cli(payload, timeout)
+    if not isinstance(envelope, Mapping):
+        raise CtlError(f'control request returned a non-object envelope: {envelope!r}')
     if not envelope.get("ok"):
         raise CtlError(str(envelope.get("error", "unknown error")))
     return envelope.get("result")
@@ -276,11 +283,13 @@ def cursor_column(pane_id: str) -> int:
     value = request('surface.cursor', target=pane_id)
     if type(value) is int and value >= 0:
         return value
-    if isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
-        try:
-            return int(value.strip())
-        except ValueError:
-            pass
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isascii() and value.isdecimal():
+            try:
+                return int(value)
+            except ValueError:
+                pass  # Python can reject decimal strings exceeding its digit limit.
     raise CtlError(f'surface.cursor returned an invalid column: {value!r}')
 
 
