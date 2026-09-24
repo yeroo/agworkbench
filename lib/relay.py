@@ -46,7 +46,7 @@ sys.path.insert(0, str(HERE))
 
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 
-PR_FIELDS = "number,url,state,createdAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
+PR_FIELDS = "number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
@@ -105,10 +105,10 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     number = new.get("number")
     if old is not None and old.get('number') != number:
         old = None
-    if old is None:
+    if old is None or (new.get('state') == 'OPEN' and old.get('state') in ('MERGED', 'CLOSED')):
         if new.get('state') != 'OPEN':
             return events
-        events.append({"kind": "note", "identity": ['open', new.get('createdAt')],
+        events.append({"kind": "note", "identity": ['open', new.get('openingAt', new.get('createdAt'))],
                        "subject": f"PR #{number} is open",
                        "body": f"{new.get('url')}\n\nThe relay is now watching it for reviews, comments "
                                f"and the merge."})
@@ -146,7 +146,7 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     if new.get("reviewDecision") and new.get("reviewDecision") != old.get("reviewDecision"):
         events.append({"kind": "note", "subject": f"PR #{number}: review decision is now "
                                                    f"{new['reviewDecision']}", "body": new.get("url", ""),
-                       "identity": ['decision', new['reviewDecision'],
+                       "identity": ['decision', old.get('reviewDecision'), new['reviewDecision'], new.get('updatedAt'),
                                     sorted(r.get('id', '') for r in new.get('reviews') or [])]})
 
     state = new.get("state")
@@ -555,6 +555,21 @@ class Relay:
             previous = self.view_pr(tracked['number'])
             if previous is None:
                 return None  # Resolve the old watch before committing the switch.
+        # Timeline timestamps identify a reopening even after the relay's state is lost.
+        # Only discovery/reopening needs this extra request; retain the identity across polls.
+        if fast or (snapshot['state'] == 'OPEN' and
+                    (tracked.get('number') != number or tracked.get('state') != 'OPEN')):
+            timeline = gh_pages(f'repos/{self.repo}/issues/{number}/timeline')
+            if timeline is None:
+                return None
+            reopened = [timestamp(event.get('created_at')) for event in timeline
+                        if event.get('event') == 'reopened']
+            if any(instant is None for instant in reopened):
+                self.log(f'PR #{number}: reopening time unavailable; will retry')
+                return None
+            snapshot['openingAt'] = (max(reopened).isoformat() if reopened else snapshot.get('createdAt'))
+        elif tracked.get('number') == number and 'openingAt' in tracked:
+            snapshot['openingAt'] = tracked['openingAt']
         for pr in older:
             self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
         return PrFetch(snapshot, fast, previous)

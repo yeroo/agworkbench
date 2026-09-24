@@ -622,6 +622,7 @@ class GithubLookup(DeliveryFixture):
         self.open_pages = [[]]
         self.history_pages = [[]]
         self.inline_pages = [[]]
+        self.timeline_pages = [[]]
         self.views = {}
         self.date_response = SimpleNamespace(returncode=0, stdout=
             'HTTP/2.0 200 OK\r\nDate: Thu, 24 Sep 2026 16:00:00 GMT\r\n\r\n{}')
@@ -635,7 +636,9 @@ class GithubLookup(DeliveryFixture):
         if argv[1] == 'api':
             self.assertEqual(['--paginate', '--slurp'], argv[3:])
             url = urlsplit(argv[2])
-            if url.path.endswith('/comments'):
+            if url.path.endswith('/timeline'):
+                data = self.timeline_pages
+            elif url.path.endswith('/comments'):
                 data = self.inline_pages
             else:
                 self.assertEqual('repos/o/r/pulls', url.path)
@@ -657,7 +660,7 @@ class GithubLookup(DeliveryFixture):
         self.assertEqual(53, snapshot['number'])
         self.assertEqual([{'id': 1}, {'id': 2}], snapshot['inline'])
         commands = [c.args[0] for c in self.gh.call_args_list]
-        self.assertEqual(3, len(commands))
+        self.assertEqual(4, len(commands))
         self.assertEqual('53', commands[1][3])
         self.assertEqual('repos/o/r/pulls/53/comments', commands[2][2])
 
@@ -1383,8 +1386,12 @@ class GithubLookup(DeliveryFixture):
         self.open_pages = [[rest_pr(53)]]
         self.views[53] = with_(OPEN, number=53, reviews=[{'id': 'R1', 'body': 'old review'}])
         self.assertFalse(self.r.watch_pr())
+        # A later poll puts the inline event in the slot that a counter would reuse for R2
+        # after state loss. The two are both kind=review, so counter ids suppress R2.
+        self.inline_pages = [[{'id': 11, 'body': 'existing inline', 'path': 'x.py', 'line': 1}]]
+        self.assertFalse(self.r.watch_pr())
         original = {hub.mark_read(path): path.stem for path in hub.unread('claude')}
-        self.assertEqual(2, len(original))
+        self.assertEqual(3, len(original))
         contents = {path: path.read_bytes() for path in original}
         self.r.state_file.unlink()
         self.restart_from_disk()
@@ -1393,10 +1400,129 @@ class GithubLookup(DeliveryFixture):
         self.assertFalse(self.r.watch_pr())
         self.assertFalse(self.r.watch_pr())
         self.assertEqual(['new review'], [hub.parse_message(path)['body'] for path in hub.unread('claude')])
-        self.assertEqual(3, len(list(hub.INBOX.rglob('*.md'))))
-        self.assertEqual(3, len(hub.LOG.read_text().splitlines()))
+        self.assertEqual(4, len(list(hub.INBOX.rglob('*.md'))))
+        self.assertEqual(4, len(hub.LOG.read_text().splitlines()))
         for path, original_bytes in contents.items():
             self.assertEqual(original_bytes, path.read_bytes())
+
+    def test_disk_reopen_notice_is_published_and_rung_after_restart(self):
+        self.use_disk_state()
+        self.use_disk_mail()
+        self.open_pages = [[rest_pr(53)]]
+        self.views[53] = with_(OPEN, number=53)
+        self.assertFalse(self.r.watch_pr())
+        self.r.deliver_mail()
+        first_open = hub.unread('claude')[0]
+        self.open_pages = [[]]
+        self.views[53].update(state='CLOSED', closedAt='2026-09-24T16:01:00Z')
+        self.r.stop_file = SimpleNamespace(exists=lambda: False)
+        self.assertEqual(0, self.r.run())
+        self.assertEqual([53], self.r.state['completed_prs'])
+        self.restart_from_disk()
+        self.r.fetch_pr = relay.Relay.fetch_pr.__get__(self.r)
+        self.open_pages = [[rest_pr(53)]]
+        self.views[53].update(state='OPEN', updatedAt='2026-09-24T16:03:00Z', closedAt=None)
+        self.timeline_pages = [[{'event': 'reopened', 'created_at': '2026-09-24T16:02:00Z'}]]
+        self.assertFalse(self.r.watch_pr())
+        openings = [p for p in hub.unread('claude') if hub.parse_message(p)['subject'] == 'PR #53 is open']
+        self.assertEqual(2, len(openings))
+        second_open = next(p for p in openings if p != first_open)
+        # Restart before ringing; the second notice must remain distinct from the first.
+        self.restart_from_disk()
+        self.r.deliver_mail()
+        self.assertEqual(1, sum(second_open.stem in c.args[2] for c in self.send.call_args_list))
+        self.assertEqual(1, sum(first_open.stem in c.args[2] for c in self.send.call_args_list))
+        # Even losing relay state later recovers the same opening from the timeline, despite
+        # an updatedAt change caused by unrelated activity after reopening.
+        self.r.state_file.unlink()
+        self.restart_from_disk()
+        self.r.fetch_pr = relay.Relay.fetch_pr.__get__(self.r)
+        self.views[53]['updatedAt'] = '2026-09-24T16:04:00Z'
+        self.assertFalse(self.r.watch_pr())
+        self.assertEqual(2, sum(hub.parse_message(p)['subject'] == 'PR #53 is open'
+                                for p in hub.unread('claude')))
+
+    def test_disk_decision_oscillations_publish_distinct_notes_without_new_reviews(self):
+        self.use_disk_state()
+        self.use_disk_mail()
+        self.open_pages = [[rest_pr(53)]]
+        self.views[53] = with_(OPEN, number=53, reviews=[{'id': 'R1', 'body': 'same review'}])
+        self.assertFalse(self.r.watch_pr())
+        for minute, decision in enumerate(['APPROVED', 'REVIEW_REQUIRED', 'APPROVED',
+                                            'REVIEW_REQUIRED', 'APPROVED'], 1):
+            self.views[53].update(reviewDecision=decision, updatedAt=f'2026-09-24T16:0{minute}:00Z')
+            self.assertFalse(self.r.watch_pr())
+            self.r.deliver_mail()
+            notes = [p for p in hub.unread('claude') if 'review decision' in hub.parse_message(p)['subject']]
+            self.assertEqual(minute, len(notes))
+        decisions = [json.loads(line) for line in hub.LOG.read_text().splitlines()
+                     if 'review decision' in line]
+        self.assertEqual(5, len({event['id'] for event in decisions}))
+        self.assertTrue(decisions[-1]['subject'].endswith('APPROVED'))
+        self.assertEqual(5, sum('review decision' in c.args[2] for c in self.send.call_args_list))
+
+    def test_unknown_reopen_timeline_defers_discovery_without_persistence(self):
+        self.open_pages = [[rest_pr(53)]]
+        self.views[53] = with_(OPEN, number=53)
+        before = copy.deepcopy(self.r.state)
+        for timeline in [None, [[{'event': 'reopened', 'created_at': 'bad date'}]]]:
+            self.timeline_pages = timeline
+            self.assertFalse(self.r.watch_pr())
+            self.assertEqual(before, self.r.state)
+        self.r.hub.write_message.assert_not_called()
+
+    def test_truncated_id_replay_repairs_under_lock_and_keeps_complete_mail(self):
+        self.use_disk_state()
+        self.use_disk_mail()
+        directory = hub.ensure_box('claude')
+        message = dict(to='claude', sender='github', subject='recovered', body='complete body',
+                       message_id='github-truncated')
+        path = directory / 'github-truncated.md'
+        path.write_text('---\nid: github-truncated\nsubject: recov', encoding='utf-8')
+        truncated = path.read_bytes()
+        with hub.message_lock(directory / '.github-truncated.lock'):
+            with self.assertRaises(OSError):
+                hub.write_message(**message)
+            self.assertEqual(truncated, path.read_bytes())
+        with patch.object(hub.os, 'link', side_effect=OSError(errno.EPERM, 'links unavailable')):
+            real_rename = hub.os.rename
+
+            def install(source, target):
+                self.assertFalse(target.exists())
+                self.assertEqual('complete body', hub.parse_message(source)['body'])
+                real_rename(source, target)
+
+            with patch.object(hub.os, 'rename', side_effect=install) as rename:
+                self.assertEqual(path, hub.write_message(**message))
+                if os.name == 'nt':
+                    rename.assert_called_once()
+                else:
+                    rename.assert_not_called()
+        complete = path.read_bytes()
+        self.assertEqual('complete body', hub.parse_message(path)['body'])
+        self.assertEqual(path, hub.write_message(**dict(message, body='replacement')))
+        self.assertEqual(complete, path.read_bytes())
+        self.assertEqual(1, len(hub.LOG.read_text().splitlines()))
+        self.assertEqual([], list(directory.glob('*.tmp')))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows no-replace rename semantics')
+    def test_windows_rename_fallback_does_not_replace_a_competing_complete_id(self):
+        self.use_disk_state()
+        self.use_disk_mail()
+        original = '---\nsubject: concurrent\n---\noriginal\n'
+        real_rename = hub.os.rename
+
+        def competing_rename(source, target):
+            target.write_text(original, encoding='utf-8')
+            real_rename(source, target)  # Windows itself must refuse replacement.
+
+        with patch.object(hub.os, 'link', side_effect=OSError(errno.EPERM, 'links unavailable')), \
+                patch.object(hub.os, 'rename', side_effect=competing_rename):
+            path = hub.write_message(to='claude', sender='github', subject='concurrent', body='replacement',
+                                     message_id='github-rename-race')
+        self.assertEqual(original, path.read_text(encoding='utf-8'))
+        self.assertFalse(hub.LOG.exists())
+        self.assertEqual([], list(hub.INBOX.rglob('*.tmp')))
 
     def test_closed_predecessor_also_ends_run_without_observing_successor(self):
         self.r.state.update(pr=with_(OPEN, number=51), seen_open=[51])

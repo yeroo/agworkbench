@@ -232,6 +232,11 @@ with IDs derived from GitHub event identities before publication. A restart
 replays that outbox without overwriting existing mail or resurrecting mail already read or
 archived, then resumes normal delivery and final-notice draining. Publication errors are logged
 and retried on later ticks. A branch change discards any unpublished outbox from the old branch.
+Opening notices use creation time or the latest GitHub `reopened` timeline timestamp, so a
+reopening gets its own notice even after relay-state loss. Decision notices include the previous
+decision and the PR update time to distinguish repeated changes. Windows publishes complete mail
+atomically using a hard link or a no-replace rename; replay repairs an incomplete header while
+holding the message ID's publication lock.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.
