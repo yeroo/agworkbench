@@ -1772,6 +1772,29 @@ class AdoptionEntry(LauncherFixtures):
                              or c[:3] == ['session', 'split', 'on'] for c in self.calls()))
         self.assert_caller_untouched()
 
+    def test_claude_implementer_pane_turning_shell_is_reserved_before_typing(self):
+        # r15 m3: adoption withholds the pin from a running pane with no record; when that pane is a
+        # shell by the time it is probed for launch, it gets a fresh identity before anything is typed.
+        self.scenario['tree'] = {'workspaces': [{'name': 'repo', 'id': self.REPO_WS, 'sessions': [
+            {'id': MAIN_ID, 'name': '#7 fix-x', 'paneIds': [MAIN_ID, RIGHT_ID]}]}]}
+        self.scenario['text'][RIGHT_ID] = 'PS C:\\checkout> '
+        self.scenario['responses'] = [{'args': '^session text --target ' + RIGHT_ID, 'stdout': 'esc to interrupt',
+                                       'once': True}]
+        self.save_scenario()
+        self.register(claude=MAIN_ID, codex=RIGHT_ID)
+        (self.checkout / '.workbench/state/implementer.json').write_text('{"tool": "claude"}', encoding='utf-8')
+        result = self.entry('-NoRelay')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('has no recorded conversation', result.stdout)
+        record = json.loads((self.checkout / '.workbench/state/implementer-claude.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual((RIGHT_ID, 'fresh'), (record['pane'], record['origin']))
+        calls = self.calls()
+        pin = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'restore'] and c[-1] == RIGHT_ID)
+        typed = next(i for i, c in enumerate(calls) if c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID)
+        self.assertLess(pin, typed)
+        self.assertIn('pane-implementer-claude.ps1', calls[typed][-3])
+        self.assert_caller_untouched()
+
     def recover_ctl_failure(self, pattern, stage):
         self.env.pop('CLAUDECODE')
         self.scenario['responses'] = [{'args': pattern, 'stdout': 'injected failure', 'exit': 1, 'once': True}]
@@ -2368,6 +2391,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
         self.assertIn('Claude implementer pane', result.stdout)
+        self.assertNotIn('start Claude implementer there yourself', result.stdout)   # r15 m3
         self.assertNotIn(RIGHT_ID, self.pins())
         self.assertFalse(any(c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID for c in self.calls()))
 
@@ -2422,9 +2446,10 @@ class ClaudeImplementer(LauncherFixtures):
         line = self.pane({'claudeArgs': ['--dangerously-skip-permissions']}).stdout
         run = line[line.index('would run: claude '):]
         self.assertTrue(run.startswith("would run: claude '--disallowedTools' 'Bash(git push:*)' 'Bash(gh:*)' "
+                                       "'PowerShell(git push:*)' 'PowerShell(gh:*)' "
                                        "'WebFetch' 'WebSearch' '--dangerously-skip-permissions' '--session-id'"), run)
         opened = self.pane({'allowNetwork': True}).stdout
-        self.assertIn("'Bash(gh:*)' '--session-id'", opened)
+        self.assertIn("'PowerShell(gh:*)' '--session-id'", opened)
         self.assertNotIn('WebFetch', opened)
 
     def test_pane_refuses_policy_and_identity_arguments(self):
@@ -2451,8 +2476,19 @@ class ClaudeImplementer(LauncherFixtures):
         capture = json.loads(result.stdout.splitlines()[-1])
         self.assertEqual(('codex', str(self.checkout / '.workbench'), str(self.checkout), str(ROOT)),
                          (capture['Box'], capture['Hub'], capture['Cwd'], capture['Root']))
-        self.assertEqual(['--disallowedTools', 'Bash(git push:*)', 'Bash(gh:*)', 'WebFetch', 'WebSearch',
+        self.assertEqual(['--disallowedTools', 'Bash(git push:*)', 'Bash(gh:*)', 'PowerShell(git push:*)',
+                          'PowerShell(gh:*)', 'WebFetch', 'WebSearch',
                           '--session-id', OTHER_ID, '/workbench-implementer o/repo#7'], capture['Args'])
+
+    def test_repair_text_offers_no_launch_for_an_unidentified_implementer(self):
+        base = ("$l=@{Stage='relay'; MailboxReady=$true; CodexLaunch='THE-LINE'; ImplementerTool='claude'; "
+                "IssueRef='o/repo#7'; ImplementerIdentityReady=")
+        for ready, offered in (('$false', False), ('$true', True)):
+            with self.subTest(ready=ready):
+                result = ps('. ./lib/Workbench.ps1; ' + base + ready + '}; Format-RepairMessage $l', env=self.env)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual(offered, 'In the Claude implementer pane, once it is at an empty shell prompt: THE-LINE'
+                                 in result.stdout)
 
     def test_codex_is_not_required(self):
         self.assertIsNone(shutil.which('codex', path=self.env['PATH']))
@@ -2483,7 +2519,7 @@ class ClaudeImplementer(LauncherFixtures):
             self.assertIn(needle, command)
         self.assertIn('claude\\commands\\*.md', (ROOT / 'install.ps1').read_text(encoding='utf-8'))
         planner = (ROOT / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
-        self.assertIn('Never\n  commit its uncommitted work yourself', planner)
+        self.assertIn("Never commit the implementer's uncommitted work yourself", planner)
 
 
 if __name__ == "__main__":

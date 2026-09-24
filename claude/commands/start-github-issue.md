@@ -27,11 +27,12 @@ The right pane may run **Claude Code** instead of Codex (`implementer: "claude"`
 implementer: its mailbox box stays `codex`, the relay rings it the same way, and the loop is the same.
 The differences:
 
-- It can commit, and it commits its own work on the issue branch. Review its commits. **Never
-  commit its uncommitted work yourself** - both panes share one index; if something is left
-  uncommitted, ask it to commit. It never pushes: pushing and GitHub stay yours.
-- It has the network, but the launcher denies it `git push`, `gh` and (unless `allowNetwork`)
-  the web tools. It still reads the issue from `.workbench/issue.md`.
+- **Never commit the implementer's uncommitted work yourself** (this holds for either tool): both
+  panes share one index. If something is left uncommitted, ask the implementer to commit it. Only
+  when it reports that it cannot commit (Codex's sandbox can deny writes to `.git`) do you commit
+  on its behalf, with its co-author trailer. It never pushes: pushing and GitHub stay yours.
+- It has the network, but the launcher denies it `git push` and `gh` (through both its Bash and
+  PowerShell tools) and, unless `allowNetwork` is set, the web tools. It still reads the issue from `.workbench/issue.md`.
 - `wb.py revmux` defaults to the `claude-only` revmux profile, so a review round does not depend on
   Codex's quota (a `revmuxProfile` key in `~/.agworkbench.json` overrides it).
 
@@ -155,8 +156,8 @@ waiter, and end your turn.
 
 ## Phase 3 - implementation (Codex)
 
-Codex implements on this clone's `issue-*` branch, commits (see "When the implementer is Claude"
-for who commits), runs the tests, and replies
+Codex implements on this clone's `issue-*` branch, commits (never commit its uncommitted work
+yourself - see "When the implementer is Claude"), runs the tests, and replies
 `IMPLEMENTED <sha>` with what it did, what it ran, and anything it did not do. Read the diff
 yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
 `git diff origin/<default>...HEAD`.

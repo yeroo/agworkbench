@@ -1864,11 +1864,6 @@ class FinalNotices(DeliveryFixture):
         self.assertEqual(self.r.state, json.loads(self.r.state_file.read_text()))
         self.send.assert_not_called()
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ClaudeImplementer(DeliveryFixture):
     """#20: with implementer=claude the box stays 'codex' and the pane takes Claude's profile."""
     CLAUDE_PANE = "d387360b-a120-4e4b-b7a4-4db3171780ab"
@@ -1918,3 +1913,7 @@ class ClaudeImplementer(DeliveryFixture):
         self.tick(0)
         self.assert_unannounced()
         self.assertEqual('half a line', self.r.holds[('codex', 'm1')].ambiguous_text)
+
+
+if __name__ == "__main__":
+    unittest.main()

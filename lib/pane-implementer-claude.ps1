@@ -13,10 +13,11 @@
       tells the relay this pane takes Claude's keys.
   --disallowedTools, always
       Claude Code has no OS sandbox for its shell on Windows, and unlike Codex it inherits the
-      network and an authenticated gh. The deny list keeps it off push, gh and (unless allowNetwork)
-      the web tools; deny rules hold under --dangerously-skip-permissions too. It is a guardrail, not
-      a boundary: a command can be spelled around a prefix rule, so the instructions still say never
-      push. The list goes first, so the next option ends its variadic value list.
+      network and an authenticated gh. The deny list keeps it off push and gh - through both of its
+      shell tools, Bash and PowerShell - and (unless allowNetwork) the web tools; deny rules hold
+      under --dangerously-skip-permissions too. It is a guardrail, not a boundary: a command can be
+      spelled around a prefix rule, so the instructions still say never push. The list goes first,
+      so the next option ends its variadic value list.
 
   Extra arguments from "claudeArgs" in ~/.agworkbench.json pass through, as for the planner - so
   the human's --dangerously-skip-permissions opt-in applies here too - except anything that would
@@ -46,7 +47,8 @@ foreach ($argument in $claudeArgs) {
     }
 }
 
-$denied = @('Bash(git push:*)', 'Bash(gh:*)')
+# Claude Code on Windows runs commands through two tools, Bash and PowerShell; each is denied by name.
+$denied = @('Bash(git push:*)', 'Bash(gh:*)', 'PowerShell(git push:*)', 'PowerShell(gh:*)')
 if (-not $config.allowNetwork) { $denied += @('WebFetch', 'WebSearch') }
 $policy = @('--disallowedTools') + $denied
 

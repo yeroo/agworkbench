@@ -17,8 +17,8 @@ the PR.
 | the relay | rings your pane when mail arrives |
 | the human | reviews, approves, merges |
 
-Work in this clone only. The launcher denies you `git push`, `gh` and (unless the human allowed
-the network) the web tools. That is a guardrail, not a sandbox, so do not work around it: GitHub
+Work in this clone only. The launcher denies you `git push` and `gh` (through both the Bash and
+PowerShell tools) and, unless the human allowed the network, the web tools. That is a guardrail, not a sandbox, so do not work around it: GitHub
 is the planner's job.
 
 ## The channel

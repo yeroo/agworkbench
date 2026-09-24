@@ -723,7 +723,7 @@ function Resolve-Implementer {
        run without -Implementer never swaps agents under a running loop. An explicit request that
        differs from the saved tool is honoured only when the right pane holds no agent: it is gone,
        or it is a proven shell. Otherwise it is refused before anything is changed.
-       Returns @{ Tool; RevmuxProfile; Saved; Conflict }. #>
+       Returns @{ Tool; RevmuxProfile; Conflict }, Conflict being a refusal message or $null. #>
     param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex or claude (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
@@ -744,7 +744,7 @@ function Resolve-Implementer {
             $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
         } else { $tool = $Requested }
     } elseif ($Requested) { $tool = $Requested }
-    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); Saved = $saved; Conflict = $conflict }
+    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); Conflict = $conflict }
 }
 
 function Save-Implementer([string] $Checkout, $Resolved) {
@@ -912,7 +912,8 @@ function Start-WorkbenchSession {
     param([string] $Checkout, [int] $Number, [string] $Slug, [string] $RepoName,
           [string] $ClaudeLaunch, [string] $CodexLaunch, [string] $CodexRestore,
           [scriptblock] $RelayCommand, [switch] $NoRelay,
-          [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex')
+          [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex',
+          [bool] $ImplementerIdentityReady = $true)
     $invokeArgs = @{} + $PSBoundParameters
     Invoke-WithCheckoutLock $Checkout { Start-WorkbenchSessionCore @invokeArgs }
 }
@@ -921,12 +922,13 @@ function Start-WorkbenchSessionCore {
     param([string] $Checkout, [int] $Number, [string] $Slug, [string] $RepoName,
           [string] $ClaudeLaunch, [string] $CodexLaunch, [string] $CodexRestore,
           [scriptblock] $RelayCommand, [switch] $NoRelay,
-          [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex')
+          [string] $AdoptSession, [string] $CallerPane, [string] $ImplementerTool = 'codex',
+          [bool] $ImplementerIdentityReady = $true)
     $ErrorActionPreference = 'Stop'
     if (-not $script:Launch) { $script:Launch = @{} }
     $adoptedCodex = $script:Launch.Codex
     foreach ($key in @('SessionId', 'Claude', 'Codex', 'RelaySession', 'MailboxReady', 'ClaudeTyped', 'CodexTyped',
-            'RelayStarted', 'RelayCommand', 'RelayStopFile', 'ClaudeLaunchRequired')) {
+            'RelayStarted', 'RelayCommand', 'RelayStopFile', 'ClaudeLaunchRequired', 'ImplementerIdentityReady')) {
         $script:Launch.Remove($key)
     }
     if ($AdoptSession) {
@@ -1021,10 +1023,12 @@ function Start-WorkbenchSessionCore {
         $script:Launch.QueueIncomplete = $true
         throw "Claude identity is unavailable; repair the conversation in '$Checkout' before retrying"
     }
-    $codexIdentityReady = $true
+    # Adoption pins an existing right pane before this runs; its outcome is passed in.
+    $codexIdentityReady = $ImplementerIdentityReady
     if ($plan.Codex -and -not $AdoptSession) {
         $codexIdentityReady = Set-ImplementerRestore $Checkout $plan.Codex $CodexRestore $ImplementerTool -ExistingPane
     }
+    $script:Launch.ImplementerIdentityReady = $codexIdentityReady
     # A new Claude pane needs a launch even if its shell never becomes ready.
     # Existing Claude panes become launch candidates only after a shell is proven below.
     $script:Launch.ClaudeLaunchRequired = $plan.NeedSplit -and $plan.NewPaneRole -eq 'Claude'
@@ -1045,7 +1049,10 @@ function Start-WorkbenchSessionCore {
             $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
             Set-PaneRestore $script:Launch.Claude $ClaudeLaunch
             $claudeIdentityReady = $true
-        } else { $null = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool }
+        } else {
+            $codexIdentityReady = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool
+            $script:Launch.ImplementerIdentityReady = $codexIdentityReady
+        }
         $confirmed = $false
         foreach ($attempt in 1..30) {
             Start-Sleep -Milliseconds 300
@@ -1116,6 +1123,7 @@ function Start-WorkbenchSessionCore {
             if ($role -eq 'Codex' -and -not $codexIdentityReady) {
                 # The pane became a shell after the pin was withheld; it is free to start fresh.
                 $codexIdentityReady = Set-ImplementerRestore $Checkout $script:Launch.Codex $CodexRestore $ImplementerTool
+                $script:Launch.ImplementerIdentityReady = $codexIdentityReady
             }
             $typeSelection = @('--select')
             if ($script:Launch.QueueContext) { $typeSelection = @() }
@@ -1131,7 +1139,9 @@ function Start-WorkbenchSessionCore {
                 $script:Launch.QueueIncomplete = $true
                 throw "new $role pane did not reach a proven shell prompt; retry the queue member to finish setup"
             }
-            if ($role -ne 'Claude' -or $claudeIdentityReady) {
+            # A pane whose conversation could not be identified was already warned about; offering
+            # a launch there would start a second conversation over the running one.
+            if (($role -eq 'Claude' -and $claudeIdentityReady) -or ($role -eq 'Codex' -and $codexIdentityReady)) {
                 $name = $role
                 if ($role -eq 'Codex') { $name = Get-ImplementerName $ImplementerTool }
                 Write-Warning "the $side pane is not at a proven shell prompt; start $name there yourself with:`n  $line"
@@ -1200,7 +1210,7 @@ function Format-RepairMessage($Launch) {
         if ($Launch.ClaudeLaunchRequired -and -not $Launch.ClaudeTyped) {
             $lines += "In the Claude pane, once it is at an empty shell prompt: $($Launch.ClaudeLaunch)"
         }
-        if (-not $Launch.CodexTyped) {
+        if (-not $Launch.CodexTyped -and $Launch.ImplementerIdentityReady -ne $false) {
             $lines += "In the $(Get-ImplementerName $Launch.ImplementerTool) pane, once it is at an empty shell prompt: $($Launch.CodexLaunch)"
         }
         if (-not $Launch.NoRelay -and $Launch.RelayCommand) {
@@ -1553,11 +1563,13 @@ function Invoke-LauncherBody {
             $script:Launch.Codex = $adoptionPlan.CodexPane
             $null = Reserve-ClaudeIdentity $co.Dir $issueRef $adoptionPlan.CallerPane $adoptionPlan.ClaudeIdentity
             Set-PaneRestore $adoptionPlan.CallerPane $claudeLaunch
+            $implementerReady = $true
             if ($adoptionPlan.CodexPane) {
-                $null = Set-ImplementerRestore $co.Dir $adoptionPlan.CodexPane $codexRestore $resolved.Tool -ExistingPane
+                $implementerReady = Set-ImplementerRestore $co.Dir $adoptionPlan.CodexPane $codexRestore $resolved.Tool -ExistingPane
             }
             Initialize-AdoptedSession $adoptionPlan $co.Dir $repoName $ref.Number $slug
-            $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane }
+            $adoptArgs = @{ AdoptSession = $adoptionPlan.Session.id; CallerPane = $adoptionPlan.CallerPane;
+                            ImplementerIdentityReady = [bool]$implementerReady }
         }
         Start-WorkbenchSession -Checkout $co.Dir -Number $ref.Number -Slug $slug -RepoName $repoName `
             -ClaudeLaunch $claudeLaunch -CodexLaunch $codexLaunch -CodexRestore $codexRestore `

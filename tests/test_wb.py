@@ -341,11 +341,6 @@ class WaitMail(unittest.TestCase):
         self.assertNotIn('NEW MAIL', output)
         self.assertTrue((path.parent / 'read' / path.name).is_file())
 
-
-if __name__ == '__main__':
-    unittest.main()
-
-
 class RevmuxProfile(unittest.TestCase):
     """#20: the review round's profile follows the implementer the launcher saved for the checkout."""
 
@@ -383,3 +378,7 @@ class RevmuxProfile(unittest.TestCase):
             with self.subTest(text=text):
                 self.save(text)
                 self.assertIn("-Profile 'comprehensive'", self.run_round())
+
+
+if __name__ == '__main__':
+    unittest.main()

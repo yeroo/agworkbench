@@ -185,9 +185,9 @@ claude` (for example when Codex is out of quota), the right pane runs Claude Cod
 `/workbench-implementer` instead of Codex. The loop does not change: the implementer's mailbox box
 is still `codex`, the relay rings it with Claude's profile (Return submits, the mid-turn hold, the
 ambiguous-composer rules), and it gets its own conversation record
-(`.workbench/state/implementer-claude.json`) and restart pin, like the planner's. Unlike Codex it
-commits its own work, and the planner never commits for it. A queue started with `-Implementer`
-passes the switch to every member.
+(`.workbench/state/implementer-claude.json`) and restart pin, like the planner's. The planner never
+commits the implementer's uncommitted work, because both panes share one index; the implementer
+commits its own. A queue started with `-Implementer` passes the switch to every member.
 
 **A checkout keeps its implementer.** The choice is saved in `.workbench/state/implementer.json`,
 and a later run without `-Implementer` reuses it, so a repair run never swaps the agent under a
@@ -196,8 +196,9 @@ right pane holds a running agent. Close that agent, or leave it at a shell promp
 
 **It is not sandboxed the way Codex is.** On Windows, Claude Code has no OS sandbox for its shell.
 Also, unlike Codex, it inherits your network and your authenticated `gh`. The launcher always
-passes `--disallowedTools` for `git push`, `gh`, and (unless `allowNetwork`) `WebFetch` and
-`WebSearch`. These deny rules hold under `--dangerously-skip-permissions` too, but they are a
+passes `--disallowedTools` for `git push` and `gh` through both of Claude Code's shell tools
+(`Bash(git push:*)`, `Bash(gh:*)`, `PowerShell(git push:*)`, `PowerShell(gh:*)`), and, unless
+`allowNetwork` is set, `WebFetch` and `WebSearch`. These deny rules hold under `--dangerously-skip-permissions` too, but they are a
 guardrail, not a boundary: a command can be spelled around a prefix rule. `claudeArgs` applies to
 both Claude panes. For the implementer, flags that would widen its tool policy are refused:
 `--add-dir`, `--permission-mode`, `--allowedTools`, `--disallowedTools` and `--settings`. Without
@@ -285,7 +286,7 @@ are trusted.
 | `codexArgs` | `[]` | extra arguments for `codex`; anything touching the sandbox policy is refused |
 | `checkoutRoot` | `~/source/workbench` | where per-issue clones go |
 | `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools |
-| `implementer` | `"codex"` | who runs the right pane: `"codex"` or `"claude"`; `-Implementer` overrides it for one launch or queue |
+| `implementer` | `"codex"` | who runs the right pane (`"codex"` or `"claude"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
 
 ## Layout
