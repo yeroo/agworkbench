@@ -86,6 +86,39 @@ on restart. A failed pin stops setup with repair instructions.
 Review helpers are not pinned. Restarting agwinterm with its session tree intact replays these
 commands; running the launcher again refreshes the pins and leaves non-shell panes untouched.
 
+To work through several issues without waiting between them, run inside agwinterm:
+
+```powershell
+github-workbench -Queue 'owner/repo#3,#4,#5'
+github-workbench -Queue '3,4,5' -Repo owner/repo -Parallel 2
+github-workbench -Queue 'label:workbench' -Repo owner/repo -Watch
+github-workbench -Queue 'owner/repo#3,#4,#5' -Retry
+```
+
+A visible, restart-pinned `#queue owner/repo` conductor starts one issue at a time by default
+(`-Parallel 1..8`). Each issue has its own clone, Claude, Codex, and review relay. PR-open or blocked
+releases the initial-work slot immediately. Human-directed fixes on an earlier issue can continue
+alongside later issues. Agents never merge or approve PRs. Queue launches preserve focus, and Claude
+does not open revdiff automatically; run `wb.py human-review --base origin/main` in the issue's
+context to open it on demand, or review on GitHub.
+
+Rerunning appends new issues without duplicates. Saved parallelism is preserved unless explicitly
+changed. A watched label is checked every five minutes; empty or temporarily failing scans keep
+waiting. Without `-Watch`, the conductor exits after admission work finishes and writes a summary
+snapshot beside `~/.agworkbench/queues/<owner>/<repo>.json`. Per-issue review continues; rerun the
+queue to refresh its PR states. There is one watched label per queue. `-DryRun` resolves and shows
+the proposed members without starting anything. `-Retry` repairs failed/incomplete launches using
+their saved checkout and conversation; ordinary reruns leave failures for the human to inspect.
+Queue state corruption is reported without resetting it. Restore a moved/deleted established
+checkout before retrying. The configuration file selected when the queue was created is retained,
+including `AGWORKBENCH_CONFIG` overrides.
+
+Members publish local `.workbench/state/loop.json` reports through `wb.py loop-state` instead of
+mailing a conductor agent. The conductor reads those reports; each issue's mailbox and one Claude
+background waiter continue to handle human review independently. Queue mode does not attach to
+an existing non-queue workbench loop. Internal `-QueueMember`, `-QueueAttempt`, and `-QueueToken`
+arguments are supplied by the conductor, not ordinary launch commands.
+
 Claude's conversation ID, original project directory and pane binding live in
 `.workbench/state/claude.json`. The launcher reserves the ID before starting Claude, so an
 interrupted first launch can retry with the same ID. The pane script resumes that exact

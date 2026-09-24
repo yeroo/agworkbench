@@ -173,6 +173,15 @@ def _cli_args(payload: dict[str, Any]) -> list[str]:
     out = [area] + ([verb] if verb else [])
     if cmd in ("session.type", "session.write", "session.paste"):
         out += ["--select", str(args_in.get("text", ""))]
+    elif cmd == 'session.new':
+        for key, value in args_in.items():
+            if isinstance(value, bool):
+                if value:
+                    out.append('--' + key)
+            else:
+                out += ['--' + key, str(value)]
+    elif cmd == 'session.restore':
+        out += [str(args_in.get('command', ''))]
     elif cmd == "session.status":
         out += [str(args_in.get("status", "idle"))]
         if args_in.get("blink"):

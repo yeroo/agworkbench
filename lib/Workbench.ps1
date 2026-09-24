@@ -57,6 +57,7 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
     # Both the entry point and the terminal-free flow tests use this failure boundary.
     try { & $Body | Out-Null; return $true } catch {
         $failure = $_
+        if ($script:Launch.QueueContext) { $script:Launch.Failure = $failure.Exception.Message }
         $script:Launch.ClaudeHerePending = $false
         if ($failure.Exception -is [AdoptRefused]) {
             $script:Launch.ExitCode = 2
@@ -823,6 +824,20 @@ function Start-WorkbenchSessionCore {
         }
         $session = $livePlan.Session
     } else { $session = Find-IssueSession $tree $RepoName $Number $Slug $registry }
+    if ($script:Launch.QueueContext) {
+        $context = $script:Launch.QueueContext
+        $check = & python (Join-Path $script:Lib 'conductor.py') member-context --file $context.queue `
+            --number $context.number --attempt $context.attempt --token $context.token
+        if ($LASTEXITCODE -ne 0) { throw 'queue launch authorization changed before setup' }
+        $membershipPath = Join-Path $Checkout '.workbench\state\queue-member.json'
+        if (Test-Path -LiteralPath $membershipPath) {
+            $membership = Get-Content -Raw -LiteralPath $membershipPath | ConvertFrom-Json
+            if ($membership.queue -ne $context.queue -or $membership.repo -ne $context.repo -or $membership.number -ne $Number) {
+                throw 'this checkout belongs to another queue'
+            }
+        } elseif ($session) { throw "issue #$Number already has a workbench loop running outside the queue in $Checkout; finish and close that workbench session before retrying" }
+        Write-AtomicJson $membershipPath $context
+    }
     $relaySession = $null
     if (-not $NoRelay) {
         $relaySession = Find-RelaySession $tree $RepoName $Number
@@ -832,8 +847,10 @@ function Start-WorkbenchSessionCore {
     if (-not $session) {
         Set-LaunchStage session
         $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef
+        $selection = @()
+        if ($script:Launch.QueueContext) { $selection = @('--no-select') }
         $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
-            --workspace-name $RepoName --create-workspace --command $ClaudeLaunch
+            --workspace-name $RepoName --create-workspace --command $ClaudeLaunch @selection
         $script:Launch.SessionId = ($id -split '\s+')[0]
         if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
         $script:Launch.Claude = $script:Launch.SessionId
@@ -866,6 +883,10 @@ function Start-WorkbenchSessionCore {
         $claudeIdentityReady = $null -ne $identity
         if ($script:Launch.Adopted -and $claudeIdentityReady) { Set-PaneRestore $plan.Claude $ClaudeLaunch }
     } elseif (-not $plan.Claude) { $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef }
+    if ($script:Launch.QueueContext -and $plan.Claude -and -not $claudeIdentityReady) {
+        $script:Launch.QueueIncomplete = $true
+        throw "Claude identity is unavailable; repair the conversation in '$Checkout' before retrying"
+    }
     if ($plan.Codex -and -not $AdoptSession) { Set-PaneRestore $plan.Codex $CodexRestore }
     # A new Claude pane needs a launch even if its shell never becomes ready.
     # Existing Claude panes become launch candidates only after a shell is proven below.
@@ -954,12 +975,18 @@ function Start-WorkbenchSessionCore {
                     $claudeIdentityReady = $true
                 }
             }
-            Invoke-Ctl session type --select "$line`n" --target $script:Launch[$role] | Out-Null
+            $typeSelection = @('--select')
+            if ($script:Launch.QueueContext) { $typeSelection = @() }
+            Invoke-Ctl session type @typeSelection "$line`n" --target $script:Launch[$role] | Out-Null
             $script:Launch["${role}Typed"] = $true
             Write-Done "$role starting in the $side pane"
         } else {
             Write-LaunchLog $role.ToLowerInvariant() 'pane is not a proven shell; no launch text sent'
             if ($AdoptSession -and $freshPane) { throw 'new Codex pane did not reach a shell prompt; rerun to complete adoption' }
+            if ($script:Launch.QueueContext -and $freshPane) {
+                $script:Launch.QueueIncomplete = $true
+                throw "new $role pane did not reach a proven shell prompt; retry the queue member to finish setup"
+            }
             if ($role -ne 'Claude' -or $claudeIdentityReady) {
                 Write-Warning "the $side pane is not at a proven shell prompt; start $role there yourself with:`n  $line"
             }
@@ -978,7 +1005,9 @@ function Start-WorkbenchSessionCore {
                     Remove-Item -LiteralPath $stopFile -ErrorAction Stop
                     $script:Launch.Remove('RelayStopFile')
                 }
-                Invoke-Ctl session type --select "$relay`n" --target $relayPanes[0] | Out-Null
+                $typeSelection = @('--select')
+                if ($script:Launch.QueueContext) { $typeSelection = @() }
+                Invoke-Ctl session type @typeSelection "$relay`n" --target $relayPanes[0] | Out-Null
                 $script:Launch.RelayStarted = $true
             } elseif ($restartRelay) {
                 throw "relay session '$($relaySession.id)' did not reach a proven shell within 15 s; stop request remains at '$stopFile'. Wait for it to exit before following the repair commands."
@@ -997,8 +1026,10 @@ function Start-WorkbenchSessionCore {
         if ($script:Launch.RelayStarted) { Write-Done 'relay watching the mailbox and the PR' }
     }
     Set-LaunchStage focus
-    Invoke-Ctl session select $script:Launch.SessionId | Out-Null
-    Invoke-Ctl session focus $plan.ClaudeSlot --target $script:Launch.SessionId | Out-Null
+    if (-not $script:Launch.QueueContext) {
+        Invoke-Ctl session select $script:Launch.SessionId | Out-Null
+        Invoke-Ctl session focus $plan.ClaudeSlot --target $script:Launch.SessionId | Out-Null
+    }
     Set-LaunchStage ready
     if ($AdoptSession) {
         Save-AdoptionState $Checkout @{ session = $session.id; claudePane = $CallerPane;
@@ -1074,7 +1105,7 @@ function ConvertTo-Slug([string] $Text, [int] $Max = 40) {
 }
 
 function Get-IssueInfo([hashtable] $Issue) {
-    $json = & gh issue view $Issue.Number --repo $Issue.Repo --json number,title,url,state 2>&1
+    $json = & gh issue view $Issue.Number --repo $Issue.Repo --json 'number,title,url,state' 2>&1
     if ($LASTEXITCODE -ne 0) { throw "gh could not read $($Issue.Repo)#$($Issue.Number): $json" }
     return ($json | ConvertFrom-Json)
 }
@@ -1085,17 +1116,44 @@ function New-IssueCheckout {
     <# A FULL clone per issue, not a worktree: a worktree's .git lives outside the checkout, and
        Codex's workspace-write sandbox would then be unable to commit. Reused if it already exists,
        so running github-workbench again on the same issue resumes rather than starts over. #>
-    param([hashtable] $Issue, [string] $Title, [string] $Root)
+    param([hashtable] $Issue, [string] $Title, [string] $Root, [string] $Directory)
     $name = ($Issue.Repo -split '/')[1]
     $dir = Join-Path $Root "$name-issue-$($Issue.Number)"
+    if ($Directory) { $dir = $Directory }
     if ($script:Launch) { $script:Launch.Checkout = $dir }
     $branch = "issue-$($Issue.Number)-$(ConvertTo-Slug $Title 32)"
+    if ($script:Launch.QueueContext -and -not $script:Launch.QueueContext.checkoutEstablished -and
+        (Test-Path -LiteralPath $dir)) {
+        $usable = $false
+        if (Test-Path -LiteralPath (Join-Path $dir '.git')) {
+            Get-Command git -ErrorAction Stop | Out-Null
+            $usable = & {
+                # Windows PowerShell treats native stderr as an error record.
+                $ErrorActionPreference = 'Continue'
+                & git -C $dir --git-dir .git rev-parse HEAD 2>$null | Out-Null
+                $LASTEXITCODE -eq 0
+            }
+        }
+        if (-not $usable) {
+            # Only the queue's saved, unestablished clone may be replaced. Resolve and
+            # check the exact target before deleting; never follow a directory junction.
+            $target = [IO.Path]::GetFullPath($dir).TrimEnd('\', '/')
+            $saved = [IO.Path]::GetFullPath($script:Launch.QueueContext.checkout).TrimEnd('\', '/')
+            $item = Get-Item -LiteralPath $target -Force
+            if ($target -ne $saved -or (Split-Path -Leaf $target) -ne "$name-issue-$($Issue.Number)" -or
+                -not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "refusing to replace partial clone at $target; repair it manually"
+            }
+            Write-Step "replacing incomplete queue clone $target"
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+    }
     if (Test-Path -LiteralPath (Join-Path $dir '.git')) {
         Write-Step "reusing $dir"
     } else {
         New-Item -ItemType Directory -Force -Path $Root | Out-Null
         Write-Step "cloning $($Issue.Repo) into $dir"
-        & gh repo clone $Issue.Repo $dir -- --quiet | Out-Host
+        & gh repo clone $Issue.Repo $dir '--' --quiet | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "gh repo clone failed" }
     }
     Connect-LaunchLog (Join-Path $dir '.workbench\state\launch.log')
@@ -1265,7 +1323,9 @@ function Invoke-LauncherBody {
         $co = @{ Dir = $dir; Branch = "issue-$($ref.Number)-$(ConvertTo-Slug $info.title 32)" }
         Write-Step "would clone $($ref.Repo) into $($co.Dir) on branch $($co.Branch)"
     } else {
-        $co = New-IssueCheckout -Issue $ref -Title $info.title -Root $config.checkoutRoot
+        $checkoutArgs = @{}
+        if ($script:Launch.QueueContext) { $checkoutArgs.Directory = $script:Launch.QueueContext.checkout }
+        $co = New-IssueCheckout -Issue $ref -Title $info.title -Root $config.checkoutRoot @checkoutArgs
         Set-LaunchStage trust
         Grant-CodexTrust -Dir $co.Dir
         Grant-ClaudeTrust -Dir $co.Dir

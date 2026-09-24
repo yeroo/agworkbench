@@ -56,6 +56,9 @@ elif args[:2] == ["session", "new"]:
         identity = Path(option('--cwd')) / '.workbench/state/claude.json'
         scenario.setdefault('created_claude_identities', []).append(
             json.loads(identity.read_text(encoding='utf-8-sig')) if identity.exists() else None)
+        membership = Path(option('--cwd')) / '.workbench/state/queue-member.json'
+        scenario.setdefault('created_queue_memberships', []).append(
+            json.loads(membership.read_text(encoding='utf-8-sig')) if membership.exists() else None)
     workspace = next((w for w in tree["workspaces"] if w["name"] == option("--workspace-name")), None)
     if workspace is None:
         workspace = {"name": option("--workspace-name"), "sessions": []}
@@ -102,7 +105,7 @@ elif args[:2] == ["session", "type"]:
         if scenario.get("stop_file") and Path(scenario["stop_file"]).exists():
             finish("relay stop file must be cleared before restarting", 98, True)
         text = "relay up:"
-    elif "pane-claude.ps1" in option("--select"):
+    elif "pane-claude.ps1" in (option("--select") if '--select' in args else args[2]):
         text = "Claude running\nbypass permissions on"
     else:
         text = "Ask Codex to do anything\ngpt-test"
