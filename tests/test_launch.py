@@ -1293,6 +1293,151 @@ class RestoreFlow(LauncherFixtures):
         self.assertIn("'--resume' '" + record['sessionId'] + "'", composed.stdout)
 
 
+class QueueEntry(LauncherFixtures):
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(LIB))
+        import conductor
+        self.queue_module = conductor
+        self.queue_path = self.temp / 'queues/o/repo.json'
+        self.store = conductor.Store(self.queue_path)
+        self.store.directory.mkdir(parents=True)
+        self.token = str(uuid.uuid4())
+        member = conductor.new_member(7, 'o/repo', self.temp)
+        member.update(state='launching', attempt=1, token=self.token)
+        conductor.atomic_json(self.queue_path, dict(version=1, repo='o/repo', config=str(self.config_path),
+                              parallel=1, watch=False, yes=False, label=None, owner=None, members=[member]))
+        self.entry_lib = self.temp / 'queue entry'
+        self.entry_lib.mkdir()
+        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py']:
+            shutil.copyfile(LIB / name, self.entry_lib / name)
+        self.overrides = (
+            "\nfunction Get-IssueInfo { return @{title='fix-x';state='OPEN'} }\n"
+            "function New-IssueCheckout { param($Issue,$Title,$Root,$Directory); "
+            "if (-not $Directory) {throw 'queue did not pass saved checkout'}; "
+            "Connect-LaunchLog " + ps_quote(self.log_path) + "; return @{Dir=$Directory;Branch='issue-7-fix-x'} }\n"
+            "function Grant-CodexTrust {}\nfunction Grant-ClaudeTrust {}\n")
+        self.write_helpers()
+
+    def write_helpers(self, extra=''):
+        (self.entry_lib / 'Workbench.ps1').write_text((LIB / 'Workbench.ps1').read_text(encoding='utf-8-sig') +
+                                                    self.overrides + extra, encoding='utf-8')
+
+    def entry(self, *extra, shell=PWSH):
+        return subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                               str(self.entry_lib / 'github-workbench.ps1'), 'o/repo#7',
+                               '-QueueMember', str(self.queue_path), '-QueueAttempt', '1', '-QueueToken', self.token, *extra],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
+
+    def retry(self):
+        self.token = str(uuid.uuid4())
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', token=self.token, result=None)
+
+    def test_fresh_and_resume_preserve_focus_and_publish_result(self):
+        first = self.entry()
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        data = self.store.load()['members'][0]
+        self.assertEqual('ok', data['result']['result'])
+        self.assertEqual(MAIN_ID, data['result']['claudePane'])
+        state = json.loads(self.scenario_path.read_text())
+        self.assertEqual(str(self.queue_path), state['created_queue_memberships'][0]['queue'])
+        before = (self.checkout / '.workbench/state/claude.json').read_bytes()
+        self.retry()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual(before, (self.checkout / '.workbench/state/claude.json').read_bytes())
+        for call in self.calls():
+            self.assertNotIn(call[:2], [['session', 'select'], ['session', 'focus']])
+            if call[:2] == ['session', 'new']:
+                self.assertIn('--no-select', call)
+            if call[:2] == ['session', 'type']:
+                self.assertNotIn('--select', call)
+        self.assertEqual(2, sum(c[:2] == ['session', 'new'] for c in self.calls()))
+
+    def test_incomplete_codex_retry_repairs_without_restarting_claude(self):
+        self.write_helpers("\nfunction Wait-ShellPrompt { return $false }\n")
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertEqual('incomplete', self.store.load()['members'][0]['result']['result'])
+        original = (self.checkout / '.workbench/state/claude.json').read_bytes()
+        self.write_helpers()
+        self.retry()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual('ok', self.store.load()['members'][0]['result']['result'])
+        self.assertEqual(original, (self.checkout / '.workbench/state/claude.json').read_bytes())
+        typed = [c for c in self.calls() if c[:2] == ['session', 'type']]
+        self.assertEqual([RIGHT_ID], [c[-1] for c in typed])
+        self.assertIn('-Resume', typed[0][2])
+
+    def test_failed_relay_retry_restores_it_with_same_conversation(self):
+        self.scenario['responses'] = [{'args': '^session new --name #7 relay', 'exit': 1, 'once': True}]
+        self.save_scenario()
+        first = self.entry()
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertEqual('failed', self.store.load()['members'][0]['result']['result'])
+        original = (self.checkout / '.workbench/state/claude.json').read_bytes()
+        self.retry()
+        second = self.entry()
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        self.assertEqual(original, (self.checkout / '.workbench/state/claude.json').read_bytes())
+        self.assertEqual(1, sum(c[:2] == ['session', 'type'] for c in self.calls()))
+        self.assertEqual(RELAY_ID, self.store.load()['members'][0]['result']['relaySession'])
+
+    def test_non_queue_loop_is_refused_before_pin_or_typing(self):
+        self.resumed()
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn('outside the queue', result.stdout)
+        self.assertFalse(any(c[:2] in [['session', 'restore'], ['session', 'type']] for c in self.calls()))
+        self.assertFalse((self.checkout / '.workbench/state/queue-member.json').exists())
+
+    def test_member_github_proxy_preserves_arguments_without_network(self):
+        capture = self.temp / 'gh-args.json'
+        stub = self.temp / 'fake-gh.py'
+        stub.write_text('import json,sys\nfrom pathlib import Path\nPath(' + repr(str(capture)) +
+                        ').write_text(json.dumps(sys.argv[1:]))\nprint(json.dumps(dict(title="fix-x",state="OPEN")))\n', encoding='utf-8')
+        self.cmd('gh', '"' + sys.executable + '" "' + str(stub) + '" %*')
+        self.overrides = self.overrides.replace("function Get-IssueInfo { return @{title='fix-x';state='OPEN'} }", '')
+        self.write_helpers()
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(['issue', 'view', '7', '--repo', 'o/repo', '--json', 'number,title,url,state'],
+                         json.loads(capture.read_text()))
+
+    def test_unrecoverable_claude_identity_is_incomplete_not_active(self):
+        first = self.entry()
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        (self.checkout / '.workbench/state/claude.json').unlink()
+        self.retry()
+        result = self.entry()
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        report = self.store.load()['members'][0]['result']
+        self.assertEqual('incomplete', report['result'])
+        self.assertIn('Claude identity is unavailable', report['detail'])
+
+    def test_internal_membership_and_options_refused_before_mutation(self):
+        self.token = str(uuid.uuid4())
+        result = self.entry()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertEqual([], self.calls())
+        for args in (['-Queue', 'o/repo#1', '-Parallel', '0'], ['-Queue', 'o/repo#1', '-NoRelay'],
+                     ['-Queue', 'o/repo#1', '-NewSession'], ['-Parallel', '2'], ['-Retry'],
+                     ['-Queue', 'o/repo#1', '-Version'], ['o/repo#1', '-Queue', 'o/repo#2']):
+            with self.subTest(args=args):
+                run = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), *args],
+                                     env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=15)
+                self.assertEqual(2, run.returncode, run.stdout + run.stderr)
+                self.assertEqual([], self.calls())
+
+    @unittest.skipUnless(WINDOWS_PS, 'Windows PowerShell not installed')
+    def test_windows_powershell_queue_entry(self):
+        result = self.entry(shell=WINDOWS_PS)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('ok', self.store.load()['members'][0]['result']['result'])
+
+
 class AdoptionEntry(LauncherFixtures):
     CALLER_WS = '55555555-5555-4555-8555-555555555555'
     REPO_WS = '66666666-6666-4666-8666-666666666666'

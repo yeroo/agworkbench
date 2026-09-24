@@ -16,6 +16,60 @@ import hub
 import wb
 
 
+class QueueReports(unittest.TestCase):
+    def setUp(self):
+        import conductor
+        self.q = conductor
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb queue ' + uuid.uuid4().hex)
+        self.folder.mkdir()
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.state = self.folder / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.loop = str(uuid.uuid4())
+        self.q.atomic_json(self.state / 'queue-member.json', dict(queue=str(self.folder / 'queue.json'), repo='o/r', number=1))
+        self.q.atomic_json(self.state / 'claude.json', dict(sessionId=self.loop))
+        self.enterContext(patch.dict(os.environ, AI_HUB=str(self.folder / '.workbench'), CLAUDE_CODE_SESSION_ID=self.loop))
+        self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('terminal access')))
+        self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+
+    def report(self, state, pr=None, reason=None):
+        return wb.cmd_loop_state(wb.argparse.Namespace(state=state, pr=pr, reason=reason))
+
+    def test_reports_keep_pr_increment_revision_and_need_no_terminal(self):
+        self.assertEqual(0, self.report('pr-open', pr='https://github.com/o/r/pull/2'))
+        self.assertEqual(0, self.report('blocked', reason='human answer'))
+        self.assertEqual(0, self.report('resumed'))
+        report = self.q.read_json(self.state / 'loop.json')
+        self.assertEqual(3, report['rev'])
+        self.assertEqual(self.loop, report['loopId'])
+        self.assertEqual('https://github.com/o/r/pull/2', report['pr'])
+        self.assertIsNone(report['reason'])
+        self.assertEqual([], list(self.state.glob('*.tmp')))
+
+    def test_invalid_state_url_reason_or_identity_does_not_publish(self):
+        for state, pr, reason in [('bad', None, None), ('pr-open', None, None),
+                                  ('pr-open', 'https://github.com/other/repo/pull/1', None), ('blocked', None, None)]:
+            self.assertEqual(2, self.report(state, pr, reason))
+        with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=str(uuid.uuid4())):
+            self.assertEqual(2, self.report('blocked', reason='x'))
+        self.assertFalse((self.state / 'loop.json').exists())
+
+    def test_queue_instructions_are_at_each_decision_point(self):
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text()
+        for heading, next_heading, needle in [
+            ('## Phase 2', '## Phase 3', 'loop-state blocked'),
+            ('## Phase 4', '## Phase 5', 'loop-state blocked'),
+            ('## Phase 6', '## Phase 7', 'loop-state pr-open --pr'),
+            ('## Phase 7', '## Rules', 'loop-state blocked --reason "PR closed"'),
+        ]:
+            self.assertIn(needle, text.split(heading)[1].split(next_heading)[0])
+        phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
+        self.assertIn('Do not open revdiff automatically', phase6)
+        self.assertIn('Outside queue mode', phase6)
+        self.assertIn('loop-state resumed', text)
+        self.assertIn('loop-state blocked --reason "mail waiter configuration error"', text)
+
+
 class HelperWorkspace(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.dict(os.environ, {}, clear=True))

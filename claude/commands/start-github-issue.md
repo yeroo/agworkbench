@@ -36,6 +36,15 @@ tools. For **every file read or written for this loop**, use an **absolute path 
 scope and PR body files, and all source files inspected or reviewed. Apply the same rule to file
 paths in shell commands; do not let the original project root select the old checkout.
 
+## Queue mode
+
+When `.workbench/state/queue-member.json` exists, this issue belongs to an unattended queue.
+Report phase changes with `python "$AGWORKBENCH/lib/wb.py" loop-state`; it writes this checkout's
+durable report for the conductor. Never edit the global queue file or start another issue yourself.
+When a human answers a blocked issue, run `wb.py loop-state resumed` before continuing. Keep the
+same conversation and the one-background-waiter rule. A PR is the queue's handoff, not permission
+to merge. The conductor admits the next issue while this session continues handling its own review.
+
 ## The channel
 
 Everything goes through the workbench mailbox (`$AI_HUB`, the `.workbench/` folder of this clone).
@@ -67,7 +76,9 @@ python "$AGWORKBENCH/lib/wb.py" status active            # or blocked --sound, c
   start a replacement waiter if the loop still needs a reply or review, even when this completion
   named only already-handled IDs or the inbox is now empty. On exit **3** (timeout), check for
   unread mail and rearm if still waiting. On exit **2**, report the configuration error in chat and set
-  `wb.py status blocked --sound`; fix the cause before rearming, never loop blindly on errors.
+  `wb.py status blocked --sound`; in queue mode first report
+  `wb.py loop-state blocked --reason "mail waiter configuration error"`. Fix the cause before
+  rearming, never loop blindly on errors.
 - The relay's `Chat from Workbench:` pointer is a second doorbell. If it arrives first, read the
   mail and keep the existing waiter only while it has not completed. Ignore duplicate message
   contents for IDs already read and handled, but never ignore a waiter completion: apply the
@@ -118,8 +129,10 @@ is not, and verify any claim it makes about the code yourself before accepting i
 Agreement is explicit: Codex's reply begins with `AGREED: plan vK`. No agreement after four rounds
 means the disagreement belongs to the human: state both positions in chat, set
 `python "$AGWORKBENCH/lib/wb.py" status blocked --sound`, and wait.
+In queue mode, before ending that turn, run `wb.py loop-state blocked --reason "plan disagreement"`.
 
 An open question only the human can answer goes to the human now, not after implementation.
+In queue mode report `wb.py loop-state blocked --reason "<the question>"` before waiting for the answer.
 
 When agreed, send the go-ahead (kind `task`, subject `IMPLEMENT plan vK`), keep the background
 waiter, and end your turn.
@@ -157,6 +170,8 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
 
 Repeat until a round is clean, or what remains is minor and both of you agree to defer it. At most
 three revmux rounds; after that, what is left goes to the human with both positions.
+In queue mode, report `wb.py loop-state blocked --reason "review rounds exhausted: <remaining issue>"`
+before ending the turn to wait for the human.
 
 ## Phase 5 - the pull request
 
@@ -173,13 +188,19 @@ watches it from then on.
 
 ## Phase 6 - the human's review
 
-Open revdiff for the human in its own session, **selected**, so it is in front of them:
+In queue mode, run `python "$AGWORKBENCH/lib/wb.py" loop-state pr-open --pr <url>` before ending
+the turn, set `wb.py status idle`, and keep the background waiter. Do not open revdiff automatically.
+Tell the human that `wb.py human-review --base origin/<default>` opens it on demand, or they can
+review on GitHub. The conductor can start the next issue immediately; continue handling this PR's
+feedback below in this session.
+
+Outside queue mode, open revdiff for the human in its own session, **selected**:
 
 ```bash
 python "$AGWORKBENCH/lib/wb.py" human-review --base origin/<default>
 ```
 
-Tell them in one line where it is and that reviewing on GitHub works just as well. Then set
+Outside queue mode, tell them where it is and that reviewing on GitHub works just as well. Then set
 `python "$AGWORKBENCH/lib/wb.py" status blocked --sound`, keep the background waiter, and end your turn.
 
 Their feedback reaches you as mail - from `human` (revdiff annotations) or from `github` (PR
@@ -197,7 +218,8 @@ When mail arrives saying the PR was **MERGED**: post a short summary in chat (wh
 anything deferred), mail Codex that the loop is complete, run
 `python "$AGWORKBENCH/lib/wb.py" status completed`, stop any running background waiter by its task ID,
 and stop. The final note to Codex does not rearm the waiter. If it was **CLOSED** without merging, ask the
-human what they want next.
+human what they want next. In queue mode first run
+`wb.py loop-state blocked --reason "PR closed"`, set blocked status, and keep the background waiter.
 
 ## Rules
 
@@ -212,3 +234,5 @@ human what they want next.
 - Disagree when there is a disagreement. Two agents converging politely produce nothing.
 - When you are waiting on the human, say so and set the sidebar status to `blocked` (`wb.py status blocked`). When you are
   waiting on Codex or a review, keep one background waiter and end your turn.
+  Queue-mode Phase 6 is the exception: publish `loop-state pr-open` and use `idle` while awaiting
+  human review. Other human waits publish `loop-state blocked` before ending the turn.

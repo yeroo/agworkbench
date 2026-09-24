@@ -1,0 +1,427 @@
+"""Queue decisions with fake GitHub/launchers/clock and real process-held file locks."""
+import contextlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'lib'))
+import conductor as q
+
+
+class QueueCase(unittest.TestCase):
+    def setUp(self):
+        self.root = ROOT / ('test queue ' + uuid.uuid4().hex)
+        self.root.mkdir()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.config = self.root / 'config.json'
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones')}))
+        self.enterContext(patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(self.config),
+                                                 'AGWINTERM_ENABLED': '1', 'AGWINTERM_SESSION_ID': str(uuid.uuid4())}))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+        self.requests = []
+        self.enterContext(patch.object(q.agw, 'request', self.terminal))
+        self.enterContext(patch.object(q.agw, 'notify'))
+        self.enterContext(patch.object(q.agw, 'set_status'))
+        self.now = 1000
+        self.store = q.Store(self.root / 'queues/o/r.json')
+        self.launches = []
+        self.pr_state = 'OPEN'
+
+    def terminal(self, command, **kwargs):
+        self.requests.append((command, kwargs))
+        if command == 'session.new':
+            return str(uuid.uuid4())
+        if command == 'session.restore':
+            return dict(action='pinned', pane=kwargs['target'], command=kwargs['args']['command'])
+        raise AssertionError(command)
+
+    def start(self, spec='o/r#1,2,3', **kwargs):
+        return q.start_queue(spec, root=self.root / 'queues', **kwargs)
+
+    def gh(self, *args):
+        self.assertEqual(('pr', 'view'), args[:2])
+        return {'state': self.pr_state}
+
+    def spawn(self, data, m):
+        self.launches.append((m['number'], m['attempt'], m['token']))
+        directory = Path(m['checkout']) / '.workbench/state'
+        directory.mkdir(parents=True, exist_ok=True)
+        identity = directory / 'claude.json'
+        if not identity.exists():
+            q.atomic_json(identity, {'sessionId': str(uuid.uuid4()), 'pane': str(uuid.uuid4())})
+        q.atomic_json(directory / 'queue-member.json', dict(queue=str(self.store.path), repo=data['repo'], number=m['number']))
+        q.member_result(self.store.path, m['number'], m['attempt'], m['token'], dict(result='ok', sessionId='session'))
+        output = self.root / f'output-{m["number"]}.log'
+        output.write_text('')
+        class Done:
+            pid = 123
+            def poll(self):
+                return 0
+        return dict(process=Done(), stream=io.BytesIO(), path=output, started=self.now, attempt=m['attempt'], token=m['token'])
+
+    def worker(self):
+        return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh,
+                        clock=lambda: self.now, spawn=self.spawn)
+
+    def member(self, n=1):
+        return q.find_member(self.store.load(), n)
+
+    def report(self, n, state='pr-open', **kwargs):
+        m = self.member(n)
+        checkout = Path(m['checkout'])
+        identity = q.read_json(checkout / '.workbench/state/claude.json')
+        if state == 'pr-open':
+            kwargs.setdefault('pr', f'https://github.com/o/r/pull/{n}')
+        with patch.dict(os.environ, CLAUDE_CODE_SESSION_ID=identity['sessionId']):
+            return q.write_loop_state(checkout, state, **kwargs)
+
+    def test_three_issues_release_on_pr_open_without_merge(self):
+        self.start()
+        worker = self.worker()
+        for n in (1, 2, 3):
+            worker.tick()
+            worker.tick()
+            self.assertEqual('active', self.member(n)['state'])
+            self.report(n)
+            worker.tick()
+            self.assertEqual('pr-open', self.member(n)['state'])
+        self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
+        self.assertTrue(q.finished(self.store.load()))
+
+    def test_parallel_blocked_resumed_and_failed_members_release_slots(self):
+        self.start(parallel=2)
+        worker = self.worker()
+        worker.tick(); worker.tick()
+        self.assertEqual([1, 2], [x[0] for x in self.launches])
+        self.report(1, 'blocked', reason='human answer needed')
+        worker.tick()
+        self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
+        self.report(1, 'resumed')
+        worker.tick()
+        self.assertTrue(self.member(1)['slotReleased'])
+        self.assertEqual('active', self.member(1)['state'])
+        self.report(1)
+        worker.tick()
+        self.assertEqual('pr-open', self.member(1)['state'])
+
+    def test_incomplete_retry_repairs_and_reuses_existing_report(self):
+        self.start('o/r#1')
+        worker = self.worker()
+        worker.tick()
+        first = self.member()
+        self.report(1)
+        q.member_result(self.store.path, 1, first['attempt'], first['token'], dict(result='incomplete', detail='Codex missing'))
+        worker.tick()
+        self.assertEqual('failed', self.member()['state'])
+        self.start('o/r#1', retry=True)
+        worker.tick(); worker.tick()
+        self.assertEqual([1, 1], [x[0] for x in self.launches])
+        self.assertEqual('pr-open', self.member()['state'])
+        self.assertFalse(q.member_result(self.store.path, 1, first['attempt'], first['token'], dict(result='failed')))
+        self.assertEqual('pr-open', self.member()['state'])
+
+    def test_failed_members_stay_failed_on_rerun(self):
+        self.start('o/r#1')
+        with self.store.transaction() as data:
+            data['members'][0].update(state='failed', slotReleased=True)
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick()
+        self.assertEqual([], self.launches)
+        self.assertTrue(q.finished(self.store.load()))
+
+    def test_loop_revision_identity_and_validation(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.report(1, 'blocked', reason='one')
+        worker.tick()
+        old_revision = self.member()['consumedRev']
+        worker.tick()
+        self.assertEqual(old_revision, self.member()['consumedRev'])
+        directory = Path(self.member()['checkout']) / '.workbench/state'
+        q.atomic_json(directory / 'claude.json', {'sessionId': str(uuid.uuid4())})
+        report = self.report(1)
+        self.assertEqual(1, report['rev'])
+        worker.tick()
+        self.assertEqual('pr-open', self.member()['state'])
+        for change in ({'queue': 'foreign'}, {'repo': 'other/repo'}, {'loopId': str(uuid.uuid4())}, {'rev': 'bad'}):
+            q.atomic_json(directory / 'loop.json', dict(report, **change))
+            worker.tick()
+            self.assertEqual('pr-open', self.member()['state'])
+        (directory / 'loop.json').write_text('{broken')
+        worker.tick()
+        self.assertEqual('pr-open', self.member()['state'])
+
+    def test_closed_orderings_replacement_and_blocked_merge(self):
+        for blocked_first in (False, True):
+            with self.subTest(blocked_first=blocked_first):
+                self.pr_state = 'OPEN'
+                self.start('o/r#1')
+                worker = self.worker(); worker.tick(); worker.tick()
+                self.report(1)
+                worker.tick()
+                if blocked_first:
+                    self.report(1, 'blocked', reason='PR closed')
+                self.pr_state = 'CLOSED'; worker.next_pr = 0
+                worker.tick()
+                if not blocked_first:
+                    self.report(1, 'blocked', reason='PR closed'); worker.tick()
+                self.assertEqual('blocked', self.member()['state'])
+                self.assertEqual('CLOSED', self.member()['prState'])
+                self.report(1, 'resumed'); worker.tick()
+                self.pr_state = 'OPEN'
+                self.report(1, pr='https://github.com/o/r/pull/99'); worker.tick()
+                self.assertEqual('OPEN', self.member()['prState'])
+                self.report(1, 'blocked', reason='waiting'); worker.tick()
+                self.pr_state = 'MERGED'
+                resumed = self.worker(); resumed.tick()
+                self.assertEqual('merged', self.member()['state'])
+                # Separate fixture state for the other ordering.
+                self.store.path.unlink()
+
+    def test_delayed_bootstrap_and_live_worker_do_not_create_a_second_session(self):
+        self.start('o/r#1')
+        self.start('o/r#2')
+        self.assertEqual(1, sum(c == 'session.new' for c, _ in self.requests))
+        with self.store.transaction() as data:
+            data['owner'].update(state='running', session='gone', pid=999999)
+        with q.Lock(self.store.worker_lock):
+            self.start('o/r#3')
+        self.assertEqual(1, sum(c == 'session.new' for c, _ in self.requests))
+        self.assertEqual([1, 2, 3], [m['number'] for m in self.store.load()['members']])
+
+    def test_abandoned_bootstrap_fences_late_worker(self):
+        self.start('o/r#1')
+        old = self.worker()
+        with self.store.transaction() as data:
+            data['owner']['reservedAt'] -= 91
+        self.start('o/r#2')
+        self.assertEqual(0, old.run())
+        self.assertEqual(2, sum(c == 'session.new' for c, _ in self.requests))
+        self.assertEqual([], self.launches)
+
+    def test_two_racing_bootstraps_create_one_conductor(self):
+        gate, release = threading.Event(), threading.Event()
+        original = self.terminal
+        failures = []
+        def terminal(command, **kwargs):
+            if command == 'session.new':
+                gate.set()
+                self.assertTrue(release.wait(5))
+            return original(command, **kwargs)
+        def first():
+            try:
+                self.start('o/r#1')
+            except Exception as err:
+                failures.append(err)
+        with patch.object(q.agw, 'request', terminal):
+            thread = threading.Thread(target=first)
+            thread.start()
+            try:
+                self.assertTrue(gate.wait(5))
+                self.start('o/r#2')
+            finally:
+                release.set(); thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], failures)
+        self.assertEqual(1, sum(c == 'session.new' for c, _ in self.requests))
+        self.assertEqual([1, 2], [m['number'] for m in self.store.load()['members']])
+
+    def test_process_lock_is_exclusive_and_released_after_process_exit(self):
+        path = self.root / 'real.lock'
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); from conductor import Lock; '
+                  'lock=Lock(__import__("pathlib").Path(sys.argv[2]),0); lock.acquire(); print("held",flush=True); sys.stdin.readline()')
+        child = subprocess.Popen([sys.executable, '-c', script, str(ROOT / 'lib'), str(path)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual('held', child.stdout.readline().strip())
+            with self.assertRaises(q.QueueError):
+                with q.Lock(path, 0):
+                    pass
+        finally:
+            child.communicate('\n', timeout=5)
+        with q.Lock(path, 0):
+            pass
+
+    def test_append_during_finish_is_seen_and_completed_snapshot_is_written(self):
+        self.start('o/r#1')
+        worker = self.worker()
+        seen = []
+        def tick():
+            with self.store.transaction() as data:
+                for m in data['members']:
+                    if m['state'] == 'pending':
+                        seen.append(m['number'])
+                        m.update(state='pr-open', slotReleased=True)
+            if seen == [1]:
+                self.start('o/r#2')  # appends while worker.lock is held, before final check
+        worker.tick = tick
+        with patch.object(q.time, 'sleep'):
+            self.assertEqual(0, worker.run())
+        self.assertEqual([1, 2], seen)
+        self.assertEqual('finished', self.store.load()['owner']['state'])
+        self.assertTrue(self.store.path.with_suffix('.md').exists())
+        self.start('o/r#3')
+        self.assertEqual(2, sum(c == 'session.new' for c, _ in self.requests))
+
+    def test_config_drift_and_missing_saved_checkout(self):
+        self.start('o/r#1', parallel=2, yes=True)
+        worker = self.worker(); worker.tick(); worker.tick()
+        original = self.member()['checkout']
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'moved')}))
+        self.start('o/r#2')
+        self.assertEqual(original, self.member()['checkout'])
+        self.assertEqual(2, self.store.load()['parallel'])
+        self.assertEqual(str(self.config), self.store.load()['config'])
+        self.assertIn('moved', self.member(2)['checkout'])
+        shutil.rmtree(original)
+        with self.store.transaction() as data:
+            data['members'][0]['state'] = 'failed'
+        self.start('o/r#1', retry=True)
+        worker.tick()
+        self.assertEqual('failed', self.member()['state'])
+        self.assertIn('moved or deleted', self.member()['reason'])
+
+    def test_dry_run_does_not_create_any_files_and_corrupt_state_is_preserved(self):
+        self.start('o/r#1', dry_run=True)
+        self.assertFalse(self.store.path.parent.exists())
+        self.start('o/r#1')
+        self.store.path.write_text('{bad')
+        with self.assertRaisesRegex(q.QueueError, 'repair this file'):
+            self.start('o/r#2')
+        self.assertEqual('{bad', self.store.path.read_text())
+
+    def test_watch_survives_failed_and_empty_scans_then_admits_new_issue(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [], 'work')):
+            self.start('label:work', watch=True)
+        worker = self.worker()
+        responses = [OSError('offline'), [], [[{'number': 8, 'created_at': 'a'}]]]
+        def gh(*args):
+            value = responses.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        worker.gh = gh
+        for _ in range(3):
+            worker.tick()
+            self.assertFalse(q.finished(self.store.load()))
+            self.now += 300
+        self.assertEqual([8], [x[0] for x in self.launches])
+
+    def test_watched_label_is_stable_but_other_label_snapshots_can_append(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [1], 'work')):
+            self.start('label:work', watch=True)
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [2], 'later')):
+            self.start('label:later')
+            with self.assertRaises(q.UsageError):
+                self.start('label:later', watch=True)
+        self.assertEqual('work', self.store.load()['label'])
+        self.assertEqual([1, 2], [m['number'] for m in self.store.load()['members']])
+
+    def test_restart_reconciles_intent_and_completed_result_without_duplicate_launch(self):
+        self.start('o/r#1')
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', attempt=1, token=str(uuid.uuid4()), startedAt=self.now)
+        worker = self.worker()
+        worker.tick()  # crash after intent, before child launch
+        self.assertEqual([1], [x[0] for x in self.launches])
+        original = q.read_json(Path(self.member()['checkout']) / '.workbench/state/claude.json')['sessionId']
+        restarted = self.worker()
+        restarted.tick()  # result checkpoint exists even though owner lost its job handle
+        self.assertEqual('active', self.member()['state'])
+        self.assertEqual([1], [x[0] for x in self.launches])
+        with self.store.transaction() as data:
+            data['members'][0].update(state='launching', result=None, startedAt=self.now)
+        restarted.tick()  # session exists but launch result was not checkpointed
+        self.assertEqual([1, 1], [x[0] for x in self.launches])
+        self.assertEqual(original, q.read_json(Path(self.member()['checkout']) / '.workbench/state/claude.json')['sessionId'])
+
+    def test_launcher_exit_and_timeout_do_not_hold_the_queue(self):
+        self.start('o/r#1,2')
+        worker = self.worker()
+        worker.tick()
+        with self.store.transaction() as data:
+            data['members'][0]['result'] = None
+        worker.tick()  # exit 0 without the required result is failed, next issue starts
+        self.assertEqual('failed', self.member()['state'])
+        self.assertEqual([1, 2], [x[0] for x in self.launches])
+        with self.store.transaction() as data:
+            data['members'][1]['result'] = None
+        process = worker.jobs[2]['process']
+        process.poll = lambda: None
+        process.wait = lambda timeout: 0
+        process.kill = lambda: None
+        self.now += 601
+        with patch.object(q.subprocess, 'run') as run, patch.object(q.shutil, 'which', return_value='gh'):
+            worker.tick()
+        self.assertEqual('failed', self.member(2)['state'])
+        self.assertEqual('timeout', self.member(2)['launchResult'])
+        self.assertTrue(q.finished(self.store.load()))
+        if os.name == 'nt':
+            self.assertEqual(['taskkill', '/PID', '123', '/T', '/F'], run.call_args.args[0])
+
+    def test_pr_lookup_failure_retains_state_and_retries(self):
+        self.start('o/r#1')
+        worker = self.worker(); worker.tick(); worker.tick()
+        self.report(1)
+        worker.gh = lambda *a: (_ for _ in ()).throw(OSError('offline'))
+        worker.tick()
+        self.assertEqual('pr-open', self.member()['state'])
+        worker.gh = self.gh
+        self.pr_state = 'MERGED'
+        self.now += 301
+        worker.tick()
+        self.assertEqual('merged', self.member()['state'])
+
+    def test_gh_uses_a_deadline_and_never_modifies_a_pr(self):
+        with patch.object(q.subprocess, 'Popen') as spawn, patch.object(q.shutil, 'which', return_value='gh'):
+            spawn.return_value.returncode = 0
+            spawn.return_value.communicate.return_value = (b'{"state":"OPEN"}', b'')
+            self.assertEqual({'state': 'OPEN'}, q.gh_json('pr', 'view', 'url', '--json', 'state'))
+        self.assertEqual(60, spawn.return_value.communicate.call_args.kwargs['timeout'])
+        self.assertEqual(['gh', 'pr', 'view', 'url', '--json', 'state'], spawn.call_args.args[0])
+
+    def test_gh_timeout_stops_its_child_tree(self):
+        with patch.object(q.subprocess, 'Popen') as spawn, patch.object(q.subprocess, 'run') as run:
+            spawn.return_value.pid = 123
+            spawn.return_value.communicate.side_effect = [subprocess.TimeoutExpired('gh', 60), (b'', b'')]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                q.run_gh(['repo', 'clone', 'o/r', 'checkout'])
+        if os.name == 'nt':
+            self.assertEqual(['taskkill', '/PID', '123', '/T', '/F'], run.call_args.args[0])
+
+
+class Specs(unittest.TestCase):
+    def test_lists_and_repositories(self):
+        self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('o/r#3,#4,3'))
+        self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('3,4', 'o/r'))
+        self.assertEqual(('o/r', [3], None), q.resolve_spec('3', gh=lambda *a: {'nameWithOwner': 'o/r'}))
+        for spec in ('', '0', '-1', 'o/r#1,x/y#2', '1,', 'label:'):
+            with self.subTest(spec=spec), self.assertRaises(q.QueueError):
+                q.resolve_spec(spec, 'o/r')
+
+    def test_paginated_label_order_excludes_prs_and_encodes_label(self):
+        calls = []
+        def gh(*args):
+            calls.append(args)
+            return [[{'number': 3, 'created_at': 'b'}, {'number': 99, 'pull_request': {}, 'created_at': 'a'}],
+                    [{'number': 2, 'created_at': 'a'}, {'number': 1, 'created_at': 'a'}]]
+        self.assertEqual(('o/r', [1, 2, 3], 'needs work'), q.resolve_spec('label:needs work', 'o/r', gh))
+        self.assertIn('labels=needs%20work', calls[0][1])
+        self.assertEqual(('--paginate', '--slurp'), calls[0][-2:])
+        with self.assertRaises(OSError):
+            q.resolve_spec('label:work', 'o/r', lambda *a: (_ for _ in ()).throw(OSError('API unavailable')))
+
+    def test_terminal_cli_fallback_preserves_creation_and_pin_arguments(self):
+        args = q.agw._cli_args(dict(cmd='session.new', args={'name': '#queue o/r', 'command': "& 'python' 'a b'", 'no-select': True}))
+        self.assertEqual(['session', 'new', '--name', '#queue o/r', '--command', "& 'python' 'a b'", '--no-select'], args)
+        self.assertEqual(['session', 'restore', 'command', '--target', 'pane'],
+                         q.agw._cli_args(dict(cmd='session.restore', target='pane', args={'command': 'command'})))

@@ -96,6 +96,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_loop_state(args: argparse.Namespace) -> int:
+    # Reports stay in this checkout; the conductor alone owns the global queue.
+    from conductor import write_loop_state
+    try:
+        write_loop_state(checkout(), args.state, args.pr, args.reason)
+        return 0
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        print(f'wb: loop-state: {err}', file=sys.stderr)
+        return 2
+
+
 def now() -> float:
     return time.monotonic()
 
@@ -151,6 +162,11 @@ def main() -> int:
                 pass
     parser = argparse.ArgumentParser(prog="wb")
     subs = parser.add_subparsers(dest="command", required=True)
+    p = subs.add_parser('loop-state', help='report a queue member phase without terminal access')
+    p.add_argument('state', choices=['pr-open', 'blocked', 'resumed'])
+    p.add_argument('--pr')
+    p.add_argument('--reason')
+    p.set_defaults(func=cmd_loop_state)
     p = subs.add_parser("revmux", help="run a revmux round in its own visible session")
     p.add_argument("--round", type=int, required=True)
     p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
