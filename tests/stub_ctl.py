@@ -33,13 +33,7 @@ for response in scenario.get("responses", []):
 
 tree = scenario.setdefault("tree", {"workspaces": []})
 sessions = [s for w in tree["workspaces"] for s in w["sessions"]]
-if args == ['config', 'get', 'restore-commands', '--json']:
-    finish(json.dumps({'ok': True, 'result': scenario.get('restore_enabled', 'true')}))
-elif args == ['config', 'set', 'restore-commands', 'true']:
-    if not scenario.get('ignore_restore_set'):
-        scenario['restore_enabled'] = 'true'
-    finish('restore-commands = true  (applies to new sessions)')
-elif args[:2] == ['session', 'restore']:
+if args[:2] == ['session', 'restore']:
     pane = option('--target')
     session = next(s for s in sessions if pane in s.get('paneIds', [s['id']]))
     session.setdefault('restoreCommands', {})[pane] = args[2]

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -451,13 +453,14 @@ class LauncherFixtures(unittest.TestCase):
     def flow(self, shell=PWSH, no_relay=False, timeout=40):
         script = (self.setup_ps() + "Connect-LaunchLog " + ps_quote(self.log_path) + "; "
                   "$codexLine = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
-                  "; Issue='o/repo#7'}; $claudeLine = Get-PaneLaunch 'pane-claude.ps1' @{Checkout=" +
+                  "; Issue='o/repo#7'}; $codexRestore = Get-PaneLaunch 'pane-codex.ps1' @{Checkout=" + ps_quote(self.checkout) +
+                  "; Issue='o/repo#7'} -Switches @('Resume'); $claudeLine = Get-PaneLaunch 'pane-claude.ps1' @{Checkout=" +
                   ps_quote(self.checkout) + "; Issue='o/repo#7'}; $builder = { param($Hub,$Left,$Right) "
                   "'python ' + (Quote 'relay.py') + ' --hub ' + (Quote $Hub) + "
                   "' --claude-pane ' + (Quote $Left) + ' --codex-pane ' + (Quote $Right) }; "
                   "$ok = Invoke-LaunchSafely { Start-WorkbenchSession -Checkout " + ps_quote(self.checkout) +
                   " -Number 7 -Slug 'fix-x' -RepoName 'repo' -ClaudeLaunch $claudeLine "
-                  "-CodexLaunch $codexLine -RelayCommand $builder " + ("-NoRelay " if no_relay else "") +
+                  "-CodexLaunch $codexLine -CodexRestore $codexRestore -RelayCommand $builder " + ("-NoRelay " if no_relay else "") +
                   "}; if (-not $ok) {exit 1}; $script:Launch | ConvertTo-Json -Compress")
         return subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
                               env=self.env, cwd=ROOT, capture_output=True, text=True,
@@ -602,7 +605,7 @@ class LauncherFlow(LauncherFixtures):
         self.assertIn("pane-codex.ps1'", launch["CodexLaunch"])
         self.assertFalse(any(c[:2] == ["session", "text"] and c[-1] == MAIN_ID for c in self.calls()))
         commands = [c[:2] for c in self.calls()]
-        self.assertEqual([["tree", "--json"], ["config", "get"], ["session", "new"],
+        self.assertEqual([["tree", "--json"], ["session", "new"],
                           ["session", "restore"], ["tree", "--json"],
                           ["session", "split"], ["session", "restore"], ["tree", "--json"], ["session", "text"],
                           ["session", "type"], ["session", "new"], ["session", "restore"], ["session", "select"],
@@ -848,6 +851,48 @@ class LauncherFlow(LauncherFixtures):
 
 
 class RestartPanes(LauncherFixtures):
+    def test_transcript_and_rollout_readers_share_and_release_files(self):
+        self.transcript()
+        transcript = Path(self.env['CLAUDE_CONFIG_DIR']) / 'projects/project' / (OTHER_ID + '.jsonl')
+        rollout = self.rollout('23', MAIN_ID, '2026-09-23T00:00:00Z')
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                command = ("$ErrorActionPreference='Stop'; . ./lib/Workbench.ps1; "
+                           '$paths=@(' + ps_quote(transcript) + ',' + ps_quote(rollout) + '); '
+                           "$writers=@($paths | ForEach-Object { [IO.File]::Open($_,'Open','ReadWrite','ReadWrite') }); "
+                           'try { $claude=Get-ClaudeTranscript ' + ps_quote(OTHER_ID) + '; '
+                           '$codex=Find-CodexSession ' + ps_quote(self.checkout) + '; '
+                           '@($claude.Cwd,$codex) | ConvertTo-Json -Compress '
+                           '} finally { $writers | ForEach-Object { $_.Dispose() } }; '
+                           "$paths | ForEach-Object { $writer=[IO.File]::Open($_,'Open','ReadWrite','None'); $writer.Dispose() }")
+                result = subprocess.run([shell, '-NoProfile', '-Command', command], env=self.env, cwd=ROOT,
+                                        capture_output=True, text=True, timeout=20)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual([str(self.checkout), MAIN_ID], json.loads(result.stdout))
+
+    def test_transcript_search_checks_all_copies_and_refuses_conflicting_cwds(self):
+        projects = Path(self.env['CLAUDE_CONFIG_DIR']) / 'projects'
+        paths = []
+        for name, content in [('a', '{}'), ('b', json.dumps({'cwd': str(self.checkout)}))]:
+            path = projects / name / (OTHER_ID + '.jsonl')
+            path.parent.mkdir(parents=True)
+            path.write_text(content, encoding='utf-8')
+            paths.append(path)
+        result = ps('. ./lib/Workbench.ps1; Get-ClaudeTranscript ' + ps_quote(OTHER_ID) +
+                    ' | ConvertTo-Json -Compress', env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(str(self.checkout), json.loads(result.stdout)['Cwd'])
+        paths[0].write_text(json.dumps({'cwd': str(self.temp)}), encoding='utf-8')
+        command = ("$ErrorActionPreference='Stop'; . ./lib/Workbench.ps1; try { Get-ClaudeTranscript " +
+                   ps_quote(OTHER_ID) + " } catch { $_.Exception.Message }; " +
+                   '@(' + ','.join(ps_quote(p) for p in paths) + ') | ForEach-Object { '
+                   "$writer=[IO.File]::Open($_,'Open','ReadWrite','None'); $writer.Dispose() }")
+        result = ps(command, env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('transcripts disagree on cwd', result.stdout)
+        for path in paths:
+            self.assertIn(str(path), result.stdout)
+
     def identity(self, **changes):
         record = dict(pane=MAIN_ID, sessionId=OTHER_ID, cwd=str(self.checkout), origin='fresh',
                       reservedAt='2026-09-23T00:00:00Z', issue='o/repo#7', checkout=str(self.checkout))
@@ -928,14 +973,21 @@ class RestartPanes(LauncherFixtures):
                 self.assertEqual(str(ROOT), capture['Root'])
                 if role == 'claude':
                     self.assertEqual(str(original), capture['Cwd'])
-                    self.assertEqual(['--resume', OTHER_ID], capture['Args'])
+                    self.assertEqual(['--resume', OTHER_ID], capture['Args'][:2])
+                    self.assertEqual(3, len(capture['Args']))
+                    self.assertIn('resumed after an agwinterm restart', capture['Args'][2])
+                    self.assertIn('one background wb.py wait-mail waiter', capture['Args'][2])
+                    self.assertIn('continue the phase you were in', capture['Args'][2])
                 else:
                     args = capture['Args']
                     self.assertEqual(str(self.checkout), capture['Cwd'])
                     self.assertEqual(MAIN_ID, args[args.index('resume') + 1])
                     self.assertEqual('workspace-write', args[args.index('--sandbox') + 1])
                     self.assertEqual('never', args[args.index('--ask-for-approval') + 1])
-                    self.assertIn('resumed after a restart', args[-1])
+                    self.assertIn('resumed after an agwinterm restart', args[-1])
+                    self.assertIn('implementing or fixing, continue that step and report', args[-1])
+                    self.assertIn('Otherwise run python', args[-1])
+                    self.assertNotIn('Do not edit anything now', args[-1])
 
     def test_what_if_preserves_environment_cwd_and_record(self):
         path = self.identity(cwd=str(self.temp / 'missing original directory'))
@@ -976,7 +1028,7 @@ class RestartPanes(LauncherFixtures):
                 self.assertEqual(0, result.returncode, result.stdout + result.stderr)
                 self.assertIn('resume ' + MAIN_ID, result.stdout)
                 self.assertIn('--sandbox workspace-write --ask-for-approval never', result.stdout)
-                self.assertIn('resumed after a restart', result.stdout)
+                self.assertIn('resumed after an agwinterm restart', result.stdout)
                 self.assertIn('agmsg.py" list', result.stdout)
                 self.assertNotIn('resume ' + OTHER_ID, result.stdout)
 
@@ -1009,7 +1061,7 @@ class RestartPanes(LauncherFixtures):
                            '$l = & $real $Script $Arguments -Switches $Switches; '
                            "$l.Prefix = @('-NoProfile') + $l.Prefix; $l.Exe = " + ps_quote(Path(shell).name) + '; $l }; '
                            '$script:Lib = ' + ps_quote(self.temp) + '; $line = Get-PaneLaunch ' + ps_quote(stub.name) +
-                           ' -Parameters @{Checkout=' + ps_quote(self.temp / "it's a checkout") +
+                           ' -Arguments @{Checkout=' + ps_quote(self.temp / "it's a checkout") +
                            ";Issue='o/repo#7'} -Switches @('Resume'); & ([scriptblock]::Create($line))")
                 result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
                                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=20)
@@ -1018,6 +1070,113 @@ class RestartPanes(LauncherFixtures):
 
 
 class RestoreFlow(LauncherFixtures):
+    def legacy_transcript(self, session_id, mtime, **changes):
+        metadata = dict(entrypoint='cli', cwd=str(self.checkout))
+        metadata.update(changes)
+        encoded = re.sub('[^a-zA-Z0-9]', '-', str(self.checkout))
+        path = Path(self.env['CLAUDE_CONFIG_DIR']) / 'projects' / encoded / (session_id + '.jsonl')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{}\n' + json.dumps(metadata) + '\n', encoding='utf-8')
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_running_legacy_claude_recovers_newest_interactive_identity(self):
+        self.resumed(relay=False)
+        self.scenario['text'][MAIN_ID] = 'Claude is working'
+        self.save_scenario()
+        self.legacy_transcript(MAIN_ID, 1000)
+        selected = self.legacy_transcript(OTHER_ID, 2000)
+        self.legacy_transcript(RIGHT_ID, 3000, entrypoint='sdk')
+        self.legacy_transcript(RELAY_ID, 4000, cwd=str(self.temp))
+        result = self.flow(no_relay=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(OTHER_ID, self.record()['sessionId'])
+        self.assertEqual('recovered', self.record()['origin'])
+        self.assertEqual(MAIN_ID, self.record()['pane'])
+        self.assertIn(MAIN_ID, self.pins())
+        self.assertFalse(any(c[:2] == ['session', 'type'] and c[-1] == MAIN_ID for c in self.calls()))
+        # Recovery also disposes its reader before returning to the same process.
+        check = ps("$ErrorActionPreference='Stop'; . ./lib/Workbench.ps1; $null=Find-LegacyClaudeIdentity " +
+                   ps_quote(self.checkout) + '; $stream=[IO.File]::Open(' + ps_quote(selected) +
+                   ",'Open','ReadWrite','None'); $stream.Dispose()", env=self.env)
+        self.assertEqual(0, check.returncode, check.stdout + check.stderr)
+
+    def test_unknown_legacy_claude_is_not_assigned_an_unstarted_identity(self):
+        self.resumed(relay=False)
+        self.scenario['text'][MAIN_ID] = 'unknown pane content'
+        self.save_scenario()
+        result = self.flow(no_relay=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse((self.checkout / '.workbench/state/claude.json').exists())
+        self.assertEqual({RIGHT_ID}, set(self.pins()))
+        self.assertIn('leaving it unpinned', result.stdout)
+        self.assertIn("github-workbench 'o/repo#7'", result.stdout)
+        self.assertNotIn('start Claude there yourself', result.stdout)
+        self.assertFalse(any(c[:2] == ['session', 'type'] and c[-1] == MAIN_ID for c in self.calls()))
+
+    def test_tied_legacy_transcripts_leave_claude_unpinned(self):
+        self.resumed(relay=False)
+        self.scenario['text'][MAIN_ID] = 'Claude is working'
+        self.save_scenario()
+        self.legacy_transcript(MAIN_ID, 2000)
+        self.legacy_transcript(OTHER_ID, 2000)
+        result = self.flow(no_relay=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse((self.checkout / '.workbench/state/claude.json').exists())
+        self.assertNotIn(MAIN_ID, self.pins())
+
+    def test_existing_codex_shell_uses_resume_but_new_split_uses_fresh(self):
+        first = self.flow(no_relay=True)
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.scenario = json.loads(self.scenario_path.read_text(encoding='utf-8'))
+        self.scenario['text'][RIGHT_ID] = 'PS C:\\checkout> '
+        self.save_scenario()
+        second = self.flow(no_relay=True)
+        self.assertEqual(0, second.returncode, second.stdout + second.stderr)
+        typed = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID]
+        self.assertEqual(2, len(typed))
+        self.assertNotIn('-Resume', typed[0])
+        self.assertEqual(self.pins()[RIGHT_ID] + '\n', typed[1])
+        self.assertIn('-Resume', typed[1])
+
+    def test_failure_after_pin_preserves_callers_stage(self):
+        self.resumed(relay=False)
+        result = ps(self.setup_ps() + "$ok=Invoke-LaunchSafely { Set-LaunchStage known-pane; "
+                    'Set-PaneRestore ' + ps_quote(MAIN_ID) + " 'test command'; throw 'after pin' }; "
+                    'if (-not $ok) { exit 1 }', env=self.env)
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("stage 'known-pane'", result.stdout)
+        self.assertNotIn('Repair restart configuration', result.stdout)
+
+    def test_checkout_lock_blocks_overlapping_launch_and_releases_after_failure(self):
+        marker = self.temp / 'lock-held'
+        release = self.temp / 'release-lock'
+        command = (self.setup_ps() + 'Invoke-WithCheckoutLock ' + ps_quote(self.checkout) + ' { '
+                   'Set-Content -LiteralPath ' + ps_quote(marker) + " -Value 'held'; "
+                   '$deadline=(Get-Date).AddSeconds(20); while (-not (Test-Path -LiteralPath ' + ps_quote(release) +
+                   ") -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }; throw 'injected failure' }")
+        holder = subprocess.Popen([PWSH, '-NoProfile', '-Command', command], env=self.env, cwd=ROOT,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not marker.exists() and holder.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), 'lock holder failed to start')
+            blocked = self.flow(no_relay=True)
+            self.assertEqual(1, blocked.returncode, blocked.stdout + blocked.stderr)
+            self.assertIn('Cannot acquire checkout launch lock', blocked.stdout)
+            self.assertFalse((self.checkout / '.workbench/state/claude.json').exists())
+            self.assertEqual([], self.calls())
+        finally:
+            release.touch()
+            stdout, stderr = holder.communicate(timeout=10)
+        self.assertNotEqual(0, holder.returncode, stdout + stderr)
+        self.assertIn('injected failure', stderr)
+        retry = self.flow(no_relay=True)
+        self.assertEqual(0, retry.returncode, retry.stdout + retry.stderr)
+        self.assertEqual(MAIN_ID, self.record()['pane'])
+        self.assertEqual([], list((self.checkout / '.workbench/state').glob('*.tmp')))
+
     def record(self):
         return json.loads((self.checkout / '.workbench/state/claude.json').read_text(encoding='utf-8-sig'))
 
@@ -1071,30 +1230,11 @@ class RestoreFlow(LauncherFixtures):
         self.assertIn("stage 'mailbox'", result.stdout)
         self.assertEqual({MAIN_ID, RIGHT_ID}, set(self.pins()))
 
-    def test_replay_is_enabled_and_confirmed(self):
-        self.scenario['restore_enabled'] = 'false'
-        self.save_scenario()
+    def test_pins_do_not_read_or_change_global_configuration(self):
         result = self.flow(no_relay=True)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn('enabled agwinterm restore-commands', result.stdout)
-        self.assertEqual(2, sum(c == ['config', 'get', 'restore-commands', '--json'] for c in self.calls()))
-        self.assertEqual(1, sum(c == ['config', 'set', 'restore-commands', 'true'] for c in self.calls()))
-
-    def test_replay_read_set_and_confirmation_failures_refuse_launch(self):
-        cases = [{'restore_enabled': ''}, {'responses': [{'args': '^config get', 'exit': 1}]},
-                 {'restore_enabled': 'false', 'responses': [{'args': '^config set', 'exit': 1}]},
-                 {'restore_enabled': 'false', 'ignore_restore_set': True}]
-        for case in cases:
-            with self.subTest(case=case):
-                self.scenario.pop('responses', None)
-                self.scenario.pop('ignore_restore_set', None)
-                self.scenario['restore_enabled'] = 'true'
-                self.scenario.update(case)
-                self.save_scenario()
-                result = self.flow()
-                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
-                self.assertIn('agwintermctl config set restore-commands true', result.stdout)
-                self.assertFalse(any(c[:2] == ['session', 'new'] for c in self.calls()))
+        self.assertEqual({MAIN_ID, RIGHT_ID}, set(self.pins()))
+        self.assertFalse(any(c[0] == 'config' for c in self.calls()))
 
     def test_pin_failure_has_exact_repair_command_and_bound_identity(self):
         self.scenario['responses'] = [{'args': '^session restore', 'exit': 1, 'stdout': 'pin failed'}]
@@ -1247,6 +1387,8 @@ class AdoptionEntry(LauncherFixtures):
         self.assertEqual(0, second.returncode, second.stdout + second.stderr)
         self.assertEqual([RIGHT_ID], self.current()['successful_types'])
         self.assertEqual(1, sum(c[:3] == ['session', 'split', 'on'] for c in self.calls()))
+        for pane in [MAIN_ID, RIGHT_ID, RELAY_ID]:
+            self.assertEqual(2, sum(c[:2] == ['session', 'restore'] and c[-1] == pane for c in self.calls()))
         self.assert_caller_untouched()
 
     def test_shell_starts_claude_after_setup_with_stdout_intact(self):

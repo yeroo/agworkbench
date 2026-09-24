@@ -23,7 +23,14 @@ foreach ($argument in $claudeArgs) {
     }
 }
 $transcript = Get-ClaudeTranscript $identity.sessionId
-if ($transcript) { $modeArgs = @('--resume', $identity.sessionId) }
+if ($transcript) {
+    $resumePrompt = @"
+You were resumed after an agwinterm restart in the Claude pane for $Issue.
+Start one background wb.py wait-mail waiter, following The channel rule. Read any unread workbench
+mail and continue the phase you were in.
+"@
+    $modeArgs = @('--resume', $identity.sessionId, $resumePrompt)
+}
 else { $modeArgs = @('--session-id', $identity.sessionId, "/start-github-issue $Issue") }
 if ($WhatIfOnly) {
     Write-Host "would cd: $($identity.cwd)"

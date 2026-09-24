@@ -91,9 +91,10 @@ if ($Resume) {
     if ($sessionId) {
         $resumeArgs = @('resume', $sessionId)
         $prompt = @"
-You were resumed after a restart. You are still CODEX, the IMPLEMENTER, in the RIGHT pane for $Issue.
-Use the workbench-implementer skill. Do not edit anything now. Run python "$script:Lib\agmsg.py" list
-to read unread workbench mail, then wait for the next "Chat from Workbench:" line from the relay.
+You were resumed after an agwinterm restart. You are still CODEX, the IMPLEMENTER, in the RIGHT pane for $Issue.
+Use the workbench-implementer skill. If you were implementing or fixing, continue that step and report
+as usual. Otherwise run python "$script:Lib\agmsg.py" list to read unread workbench mail, then wait
+for the next "Chat from Workbench:" line from the relay.
 "@
     }
 }

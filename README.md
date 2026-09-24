@@ -81,8 +81,8 @@ checkout's registered Claude pane to locate the session; the fallback matches th
 workspace name and issue number/title. That fallback cannot distinguish owners with identical
 repository names. Ambiguous matches are reported with their session IDs rather than chosen.
 
-The launcher pins restart commands for Claude, Codex and the relay, and confirms that agwinterm's
-`restore-commands` setting is enabled. A failed setting or pin stops setup with repair instructions.
+The launcher pins restart commands for Claude, Codex and the relay. Pinned commands always replay
+on restart. A failed pin stops setup with repair instructions.
 Review helpers are not pinned. Restarting agwinterm with its session tree intact replays these
 commands; running the launcher again refreshes the pins and leaves non-shell panes untouched.
 
@@ -93,10 +93,16 @@ conversation when its transcript exists, or starts the reserved conversation oth
 replacement Claude pane gets a new reservation and the old record is archived. When adopting a
 running Claude, its `CLAUDE_CODE_SESSION_ID` and transcript must be available; a missing identity
 is refused before adoption. `claudeArgs` cannot override conversation identity or launch mode.
+For older workbenches without a saved identity, the launcher recovers the newest unambiguous CLI
+transcript for the checkout. If it cannot identify a running Claude conversation, it leaves that
+pane unpinned and prints a manual repair command. A per-checkout lock prevents overlapping launches
+from reserving different identities for the same pane.
 
 Codex's restart command uses `-Resume` to select the newest interactive rollout for the checkout
 by its metadata timestamp, ignoring review/exec rollouts and other directories. It reapplies the
 same sandbox, approval and environment policy. If no matching rollout exists, it starts fresh.
+Resumed Codex continues interrupted implementation or fixes; otherwise it checks mail and waits.
+Resumed Claude starts its background mail waiter and continues its interrupted phase.
 Both pane scripts support `-WhatIfOnly` to inspect the command without starting an agent or
 changing the workbench state. Claude transcripts use `CLAUDE_CONFIG_DIR` when set (otherwise
 `~/.claude`); Codex rollouts use `CODEX_HOME` when set (otherwise `~/.codex`).
