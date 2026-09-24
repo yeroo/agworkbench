@@ -1339,6 +1339,14 @@ class QueueEntry(LauncherFixtures):
         with self.store.transaction() as data:
             data['members'][0].update(state='launching', token=self.token, result=None)
 
+    def test_member_auto_merge_switch_reaches_its_checkout(self):
+        # #23: the conductor passes a queue's saved choice as -AutoMerge / -NoAutoMerge.
+        result = self.entry('-AutoMerge')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        checkout = Path(self.store.load()['members'][0]['checkout'])
+        record = json.loads((checkout / '.workbench/state/implementer.json').read_text(encoding='utf-8-sig'))
+        self.assertIs(True, record['autoMerge'])
+
     def test_fresh_and_resume_preserve_focus_and_publish_result(self):
         first = self.entry()
         self.assertEqual(0, first.returncode, first.stdout + first.stderr)
@@ -2182,7 +2190,7 @@ class ClaudeImplementer(LauncherFixtures):
     def pins(self):
         return {c[-1]: c[2] for c in self.calls() if c[:2] == ['session', 'restore']}
 
-    def body(self, implementer=None, config=None):
+    def body(self, implementer=None, config=None, extra=''):
         if config is not None:
             self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding='utf-8')
         switch = f" -Implementer {implementer}" if implementer else ''
@@ -2191,7 +2199,7 @@ class ClaudeImplementer(LauncherFixtures):
                   "function New-IssueCheckout { Connect-LaunchLog " + ps_quote(self.log_path) +
                   "; return @{Dir=" + ps_quote(self.checkout) + "; Branch='issue-7-fix-x'} }; "
                   "function Grant-CodexTrust {}; function Grant-ClaudeTrust {}; "
-                  "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' -NewSession" + switch + " }; "
+                  "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' -NewSession" + switch + extra + " }; "
                   "if (-not $ok) { Write-Output \"EXIT=$($script:Launch.ExitCode)\"; exit 1 }", env=self.env)
 
     def relay_line(self):
@@ -2216,7 +2224,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
         self.assertIn("pane-codex.ps1'", self.typed_right()[0])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False}, self.state('implementer.json'))
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
 
     def test_claude_composes_right_pane_relay_mailbox_identity_and_pin(self):
@@ -2230,7 +2238,7 @@ class ClaudeImplementer(LauncherFixtures):
         agents = self.state('agents.json')['agents']
         self.assertEqual(('claude', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
         self.assertEqual('claude', agents['claude']['tool'])
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False}, self.state('implementer.json'))
         implementer = self.state('implementer-claude.json')
         planner = self.state('claude.json')
         self.assertEqual((RIGHT_ID, 'fresh', 'o/repo#7'), (implementer['pane'], implementer['origin'], implementer['issue']))
@@ -2245,7 +2253,7 @@ class ClaudeImplementer(LauncherFixtures):
     def test_config_selects_claude_and_revmux_profile_is_configurable(self):
         result = self.body(config={'implementer': 'claude', 'revmuxProfile': 'codex-final'})
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False}, self.state('implementer.json'))
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
 
     def test_invalid_config_and_switch_values_are_refused(self):
@@ -2306,7 +2314,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertIn('-Resume', self.typed_right()[-1])
         self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive'}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False}, self.state('implementer.json'))
         # B2: the relay was asked to stop and was restarted without the Claude profile.
         self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
         relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
@@ -2520,6 +2528,90 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertIn('claude\\commands\\*.md', (ROOT / 'install.ps1').read_text(encoding='utf-8'))
         planner = (ROOT / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
         self.assertIn("Never commit the implementer's uncommitted work yourself", planner)
+
+
+class AutoMergeLaunch(LauncherFixtures):
+    """#23: auto-merge is stored in the checkout's settings record; it is policy, not a process."""
+    body = ClaudeImplementer.body
+    state = ClaudeImplementer.state
+    relay_line = ClaudeImplementer.relay_line
+    typed_right = ClaudeImplementer.typed_right
+    reuse_scenario = ClaudeImplementer.reuse_scenario
+
+    def test_default_is_off_and_launch_strings_are_unchanged(self):
+        result = self.body()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIs(False, self.state('implementer.json')['autoMerge'])
+        self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
+        self.assertNotIn('AutoMerge', self.relay_line() + self.typed_right()[0])
+        self.assertIn('auto-merge off', result.stdout)
+
+    def test_switch_turns_it_on_and_a_rerun_without_it_keeps_it(self):
+        on = self.body(extra=' -AutoMerge $true')
+        self.assertEqual(0, on.returncode, on.stdout + on.stderr)
+        self.assertIs(True, self.state('implementer.json')['autoMerge'])
+        self.assertIn('auto-merge on', on.stdout)
+        self.reuse_scenario('esc to interrupt')
+        again = self.body()
+        self.assertEqual(0, again.returncode, again.stdout + again.stderr)
+        self.assertIs(True, self.state('implementer.json')['autoMerge'])
+
+    def test_off_applies_even_while_the_implementer_is_running(self):
+        self.assertEqual(0, self.body(extra=' -AutoMerge $true').returncode)
+        self.reuse_scenario('esc to interrupt')      # a live agent does not block a policy change
+        off = self.body(extra=' -AutoMerge $false')
+        self.assertEqual(0, off.returncode, off.stdout + off.stderr)
+        self.assertIs(False, self.state('implementer.json')['autoMerge'])
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_config_default_applies_to_new_checkouts_only(self):
+        on = self.body(config={'autoMerge': True})
+        self.assertEqual(0, on.returncode, on.stdout + on.stderr)
+        self.assertIs(True, self.state('implementer.json')['autoMerge'])
+        self.reuse_scenario('esc to interrupt')
+        kept = self.body(config={'autoMerge': False})
+        self.assertEqual(0, kept.returncode, kept.stdout + kept.stderr)
+        self.assertIs(True, self.state('implementer.json')['autoMerge'])
+
+    def test_a_pre_23_record_reads_as_the_config_default(self):
+        state = self.checkout / '.workbench/state'
+        state.mkdir(parents=True)
+        (state / 'implementer.json').write_text('{"tool": "codex", "revmuxProfile": "comprehensive"}', encoding='utf-8')
+        result = ps(". ./lib/Workbench.ps1; $r = Resolve-Implementer -Checkout " + ps_quote(self.checkout) +
+                    " -Config (Get-WorkbenchConfig) -NoProbe; $r.AutoMerge", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('False', result.stdout.strip())
+
+    def test_non_boolean_config_is_refused(self):
+        for value in ('true', 1, None):
+            with self.subTest(value=value):
+                self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), 'autoMerge': value}),
+                                            encoding='utf-8')
+                result = ps('. ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null; "loaded"', env=self.env)
+                if value is None:     # null is "not set": the default applies
+                    self.assertIn('loaded', result.stdout, result.stderr)
+                else:
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn('autoMerge', result.stderr + result.stdout)
+
+    def entry(self, *args):
+        return subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7', *args],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=20)
+
+    def test_entry_refuses_both_switches(self):
+        result = self.entry('-AutoMerge', '-NoAutoMerge')
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn('-AutoMerge and -NoAutoMerge cannot be combined', result.stdout)
+        self.assertFalse(self.calls())
+
+    def test_dry_run_prints_auto_merge_and_writes_nothing(self):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        result = self.entry('-NewSession', '-DryRun', '-AutoMerge')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('auto-merge on', result.stdout)
+        self.assertFalse((self.checkout / '.workbench').exists())
+        self.assertFalse(self.calls())
 
 
 if __name__ == "__main__":

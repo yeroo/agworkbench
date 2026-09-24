@@ -5,6 +5,8 @@
   wb.py human-review --base origin/main                          # revdiff, selected, for the human
   wb.py status blocked --sound                                    # this pane's sidebar status
   wb.py wait-mail                                                 # background inbox waiter
+  wb.py settings                                                  # implementer, revmux profile, auto-merge
+  wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
 
 Why a helper: Claude's shell is Git Bash, where $PWD is a POSIX path (/c/Users/...) that PowerShell
 cannot use, and quoting a PowerShell command inside a bash string inside an agwintermctl argument
@@ -119,6 +121,167 @@ def cmd_loop_state(args: argparse.Namespace) -> int:
         return 2
 
 
+def checkout_settings(root: Path) -> dict:
+    """The checkout's settings record (state/implementer.json, #20 and #23). Missing keys read as
+    their defaults: a record written before #23 has no autoMerge, and that is off."""
+    try:
+        saved = json.loads((root / ".workbench" / "state" / "implementer.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    tool = saved.get("tool") if saved.get("tool") in ("codex", "claude") else "codex"
+    return {"implementer": tool, "revmuxProfile": revmux_profile(root), "autoMerge": saved.get("autoMerge") is True}
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    settings = checkout_settings(checkout())
+    print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
+          f"autoMerge={'true' if settings['autoMerge'] else 'false'}")
+    return 0
+
+
+# --- merge-check (#23) -----------------------------------------------------------------------
+# Read-only. Every condition is a pure function over what one `gh pr view` (plus the PR's inline
+# comments) returned, so each is tested without a network. The planner merges only on "ok".
+
+PLANNER_MARKER = "<!-- agworkbench:planner -->"
+HOLD_RE = re.compile(r"\b(hold|wait|do not merge|don't merge|dont merge)\b", re.IGNORECASE)
+LIFT_RE = re.compile(r"\b(unhold|resume|go ahead)\b", re.IGNORECASE)
+PR_FIELDS = "number,url,state,mergeable,mergeStateStatus,reviewDecision,headRefOid,reviews,comments"
+
+
+def _login(item: dict) -> str:
+    return ((item.get("author") or item.get("user") or {}).get("login")) or "?"
+
+
+def _when(item: dict) -> str:
+    # ISO-8601 UTC strings from GitHub sort correctly as text.
+    return item.get("submittedAt") or item.get("createdAt") or item.get("created_at") or ""
+
+
+def check_state(pr: dict) -> list[str]:
+    failures = []
+    if pr.get("state") != "OPEN":
+        failures.append(f"state: PR is {pr.get('state')}, not OPEN")
+    mergeable = pr.get("mergeable")
+    if mergeable != "MERGEABLE":
+        retry = " (retry in ~30s)" if mergeable == "UNKNOWN" else ""
+        failures.append(f"mergeable: GitHub says {mergeable}{retry}")
+    status = pr.get("mergeStateStatus")
+    if status != "CLEAN":
+        retry = " (retry in ~30s)" if status == "UNKNOWN" else ""
+        failures.append(f"mergeable: merge state is {status}, not CLEAN{retry}")
+    return failures
+
+
+def check_reviews(pr: dict) -> list[str]:
+    failures = []
+    if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+        failures.append("review: the review decision is CHANGES_REQUESTED")
+    latest: dict[str, dict] = {}
+    for review in sorted(pr.get("reviews") or [], key=_when):
+        if PLANNER_MARKER in (review.get("body") or ""):
+            continue
+        if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[_login(review)] = review
+    for who, review in sorted(latest.items()):
+        if review.get("state") == "CHANGES_REQUESTED":
+            failures.append(f"review: {who} requested changes ({_when(review)})")
+    return failures
+
+
+def check_holds(pr: dict, inline: list[dict]) -> list[str]:
+    """A hold word in any body the planner did not mark holds the PR, at any age. Only a later
+    unmarked lift word releases it; a body with both is a hold (fail safe)."""
+    bodies = []
+    for item in list(pr.get("comments") or []) + list(pr.get("reviews") or []) + list(inline or []):
+        body = item.get("body") or ""
+        if body and PLANNER_MARKER not in body:
+            bodies.append((_when(item), _login(item), body))
+    holding = None
+    for when, who, body in sorted(bodies, key=lambda entry: entry[0]):
+        if HOLD_RE.search(body):
+            holding = (when, who, body)
+        elif LIFT_RE.search(body):
+            holding = None
+    if holding is None:
+        return []
+    when, who, body = holding
+    excerpt = " ".join(body.split())[:80]
+    return [f"hold: {who} at {when}: \"{excerpt}\" (lift with a later comment: go ahead / resume / unhold)"]
+
+
+def check_mail(box: str = "claude") -> list[str]:
+    failures = []
+    hub.reload_paths()   # AI_HUB names this checkout's mailbox
+    for path in hub.unread(box):
+        try:
+            message = hub.parse_message(path)
+        except (OSError, ValueError):
+            continue
+        if message.get("from") in ("human", "github"):
+            failures.append(f"mail: unread from {message.get('from')}: {message.get('subject', '')} "
+                            f"[{message.get('id', path.stem)}] - read and handle it first")
+    return failures
+
+
+def check_relay(root: Path, number: int) -> list[str]:
+    try:
+        state = json.loads((root / ".workbench" / "state" / "relay.json").read_text(encoding="utf-8-sig"))
+        seen = number in (state.get("seen_open") or [])
+    except (OSError, ValueError, AttributeError):
+        seen = False
+    return [] if seen else [f"relay: the relay has not recorded PR #{number} as seen open yet"]
+
+
+def check_head(pr: dict, head: str) -> list[str]:
+    actual = (pr.get("headRefOid") or "").lower()
+    if actual != head.lower():
+        return [f"head: the PR head is {actual or '?'}, not the tested {head}; run the suite on the new head"]
+    return []
+
+
+def merge_failures(pr: dict, inline: list[dict], head: str, root: Path) -> list[str]:
+    return (check_state(pr) + check_reviews(pr) + check_holds(pr, inline) + check_mail() +
+            check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head))
+
+
+def gh_json(*args: str):
+    done = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if done.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])} failed: {(done.stderr or done.stdout).strip()}")
+    return json.loads(done.stdout)
+
+
+def fetch_pr(pr_ref: str) -> tuple[dict, list[dict]]:
+    pr = gh_json("pr", "view", pr_ref, "--json", PR_FIELDS)
+    match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", pr.get("url") or "")
+    if not match:
+        raise RuntimeError(f"cannot tell the repository from PR url {pr.get('url')!r}")
+    pages = gh_json("api", f"repos/{match[1]}/pulls/{match[2]}/comments", "--paginate", "--slurp")
+    inline = [comment for page in pages for comment in page] if pages and isinstance(pages[0], list) else list(pages or [])
+    return pr, inline
+
+
+def cmd_merge_check(args: argparse.Namespace) -> int:
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", args.head or ""):
+        print("wb: merge-check --head needs the full 40-character SHA the suite ran on", file=sys.stderr)
+        return 2
+    root = checkout()
+    try:
+        pr, inline = fetch_pr(args.pr)
+    except (RuntimeError, ValueError, OSError) as err:
+        print(f"gh: {err}")
+        return 1
+    failures = merge_failures(pr, inline, args.head, root)
+    if failures:
+        print("\n".join(failures))
+        return 1
+    print("ok")
+    return 0
+
+
 def now() -> float:
     return time.monotonic()
 
@@ -184,6 +347,12 @@ def main() -> int:
     p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
     p.add_argument("--profile", help="revmux profile (default: the one the launcher saved for this checkout)")
     p.set_defaults(func=cmd_revmux)
+    p = subs.add_parser("settings", help="print this checkout's settings record (implementer, revmux profile, auto-merge)")
+    p.set_defaults(func=cmd_settings)
+    p = subs.add_parser("merge-check", help="read-only: exit 0 and print ok only when the PR may be auto-merged")
+    p.add_argument("--pr", required=True, help="PR number or URL")
+    p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")
+    p.set_defaults(func=cmd_merge_check)
     p = subs.add_parser("human-review", help="open revdiff for the human, selected")
     p.add_argument("--base", required=True, help="e.g. origin/main")
     p.set_defaults(func=cmd_human_review)

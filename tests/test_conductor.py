@@ -538,6 +538,38 @@ class QueueCase(unittest.TestCase):
             self.store.load()
 
 
+    # #23: -AutoMerge / -NoAutoMerge on a queue are saved (false included) and passed to members.
+    def test_default_queue_passes_no_auto_merge_switch(self):
+        self.start('o/r#1')
+        self.assertNotIn('autoMerge', self.store.load())
+        args = self.launched_args()
+        self.assertNotIn('-AutoMerge', args)
+        self.assertNotIn('-NoAutoMerge', args)
+
+    def test_auto_merge_on_and_off_are_saved_and_passed(self):
+        self.start('o/r#1', auto_merge=True)
+        self.assertIs(True, self.store.load()['autoMerge'])
+        self.assertIn('-AutoMerge', self.launched_args())
+        self.start('o/r#2')
+        self.assertIs(True, self.store.load()['autoMerge'])
+        self.start('o/r#3', auto_merge=False)
+        self.assertIs(False, self.store.load()['autoMerge'])
+        args = self.launched_args()
+        self.assertIn('-NoAutoMerge', args)
+        self.assertNotIn('-AutoMerge', args)
+
+    def test_invalid_saved_auto_merge_is_refused(self):
+        self.start('o/r#1')
+        data = json.loads(self.store.path.read_text())
+        data['autoMerge'] = 'yes'
+        self.store.path.write_text(json.dumps(data))
+        with self.assertRaises(q.StateError):
+            self.store.load()
+
+    def test_cli_auto_merge_flags_are_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            q.main(['start', '--spec', 'o/r#1', '--auto-merge', '--no-auto-merge'])
+
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
         self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('o/r#3,#4,3'))

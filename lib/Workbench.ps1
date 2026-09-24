@@ -101,14 +101,15 @@ function Get-WorkbenchConfig {
          allowNetwork   let Codex's sandbox reach the network (default false)
          implementer    who runs in the right pane: codex (default) or claude
          revmuxProfile  revmux profile for review rounds (default: comprehensive with codex,
-                        claude-only with claude) #>
+                        claude-only with claude)
+         autoMerge      let the planner merge its own PR when every condition holds (default false) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
-                 implementer = 'codex'; revmuxProfile = $null }
+                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -118,6 +119,7 @@ function Get-WorkbenchConfig {
     if ($null -ne $config.revmuxProfile -and ($config.revmuxProfile -isnot [string] -or $config.revmuxProfile -notmatch '^[A-Za-z0-9._-]+$')) {
         throw "revmuxProfile in '$path' must be a revmux profile name (got '$($config.revmuxProfile)')"
     }
+    if ($config.autoMerge -isnot [bool]) { throw "autoMerge in '$path' must be true or false (got '$($config.autoMerge)')" }
     return $config
 }
 
@@ -723,8 +725,10 @@ function Resolve-Implementer {
        run without -Implementer never swaps agents under a running loop. An explicit request that
        differs from the saved tool is honoured only when the right pane holds no agent: it is gone,
        or it is a proven shell. Otherwise it is refused before anything is changed.
-       Returns @{ Tool; RevmuxProfile; Conflict }, Conflict being a refusal message or $null. #>
-    param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe)
+       Auto-merge (#23) is policy, not a process: the saved value wins over the config default and an
+       explicit -AutoMerge / -NoAutoMerge ($RequestedAutoMerge true/false) changes it, with no pane check.
+       Returns @{ Tool; RevmuxProfile; AutoMerge; Conflict }, Conflict being a refusal message or $null. #>
+    param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex or claude (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
@@ -744,20 +748,42 @@ function Resolve-Implementer {
             $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
         } else { $tool = $Requested }
     } elseif ($Requested) { $tool = $Requested }
-    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); Conflict = $conflict }
+    $autoMerge = [bool]$Config.autoMerge
+    $savedAutoMerge = Get-SavedAutoMerge $Checkout
+    if ($null -ne $savedAutoMerge) { $autoMerge = $savedAutoMerge }
+    if ($null -ne $RequestedAutoMerge) { $autoMerge = [bool]$RequestedAutoMerge }
+    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); AutoMerge = $autoMerge;
+              Conflict = $conflict }
+}
+
+function Get-SavedAutoMerge([string] $Checkout) {
+    # A record from before #23 has no autoMerge key: that is "not decided", so the config default applies.
+    $path = Get-ImplementerStatePath $Checkout
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    if ($data.autoMerge -is [bool]) { return $data.autoMerge }
+    return $null
 }
 
 function Save-Implementer([string] $Checkout, $Resolved) {
+    # state\implementer.json is the checkout's settings record: the implementer tool (#20), its
+    # revmux profile, and auto-merge (#23). wb.py reads it for the planner.
     $path = Get-ImplementerStatePath $Checkout
-    $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile }
+    $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge }
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
-            if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile) { return }
+            if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile -and
+                $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
     }
     Write-AtomicJson $path $record
-    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile))"
+    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge)"
+}
+
+function Format-AutoMerge([bool] $Value) {
+    if ($Value) { return 'on' }
+    return 'off'
 }
 
 function Get-ImplementerName([string] $Tool) {
@@ -1438,7 +1464,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
-          [string] $Implementer)
+          [string] $Implementer, $AutoMerge = $null)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -1506,7 +1532,7 @@ function Invoke-LauncherBody {
                   Restore = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')) }
     }
     if ($DryRun) {
-        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
             Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$repoName'"
@@ -1516,7 +1542,7 @@ function Invoke-LauncherBody {
             Write-Step "would open session '#$($ref.Number) $slug' in workspace '$repoName'"
             Write-Step "left pane:  $claudeLaunch"
         }
-        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile))"
+        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
@@ -1534,7 +1560,7 @@ function Invoke-LauncherBody {
     Invoke-WithCheckoutLock $co.Dir {
         # Decided before any pin, identity or registry change, so a refused switch changes nothing.
         Set-LaunchStage implementer
-        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree)
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         Save-Implementer $co.Dir $resolved
         $script:Launch.ImplementerTool = $resolved.Tool

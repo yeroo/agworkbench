@@ -193,6 +193,8 @@ class Store:
                 raise ValueError('invalid settings')
             if data.get('implementer') not in (None, 'codex', 'claude'):
                 raise ValueError('invalid implementer')
+            if data.get('autoMerge') not in (None, True, False):
+                raise ValueError('invalid autoMerge')
             if (not isinstance(data['config'], str) or not Path(data['config']).is_absolute() or
                     type(data['yes']) is not bool or not isinstance(data['members'], list) or
                     (data['watch'] and (not isinstance(data['label'], str) or not data['label']))):
@@ -257,7 +259,7 @@ def pin_conductor(store, owner):
 
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
-                implementer=None):
+                implementer=None, auto_merge=None):
     repo, numbers, label = resolve_spec(spec, repo)
     if watch and not label:
         raise UsageError('-Watch requires a label spec')
@@ -290,6 +292,10 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         if implementer:
             # Applies to members launched from now on; a member's checkout keeps the tool it has.
             data['implementer'] = implementer
+        if auto_merge is not None:
+            # Saved explicitly, false included: an explicit off must reach members whose own
+            # checkout record says on.
+            data['autoMerge'] = auto_merge
         known = {m['number'] for m in data['members']}
         added = [n for n in numbers if n not in known]
         data['members'].extend(new_member(n, repo, checkout_root(data['config'])) for n in added)
@@ -471,6 +477,8 @@ class Worker:
             args.append('-Yes')
         if data.get('implementer'):
             args += ['-Implementer', data['implementer']]
+        if data.get('autoMerge') is not None:
+            args.append('-AutoMerge' if data['autoMerge'] else '-NoAutoMerge')
         try:
             process = subprocess.Popen(args, cwd=HERE.parent, env=env, stdout=stream, stderr=subprocess.STDOUT)
         except BaseException:
@@ -677,6 +685,9 @@ def main(argv=None):
     for flag in ('watch', 'retry', 'yes', 'dry-run'):
         start.add_argument('--' + flag, action='store_true')
     start.add_argument('--implementer', choices=('codex', 'claude'))
+    merge = start.add_mutually_exclusive_group()
+    merge.add_argument('--auto-merge', dest='auto_merge', action='store_const', const=True)
+    merge.add_argument('--no-auto-merge', dest='auto_merge', action='store_const', const=False)
     run = sub.add_parser('run')
     run.add_argument('--file', required=True)
     run.add_argument('--token', required=True)
@@ -703,7 +714,7 @@ def main(argv=None):
             if os.environ.get('AGWINTERM_ENABLED') != '1' or not os.environ.get('AGWINTERM_SESSION_ID'):
                 raise UsageError('queue mode requires running inside agwinterm')
             return start_queue(args.spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
-                               implementer=args.implementer)
+                               implementer=args.implementer, auto_merge=args.auto_merge)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'member-context':

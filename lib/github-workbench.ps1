@@ -24,6 +24,7 @@
   github-workbench 7 -DryRun              # print what would happen, touch nothing
   github-workbench -Version              # report the installed toolchain
   github-workbench 7 -Implementer claude  # Claude, not Codex, in the right pane (e.g. Codex out of quota)
+  github-workbench 7 -AutoMerge           # the planner merges its own PR when every condition holds
 .EXAMPLE
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
@@ -45,6 +46,8 @@ param(
     [int] $QueueAttempt,
     [string] $QueueToken,
     [string] $Implementer,
+    [switch] $AutoMerge,
+    [switch] $NoAutoMerge,
     [switch] $Version
 )
 
@@ -66,6 +69,15 @@ if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('c
     exit 2
 }
 
+if ($AutoMerge -and $NoAutoMerge) {
+    Write-Host '-AutoMerge and -NoAutoMerge cannot be combined.' -ForegroundColor Yellow
+    exit 2
+}
+# $null leaves the checkout's saved choice (or the config default) alone.
+$autoMergeChoice = $null
+if ($AutoMerge) { $autoMergeChoice = $true }
+if ($NoAutoMerge) { $autoMergeChoice = $false }
+
 if ($PSBoundParameters.ContainsKey('Queue')) {
     if (-not $Queue -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $QueueAttempt -or $QueueToken -or
         (-not (Test-InsideAgwinterm)) -or ($PSBoundParameters.ContainsKey('Parallel') -and ($Parallel -lt 1 -or $Parallel -gt 8))) {
@@ -80,6 +92,8 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($Yes) { $queueArgs += '--yes' }
     if ($DryRun) { $queueArgs += '--dry-run' }
     if ($Implementer) { $queueArgs += @('--implementer', $Implementer) }
+    if ($AutoMerge) { $queueArgs += '--auto-merge' }
+    if ($NoAutoMerge) { $queueArgs += '--no-auto-merge' }
     & python @queueArgs
     exit $LASTEXITCODE
 }
@@ -90,9 +104,9 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
 }
@@ -125,7 +139,7 @@ if ($QueueMember) {
         }
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
-            Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer
+            Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -149,7 +163,7 @@ if ($QueueMember) {
 if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
-        -Implementer $Implementer
+        -Implementer $Implementer -AutoMerge $autoMergeChoice
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef
