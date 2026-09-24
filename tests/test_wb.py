@@ -341,6 +341,44 @@ class WaitMail(unittest.TestCase):
         self.assertNotIn('NEW MAIL', output)
         self.assertTrue((path.parent / 'read' / path.name).is_file())
 
+class RevmuxProfile(unittest.TestCase):
+    """#20: the review round's profile follows the implementer the launcher saved for the checkout."""
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb revmux ' + uuid.uuid4().hex)
+        (self.folder / '.workbench/state').mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        (self.folder / 'scope.md').write_text('scope', encoding='utf-8')
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench')}))
+        self.opened = self.enterContext(patch.object(wb, 'open_session', return_value='sid'))
+        self.enterContext(patch.object(wb, 'issue_number', return_value='20'))
+        self.enterContext(contextlib.redirect_stdout(io.StringIO()))
+
+    def run_round(self, *extra):
+        with patch.object(sys, 'argv', ['wb.py', 'revmux', '--round', '1', '--scope', 'scope.md', *extra]):
+            self.assertEqual(0, wb.main())
+        return self.opened.call_args.args[2]
+
+    def save(self, text):
+        (self.folder / '.workbench/state/implementer.json').write_text(text, encoding='utf-8')
+
+    def test_no_saved_implementer_keeps_comprehensive(self):
+        self.assertIn("-Profile 'comprehensive'", self.run_round())
+
+    def test_claude_implementer_uses_the_saved_claude_only_profile(self):
+        self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
+        self.assertIn("-Profile 'claude-only'", self.run_round())
+
+    def test_explicit_profile_wins(self):
+        self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
+        self.assertIn("-Profile 'codex-final'", self.run_round('--profile', 'codex-final'))
+
+    def test_unreadable_or_unsafe_saved_profile_falls_back(self):
+        for text in ('not json', '{"revmuxProfile": "x\' ; calc"}', '[]'):
+            with self.subTest(text=text):
+                self.save(text)
+                self.assertIn("-Profile 'comprehensive'", self.run_round())
+
 
 if __name__ == '__main__':
     unittest.main()

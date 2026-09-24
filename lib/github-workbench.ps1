@@ -23,6 +23,7 @@
   github-workbench https://github.com/yeroo/agworkbench/issues/7
   github-workbench 7 -DryRun              # print what would happen, touch nothing
   github-workbench -Version              # report the installed toolchain
+  github-workbench 7 -Implementer claude  # Claude, not Codex, in the right pane (e.g. Codex out of quota)
 .EXAMPLE
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
@@ -43,6 +44,7 @@ param(
     [string] $QueueMember,
     [int] $QueueAttempt,
     [string] $QueueToken,
+    [string] $Implementer,
     [switch] $Version
 )
 
@@ -59,6 +61,11 @@ if ($Version) {
     exit 0
 }
 
+if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude')) {
+    Write-Host "-Implementer must be codex or claude (got '$Implementer')" -ForegroundColor Yellow
+    exit 2
+}
+
 if ($PSBoundParameters.ContainsKey('Queue')) {
     if (-not $Queue -or $Issue -or $NewSession -or $NoRelay -or $QueueMember -or $QueueAttempt -or $QueueToken -or
         (-not (Test-InsideAgwinterm)) -or ($PSBoundParameters.ContainsKey('Parallel') -and ($Parallel -lt 1 -or $Parallel -gt 8))) {
@@ -72,6 +79,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($Retry) { $queueArgs += '--retry' }
     if ($Yes) { $queueArgs += '--yes' }
     if ($DryRun) { $queueArgs += '--dry-run' }
+    if ($Implementer) { $queueArgs += @('--implementer', $Implementer) }
     & python @queueArgs
     exit $LASTEXITCODE
 }
@@ -82,9 +90,9 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
 }
@@ -117,7 +125,7 @@ if ($QueueMember) {
         }
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
-            Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession
+            Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -140,7 +148,8 @@ if ($QueueMember) {
 }
 if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
-    Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession
+    Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
+        -Implementer $Implementer
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef

@@ -19,6 +19,23 @@ it first, and what comes back is a located disagreement or a checked fact.
 
 The loop ends when the human has approved **and merged** the PR. Not before.
 
+## When the implementer is Claude
+
+The right pane may run **Claude Code** instead of Codex (`implementer: "claude"` in
+`~/.agworkbench.json`, or `github-workbench -Implementer claude`, e.g. when Codex is out of quota).
+`.workbench/state/implementer.json` says which. Everything below still says "Codex" for the
+implementer: its mailbox box stays `codex`, the relay rings it the same way, and the loop is the same.
+The differences:
+
+- **Never commit the implementer's uncommitted work yourself** (this holds for either tool): both
+  panes share one index. If something is left uncommitted, ask the implementer to commit it. Only
+  when it reports that it cannot commit (Codex's sandbox can deny writes to `.git`) do you commit
+  on its behalf, with its co-author trailer. It never pushes: pushing and GitHub stay yours.
+- It has the network, but the launcher denies it `git push` and `gh` (through both its Bash and
+  PowerShell tools) and, unless `allowNetwork` is set, the web tools. It still reads the issue from `.workbench/issue.md`.
+- `wb.py revmux` defaults to the `claude-only` revmux profile, so a review round does not depend on
+  Codex's quota (a `revmuxProfile` key in `~/.agworkbench.json` overrides it).
+
 ## Adopted session
 
 If the launcher printed `WORKBENCH ADOPTED`, this existing Claude session now owns that issue.
@@ -139,7 +156,8 @@ waiter, and end your turn.
 
 ## Phase 3 - implementation (Codex)
 
-Codex implements on this clone's `issue-*` branch, commits, runs the tests, and replies
+Codex implements on this clone's `issue-*` branch, commits (never commit its uncommitted work
+yourself - see "When the implementer is Claude"), runs the tests, and replies
 `IMPLEMENTED <sha>` with what it did, what it ran, and anything it did not do. Read the diff
 yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
 `git diff origin/<default>...HEAD`.
