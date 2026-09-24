@@ -1122,12 +1122,38 @@ function New-IssueCheckout {
     if ($Directory) { $dir = $Directory }
     if ($script:Launch) { $script:Launch.Checkout = $dir }
     $branch = "issue-$($Issue.Number)-$(ConvertTo-Slug $Title 32)"
+    if ($script:Launch.QueueContext -and -not $script:Launch.QueueContext.checkoutEstablished -and
+        (Test-Path -LiteralPath $dir)) {
+        $usable = $false
+        if (Test-Path -LiteralPath (Join-Path $dir '.git')) {
+            Get-Command git -ErrorAction Stop | Out-Null
+            $usable = & {
+                # Windows PowerShell treats native stderr as an error record.
+                $ErrorActionPreference = 'Continue'
+                & git -C $dir --git-dir .git rev-parse HEAD 2>$null | Out-Null
+                $LASTEXITCODE -eq 0
+            }
+        }
+        if (-not $usable) {
+            # Only the queue's saved, unestablished clone may be replaced. Resolve and
+            # check the exact target before deleting; never follow a directory junction.
+            $target = [IO.Path]::GetFullPath($dir).TrimEnd('\', '/')
+            $saved = [IO.Path]::GetFullPath($script:Launch.QueueContext.checkout).TrimEnd('\', '/')
+            $item = Get-Item -LiteralPath $target -Force
+            if ($target -ne $saved -or (Split-Path -Leaf $target) -ne "$name-issue-$($Issue.Number)" -or
+                -not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw "refusing to replace partial clone at $target; repair it manually"
+            }
+            Write-Step "replacing incomplete queue clone $target"
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+    }
     if (Test-Path -LiteralPath (Join-Path $dir '.git')) {
         Write-Step "reusing $dir"
     } else {
         New-Item -ItemType Directory -Force -Path $Root | Out-Null
         Write-Step "cloning $($Issue.Repo) into $dir"
-        & gh repo clone $Issue.Repo $dir -- --quiet | Out-Host
+        & gh repo clone $Issue.Repo $dir '--' --quiet | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "gh repo clone failed" }
     }
     Connect-LaunchLog (Join-Path $dir '.workbench\state\launch.log')

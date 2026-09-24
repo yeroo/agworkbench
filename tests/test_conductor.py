@@ -59,7 +59,9 @@ class QueueCase(unittest.TestCase):
         if not identity.exists():
             q.atomic_json(identity, {'sessionId': str(uuid.uuid4()), 'pane': str(uuid.uuid4())})
         q.atomic_json(directory / 'queue-member.json', dict(queue=str(self.store.path), repo=data['repo'], number=m['number']))
-        q.member_result(self.store.path, m['number'], m['attempt'], m['token'], dict(result='ok', sessionId='session'))
+        # This fake launcher stands in for a completed clone as well as the terminal.
+        with patch.object(q, 'usable_checkout', return_value=True):
+            q.member_result(self.store.path, m['number'], m['attempt'], m['token'], dict(result='ok', sessionId='session'))
         output = self.root / f'output-{m["number"]}.log'
         output.write_text('')
         class Done:
@@ -208,6 +210,25 @@ class QueueCase(unittest.TestCase):
         self.assertEqual(2, sum(c == 'session.new' for c, _ in self.requests))
         self.assertEqual([], self.launches)
 
+    def test_live_unpinned_conductor_retries_pin_before_reporting_running(self):
+        real_terminal = self.terminal
+        def fail_pin(command, **kwargs):
+            if command == 'session.restore':
+                return {'action': 'failed'}
+            return real_terminal(command, **kwargs)
+        with patch.object(q.agw, 'request', fail_pin), self.assertRaisesRegex(q.QueueError, 'pin failed'):
+            self.start('o/r#1')
+        owner = self.store.load()['owner']
+        self.assertFalse(owner['pinned'])
+        with self.store.transaction() as data:
+            data['owner']['state'] = 'running'
+        with q.Lock(self.store.worker_lock):
+            self.start('o/r#2')
+        self.assertTrue(self.store.load()['owner']['pinned'])
+        self.assertEqual(owner['token'], self.store.load()['owner']['token'])
+        self.assertEqual(1, sum(c == 'session.new' for c, _ in self.requests))
+        self.assertEqual(owner['session'], self.requests[-1][1]['target'])
+
     def test_two_racing_bootstraps_create_one_conductor(self):
         gate, release = threading.Event(), threading.Event()
         original = self.terminal
@@ -227,7 +248,9 @@ class QueueCase(unittest.TestCase):
             thread.start()
             try:
                 self.assertTrue(gate.wait(5))
-                self.start('o/r#2')
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.start('o/r#2')
+                self.assertIn('in session pending', output.getvalue())
             finally:
                 release.set(); thread.join(5)
         self.assertFalse(thread.is_alive())
@@ -298,6 +321,76 @@ class QueueCase(unittest.TestCase):
         with self.assertRaisesRegex(q.QueueError, 'repair this file'):
             self.start('o/r#2')
         self.assertEqual('{bad', self.store.path.read_text())
+
+    def test_tick_errors_are_retried_with_throttled_notification(self):
+        self.start('o/r#1')
+        worker = self.worker()
+        errors = [OSError('disk busy'), q.QueueError('lock busy: state'), ValueError('bad report'),
+                  KeyError('missing'), TypeError('bad type'), subprocess.TimeoutExpired('git', 30)]
+        attempts = []
+        def tick():
+            attempts.append(1)
+            if errors:
+                raise errors.pop(0)
+            with self.store.transaction() as data:
+                data['members'][0].update(state='blocked', slotReleased=True)
+        worker.tick = tick
+        with patch.object(q.time, 'sleep') as sleep:
+            self.assertEqual(0, worker.run())
+        self.assertEqual(7, len(attempts))
+        self.assertEqual(6, sleep.call_count)
+        q.agw.notify.assert_called_once()
+        self.assertEqual('completed', q.agw.set_status.call_args.args[0])
+
+    def test_corrupt_state_blocks_and_exits_without_overwriting_it(self):
+        self.start('o/r#1')
+        worker = self.worker()
+        def tick():
+            self.store.path.write_text('{broken')
+            self.store.load()
+        worker.tick = tick
+        with patch.object(q.time, 'sleep') as sleep:
+            self.assertEqual(1, worker.run())
+        sleep.assert_not_called()
+        q.agw.notify.assert_called_once()
+        self.assertEqual('blocked', q.agw.set_status.call_args.args[0])
+        self.assertEqual('{broken', self.store.path.read_text())
+        self.assertFalse(self.store.running())
+
+    def check_partial_clone(self, result):
+        self.start('o/r#1')
+        worker = self.worker()
+        def partial(data, m):
+            checkout = Path(m['checkout'])
+            (checkout / '.git').mkdir(parents=True)
+            if result:
+                q.member_result(self.store.path, 1, m['attempt'], m['token'], dict(result=result))
+            output = self.root / 'partial.log'
+            output.write_text('clone interrupted')
+            class Exited:
+                pid = 123
+                def poll(self):
+                    return 1
+            return dict(process=Exited(), stream=io.BytesIO(), path=output, started=self.now,
+                        attempt=m['attempt'], token=m['token'])
+        worker.spawn = partial
+        worker.tick(); worker.tick()
+        self.assertEqual('failed', self.member()['state'])
+        self.assertFalse(self.member()['checkoutEstablished'])
+        checkout = Path(self.member()['checkout'])
+        self.assertTrue(checkout.resolve().is_relative_to(self.root))
+        shutil.rmtree(checkout)
+        self.start('o/r#1', retry=True)
+        worker.spawn = self.spawn
+        worker.tick(); worker.tick()
+        self.assertEqual('active', self.member()['state'])
+        self.assertTrue(self.member()['checkoutEstablished'])
+
+    def test_failed_clone_is_not_established_and_deletion_does_not_block_retry(self):
+        self.check_partial_clone('failed')
+
+    def test_killed_clone_is_not_established_and_deletion_does_not_block_retry(self):
+        self.check_partial_clone(None)
 
     def test_watch_survives_failed_and_empty_scans_then_admits_new_issue(self):
         with patch.object(q, 'resolve_spec', return_value=('o/r', [], 'work')):
@@ -394,9 +487,18 @@ class QueueCase(unittest.TestCase):
             spawn.return_value.pid = 123
             spawn.return_value.communicate.side_effect = [subprocess.TimeoutExpired('gh', 60), (b'', b'')]
             with self.assertRaises(subprocess.TimeoutExpired):
-                q.run_gh(['repo', 'clone', 'o/r', 'checkout'])
+                q.run_gh(['issue', 'view', '1'])
         if os.name == 'nt':
             self.assertEqual(['taskkill', '/PID', '123', '/T', '/F'], run.call_args.args[0])
+
+    def test_clone_proxy_has_no_short_deadline(self):
+        with patch.object(q.subprocess, 'Popen') as spawn, patch.object(q.shutil, 'which', return_value='gh'), \
+                patch.object(q.sys, 'stdout'), patch.object(q.sys, 'stderr'):
+            spawn.return_value.returncode = 0
+            spawn.return_value.communicate.return_value = (b'', b'')
+            self.assertEqual(0, q.main(['gh-proxy', '--', 'repo', 'clone', 'o/r', 'checkout', '--', '--quiet']))
+        self.assertIsNone(spawn.return_value.communicate.call_args.kwargs['timeout'])
+        self.assertEqual(['gh', 'repo', 'clone', 'o/r', 'checkout', '--', '--quiet'], spawn.call_args.args[0])
 
 
 class Specs(unittest.TestCase):

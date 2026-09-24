@@ -6,7 +6,8 @@
   Claude Code on the left, Codex on the right, in one agwinterm session - the layout from
   umputun's agterm cookbook recipe `two-agent-chat`, on Windows. Claude starts by running
   /start-github-issue, which drives the loop: agree a plan with Codex, Codex implements, Claude
-  reviews with revmux, Codex fixes, the human reviews with revdiff and merges the PR.
+  reviews with revmux, Codex fixes, and the human reviews and merges the PR. Revdiff opens
+  automatically only outside queue mode.
 
   Run it from PowerShell or cmd. Inside agwinterm or agliteterm it adopts the caller's session;
   -NewSession keeps the separate-session/resume behavior. From another terminal it starts agwinterm and opens
@@ -14,6 +15,7 @@
 
   Each issue gets its own full clone under ~/source/workbench, on branch issue-<n>-<slug>, and its
   own mailbox in .workbench/ inside that clone. Running it again for the same issue resumes.
+  Inside agwinterm, -Queue runs an issue list or watched label in separate sessions.
 
 .EXAMPLE
   github-workbench 42                     # issue 42 of the repo in the current directory
@@ -21,6 +23,10 @@
   github-workbench https://github.com/yeroo/agworkbench/issues/7
   github-workbench 7 -DryRun              # print what would happen, touch nothing
   github-workbench -Version              # report the installed toolchain
+.EXAMPLE
+  github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
+.EXAMPLE
+  github-workbench -Queue 'label:ready' -Repo yeroo/agworkbench -Watch
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -78,6 +84,7 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or
 if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
 }
@@ -103,10 +110,9 @@ if ($QueueMember) {
         if ($context.repo -ne $memberRepo) { Write-Host 'Queue repository mismatch'; exit 2 }
         $script:Launch.QueueContext = $context
         $env:AGWORKBENCH_CONFIG = $context.config
-        # Keep GitHub calls bounded in unattended member setup as well as in the conductor.
+        # Reads have a short deadline; cloning uses the overall launcher deadline.
         function gh {
-            param([Parameter(ValueFromRemainingArguments=$true)] [string[]] $GhArguments)
-            & python (Join-Path $script:Lib 'conductor.py') gh-proxy -- @GhArguments
+            & python (Join-Path $script:Lib 'conductor.py') gh-proxy -- @args
             $global:LASTEXITCODE = $LASTEXITCODE
         }
         Enable-LaunchLog

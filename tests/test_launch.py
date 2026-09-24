@@ -1406,6 +1406,88 @@ class QueueEntry(LauncherFixtures):
         self.assertEqual(['issue', 'view', '7', '--repo', 'o/repo', '--json', 'number,title,url,state'],
                          json.loads(capture.read_text()))
 
+    def configure_real_checkout(self):
+        # Fake gh copies a local seed; the real launcher and Git HEAD checks run offline.
+        def make_objects_writable():
+            self.assertTrue(self.temp.resolve().is_relative_to(ROOT))
+            for path in self.temp.rglob('*'):
+                if path.is_file():
+                    path.chmod(0o600)
+        self.addCleanup(make_objects_writable)
+        git = shutil.which('git')
+        self.assertIsNotNone(git)
+        seed = self.temp / 'seed'
+        for args in (['init', '-b', 'issue-7-fix-x', str(seed)],
+                     ['-C', str(seed), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                      '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'seed']):
+            done = subprocess.run([git, *args], capture_output=True, text=True, timeout=15)
+            self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        self.cmd('git', '"' + git + '" %*')
+        capture, failure = self.temp / 'clone-args.jsonl', self.temp / 'fail-clone'
+        stub = self.temp / 'fake-gh.py'
+        stub.write_text(
+            'import json,sys,shutil\nfrom pathlib import Path\n'
+            'args=sys.argv[1:]\n'
+            'with Path(' + repr(str(capture)) + ').open("a") as f: f.write(json.dumps(args)+"\\n")\n'
+            'if args[:2] == ["issue", "view"]:\n'
+            ' print(json.dumps(dict(title="fix-x",state="OPEN")))\n'
+            'elif args[:2] == ["repo", "clone"]:\n'
+            ' target=Path(args[3])\n'
+            ' if Path(' + repr(str(failure)) + ').exists():\n'
+            '  (target/".git/info").mkdir(parents=True,exist_ok=True)\n'
+            '  (target/"partial").write_text("incomplete clone")\n'
+            '  sys.exit(1)\n'
+            ' assert args[4:] == ["--", "--quiet"], args\n'
+            ' shutil.copytree(' + repr(str(seed)) + ',target,dirs_exist_ok=True)\n'
+            'else: raise AssertionError(args)\n', encoding='utf-8')
+        self.cmd('gh', '"' + sys.executable + '" "' + str(stub) + '" %*')
+        self.overrides = '\nfunction Grant-CodexTrust {}\nfunction Grant-ClaudeTrust {}\n'
+        self.write_helpers()
+        return capture, failure
+
+    def test_queue_real_clone_preserves_separator_and_reuses_usable_checkout(self):
+        capture, _ = self.configure_real_checkout()
+        self.checkout.rmdir()
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in capture.read_text().splitlines()]
+        self.assertIn(['repo', 'clone', 'o/repo', str(self.checkout), '--', '--quiet'], calls)
+        self.assertTrue(self.store.load()['members'][0]['checkoutEstablished'])
+        # A completed clone without a result checkpoint must survive retry as well.
+        with self.store.transaction() as data:
+            data['members'][0]['checkoutEstablished'] = False
+        sentinel = self.checkout / 'keep-local-work'
+        sentinel.write_text('keep')
+        self.retry()
+        result = self.entry()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual('keep', sentinel.read_text())
+        calls = [json.loads(line) for line in capture.read_text().splitlines()]
+        self.assertEqual(1, sum(call[:2] == ['repo', 'clone'] for call in calls))
+
+    def check_partial_clone_retry(self, shell):
+        capture, failure = self.configure_real_checkout()
+        failure.touch()
+        first = self.entry(shell=shell)
+        self.assertEqual(1, first.returncode, first.stdout + first.stderr)
+        self.assertTrue((self.checkout / 'partial').exists())
+        self.assertFalse(self.store.load()['members'][0]['checkoutEstablished'])
+        failure.unlink()
+        self.retry()
+        result = self.entry(shell=shell)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertFalse((self.checkout / 'partial').exists())
+        self.assertTrue(self.store.load()['members'][0]['checkoutEstablished'])
+        calls = [json.loads(line) for line in capture.read_text().splitlines()]
+        self.assertEqual(2, sum(call[:2] == ['repo', 'clone'] for call in calls))
+
+    def test_queue_retry_replaces_partial_clone(self):
+        self.check_partial_clone_retry(PWSH)
+
+    @unittest.skipUnless(WINDOWS_PS, 'Windows PowerShell not installed')
+    def test_windows_powershell_queue_retry_replaces_partial_clone(self):
+        self.check_partial_clone_retry(WINDOWS_PS)
+
     def test_unrecoverable_claude_identity_is_incomplete_not_active(self):
         first = self.entry()
         self.assertEqual(0, first.returncode, first.stdout + first.stderr)

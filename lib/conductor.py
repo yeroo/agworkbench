@@ -29,6 +29,10 @@ class UsageError(QueueError):
     pass
 
 
+class StateError(QueueError):
+    """Saved queue data was refused; retrying must not overwrite it."""
+
+
 class Lock:
     """Process-held OS lock; no PID-based liveness and no deletion of lock files."""
     def __init__(self, path: Path, timeout=10):
@@ -110,11 +114,11 @@ def pr_url(value, repo):
     return value
 
 
-def run_gh(args):
+def run_gh(args, timeout=60):
     argv = [shutil.which('gh') or 'gh', *args]
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        out, err = process.communicate(timeout=60)
+        out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         # repo clone can have a git child; terminating just gh would leave it
         # writing into a checkout that a later Retry is about to repair.
@@ -202,8 +206,8 @@ class Store:
                     raise ValueError('invalid member')
                 seen.add(m['number'])
             return data
-        except (OSError, ValueError, KeyError, TypeError) as err:
-            raise QueueError(f'Cannot read queue {self.path}: {err}; repair this file, do not reset it') from err
+        except (ValueError, KeyError, TypeError) as err:
+            raise StateError(f'Cannot read queue {self.path}: {err}; repair this file, do not reset it') from err
 
     @contextlib.contextmanager
     def transaction(self):
@@ -233,6 +237,21 @@ def find_member(data, number):
 def command_line(parts):
     # Commands supplied to a terminal shell use PowerShell quoting; subprocess argv never does.
     return ' '.join("'" + str(p).replace("'", "''") + "'" for p in parts)
+
+
+def conductor_command(store, token):
+    return '& ' + command_line([sys.executable, str(HERE / 'conductor.py'), 'run', '--file', str(store.path), '--token', token])
+
+
+def pin_conductor(store, owner):
+    session, token = owner['session'], owner['token']
+    line = conductor_command(store, token)
+    reply = agw.request('session.restore', target=session, args={'command': line})
+    if not isinstance(reply, dict) or reply.get('action') != 'pinned' or reply.get('pane') != session or reply.get('command') != line:
+        raise QueueError(f'conductor pin failed; repair: agwintermctl session restore {command_line([line]).strip()} --target {session}')
+    with store.transaction() as data:
+        if data['owner']['token'] == token and data['owner'].get('session') == session:
+            data['owner']['pinned'] = True
 
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None):
@@ -272,24 +291,26 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
                     m.update(state='pending', reason=None, slotReleased=False, consumedLoop=None, consumedRev=0)
         owner = data.get('owner') or {}
         if store.running() or (owner.get('state') == 'starting' and time.time() - owner['reservedAt'] < 90):
-            atomic_json(store.path, data)
-            print(f'queue running/starting in session {owner.get("session", "pending")}; appended {len(added)}')
-            return 0
-        token = str(uuid.uuid4())
-        if owner.get('session'):
-            print(f'previous conductor session {owner["session"]} left untouched')
-        data['owner'] = dict(token=token, state='starting', session=None, reservedAt=time.time())
+            owner = dict(owner)
+        else:
+            token = str(uuid.uuid4())
+            if owner.get('session'):
+                print(f'previous conductor session {owner["session"]} left untouched')
+            data['owner'] = dict(token=token, state='starting', session=None, pinned=False, reservedAt=time.time())
         atomic_json(store.path, data)
-    line = '& ' + command_line([sys.executable, str(HERE / 'conductor.py'), 'run', '--file', str(store.path), '--token', token])
+    if token is None:
+        if owner.get('session') and not owner.get('pinned'):
+            pin_conductor(store, owner)
+        print(f'queue running/starting in session {owner.get("session") or "pending"}; appended {len(added)}')
+        return 0
+    line = conductor_command(store, token)
     session = str(agw.request('session.new', args={'name': f'#queue {repo}', 'cwd': str(HERE.parent), 'command': line})).split()[0]
     if not valid_uuid(session):
         raise QueueError(f'invalid conductor session id: {session}')
     with store.transaction() as data:
         if data['owner']['token'] == token:
             data['owner']['session'] = session
-    reply = agw.request('session.restore', target=session, args={'command': line})
-    if not isinstance(reply, dict) or reply.get('action') != 'pinned' or reply.get('pane') != session or reply.get('command') != line:
-        raise QueueError(f'conductor pin failed; repair: agwintermctl session restore {command_line([line]).strip()} --target {session}')
+    pin_conductor(store, dict(session=session, token=token))
     print(f'queue running in session {session}: {store.path}')
     return 0
 
@@ -309,11 +330,22 @@ def member_context(path, number, attempt, token):
         if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
             raise QueueError(f'checkout moved or deleted: {m["checkout"]}; restore it or remove the member')
         return dict(queue=str(store.path), repo=data['repo'], number=number, attempt=attempt, token=token,
-                    checkout=m['checkout'], config=data['config'])
+                    checkout=m['checkout'], checkoutEstablished=m['checkoutEstablished'], config=data['config'])
+
+
+def usable_checkout(path):
+    # Do not let git discover an ancestor repository in an empty clone directory.
+    if not (Path(path) / '.git').exists():
+        return False
+    done = subprocess.run([shutil.which('git') or 'git', '-C', str(path), '--git-dir', '.git', 'rev-parse', 'HEAD'],
+                          capture_output=True, timeout=30)
+    return done.returncode == 0
 
 
 def member_result(path, number, attempt, token, result):
     store = Store(path)
+    previous = find_member(store.load(), number)
+    established = bool(previous and (previous['checkoutEstablished'] or usable_checkout(previous['checkout'])))
     with store.transaction() as data:
         m = find_member(data, number)
         if not m or m['attempt'] != attempt or m.get('token') != token or m['state'] != 'launching':
@@ -322,7 +354,7 @@ def member_result(path, number, attempt, token, result):
         if result.get('result') not in {'ok', 'incomplete', 'failed', 'timeout'}:
             raise QueueError('invalid launch result')
         m['result'] = dict(result, attempt=attempt, token=token)
-        m['checkoutEstablished'] = Path(m['checkout']).is_dir()
+        m['checkoutEstablished'] = m['checkoutEstablished'] or established
     return True
 
 
@@ -451,6 +483,8 @@ class Worker:
                 process.wait(timeout=30)
             job['stream'].close()
             tail = '\n'.join(job['path'].read_text(encoding='utf-8', errors='replace').splitlines()[-20:])
+            previous = find_member(self.store.load(), number)
+            established = bool(previous and (previous['checkoutEstablished'] or usable_checkout(previous['checkout'])))
             with self.store.transaction() as data:
                 m = find_member(data, number)
                 if m and m.get('token') == job['token'] and m['attempt'] == job['attempt'] and m['state'] == 'launching':
@@ -458,7 +492,7 @@ class Worker:
                         m['result'] = dict(result='timeout' if timed_out else 'failed', token=job['token'],
                                            attempt=job['attempt'], childPid=process.pid,
                                            detail='launcher timed out' if timed_out else f'launcher exited {code} without a result\n{tail}')
-                    m['checkoutEstablished'] = Path(m['checkout']).is_dir()
+                    m['checkoutEstablished'] = m['checkoutEstablished'] or established
             del self.jobs[number]
 
     def refresh_remote(self):
@@ -555,27 +589,43 @@ class Worker:
     def run(self):
         lock = Lock(self.store.worker_lock, 30)
         with lock:
-            with self.store.transaction() as data:
-                if data['owner']['token'] != self.token:
-                    return 0
-                data['owner'].update(state='running', session=agw.my_pane() or data['owner'].get('session'))
-            self.status('active')
+            initialized = False
             while True:
-                self.tick()
-                # Append and final admission check share the same transaction. Release
-                # worker ownership before another invocation can decide whether to start.
-                report = None
-                with self.store.transaction() as data:
-                    if finished(data):
-                        report = summary(data)
-                        self.store.path.with_suffix('.md').write_text(report, encoding='utf-8')
-                        data['owner']['state'] = 'finished'
-                        atomic_json(self.store.path, data)
-                        lock.release()
-                if report is not None:
-                    print(report, flush=True)
-                    self.status('completed')
-                    return 0
+                try:
+                    if not initialized:
+                        with self.store.transaction() as data:
+                            if data['owner']['token'] != self.token:
+                                return 0
+                            data['owner'].update(state='running', session=agw.my_pane() or data['owner'].get('session'))
+                        initialized = True
+                        self.status('active')
+                    self.tick()
+                    # Publish completion and release ownership under the state lock,
+                    # so a racing append either keeps us alive or starts a successor.
+                    report = None
+                    with Lock(self.store.state_lock):
+                        data = self.store._load()
+                        if finished(data):
+                            report = summary(data)
+                            self.store.path.with_suffix('.md').write_text(report, encoding='utf-8')
+                            data['owner']['state'] = 'finished'
+                            atomic_json(self.store.path, data)
+                            lock.release()
+                    if report is not None:
+                        print(report, flush=True)
+                        self.status('completed')
+                        return 0
+                    self.errors.pop('conductor tick', None)
+                except StateError as err:
+                    print(str(err), flush=True)
+                    self.notify(str(err))
+                    self.status('blocked')
+                    return 1
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as err:
+                    self.error('conductor tick', err)
+                    for message in self.alerts:
+                        self.notify(message)
+                    self.alerts.clear()
                 time.sleep(20)
 
     def status(self, value):
@@ -633,7 +683,8 @@ def main(argv=None):
     try:
         if args.command == 'gh-proxy':
             arguments = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
-            done = run_gh(arguments)
+            # Cloning is bounded by the launcher's overall ten-minute deadline.
+            done = run_gh(arguments, timeout=None if arguments[:2] == ['repo', 'clone'] else 60)
             sys.stdout.buffer.write(done.stdout)
             sys.stderr.buffer.write(done.stderr)
             return done.returncode
