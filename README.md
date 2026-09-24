@@ -225,11 +225,13 @@ finishes; if several eligible PRs finished between polls, the newest by creation
 first and the others remain available on restart. Pending final notices from older relay
 versions are also drained once for compatibility.
 
-When a newer open PR takes over, the relay checks the previous PR before switching. It files any
-new terminal notice for that PR and retires its watch, or logs that an unresolved watch was
-superseded. PR events are saved in an outbox with stable message IDs before publication. A restart
+When a newer open PR appears, the relay checks the previous PR before switching. If the watched
+PR has finished, the relay drains its terminal notices and exits; the newer PR waits for the next
+run. Otherwise, it logs that the unresolved watch was superseded. PR events are saved in an outbox
+with IDs derived from GitHub event identities before publication. A restart
 replays that outbox without overwriting existing mail or resurrecting mail already read or
-archived, then resumes normal delivery and final-notice draining.
+archived, then resumes normal delivery and final-notice draining. Publication errors are logged
+and retried on later ticks. A branch change discards any unpublished outbox from the old branch.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.

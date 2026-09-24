@@ -28,6 +28,7 @@ peerchat; a failed ring is announced only after a later send succeeds from an em
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -45,7 +46,7 @@ sys.path.insert(0, str(HERE))
 
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 
-PR_FIELDS = "number,url,state,createdAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
+PR_FIELDS = "number,url,state,createdAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
@@ -107,7 +108,8 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     if old is None:
         if new.get('state') != 'OPEN':
             return events
-        events.append({"kind": "note", "subject": f"PR #{number} is open",
+        events.append({"kind": "note", "identity": ['open', new.get('createdAt')],
+                       "subject": f"PR #{number} is open",
                        "body": f"{new.get('url')}\n\nThe relay is now watching it for reviews, comments "
                                f"and the merge."})
         old = {"reviews": [], "comments": [], "inline": [], "reviewDecision": "", "state": "OPEN"}
@@ -120,7 +122,7 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
         state = review.get("state", "")
         body = (review.get("body") or "").strip() or "(no summary text)"
         events.append({"kind": "review", "subject": f"PR #{number}: review from {author} - {state}",
-                       "body": body})
+                       "body": body, "identity": ['review', review.get('id') or review]})
 
     seen_comments = {c.get("id") for c in old.get("comments") or []}
     for comment in new.get("comments") or []:
@@ -128,7 +130,8 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
             continue
         author = (comment.get("author") or {}).get("login", "?")
         events.append({"kind": "message", "subject": f"PR #{number}: comment from {author}",
-                       "body": (comment.get("body") or "").strip()})
+                       "body": (comment.get("body") or "").strip(),
+                       "identity": ['comment', comment.get('id') or comment]})
 
     seen_inline = {c.get("id") for c in old.get("inline") or []}
     for comment in new.get("inline") or []:
@@ -137,20 +140,25 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
         author = (comment.get("user") or {}).get("login", "?")
         where = f"{comment.get('path')}:{comment.get('line') or comment.get('original_line') or '?'}"
         events.append({"kind": "review", "subject": f"PR #{number}: line comment from {author} on {where}",
-                       "body": (comment.get("body") or "").strip()})
+                       "body": (comment.get("body") or "").strip(),
+                       "identity": ['inline', comment.get('id') or comment]})
 
     if new.get("reviewDecision") and new.get("reviewDecision") != old.get("reviewDecision"):
         events.append({"kind": "note", "subject": f"PR #{number}: review decision is now "
-                                                   f"{new['reviewDecision']}", "body": new.get("url", "")})
+                                                   f"{new['reviewDecision']}", "body": new.get("url", ""),
+                       "identity": ['decision', new['reviewDecision'],
+                                    sorted(r.get('id', '') for r in new.get('reviews') or [])]})
 
     state = new.get("state")
     if state != old.get("state"):
         if state == "MERGED":
             events.append({"kind": "note", "subject": f"PR #{number} MERGED - the loop is complete",
-                           "body": f"Merged at {new.get('mergedAt')}. {new.get('url')}", "terminal": True})
+                           "body": f"Merged at {new.get('mergedAt')}. {new.get('url')}", "terminal": True,
+                           "identity": ['MERGED', new.get('mergedAt')]})
         elif state == "CLOSED":
             events.append({"kind": "note", "subject": f"PR #{number} was CLOSED without merging",
-                           "body": new.get("url", ""), "terminal": True})
+                           "body": new.get("url", ""), "terminal": True,
+                           "identity": ['CLOSED', new.get('closedAt')]})
     return events
 
 
@@ -158,6 +166,12 @@ def fast_terminal_events(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """Discover a PR and its existing discussion, then announce its terminal transition."""
     opened = dict(snapshot, state='OPEN')
     return pr_events(None, opened) + pr_events(opened, snapshot)
+
+
+def event_message_id(number: int, event: dict[str, Any], box: str) -> str:
+    identity = json.dumps([number, event['kind'], event['identity'], box], sort_keys=True)
+    digest = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:8]
+    return f'github-pr{number}-{event["kind"]}-{digest}-{box}'
 
 
 def timestamp(value: Any) -> datetime | None:
@@ -202,11 +216,6 @@ def check_panes(claude: str, codex: str) -> None:
             raise SystemExit(f"relay: --{name}-pane {pane!r} is not a pane id")
     if claude == codex:
         raise SystemExit("relay: Claude and Codex cannot share a pane")
-
-
-def finished(snapshot: dict[str, Any] | None, seen_open: set[int], completed_prs: set[int]) -> bool:
-    return (bool(snapshot) and snapshot.get('state') in ('MERGED', 'CLOSED')
-            and snapshot.get('number') in seen_open and snapshot.get('number') not in completed_prs)
 
 
 def same_repo(candidate: dict[str, Any], repo: str) -> bool:
@@ -266,7 +275,8 @@ class Relay:
         saved_branch = self.state.get('branch', (saved_pr or {}).get('headRefName'))
         changed = self.state.get('branch') != self.branch
         if saved_branch != self.branch or (saved_pr and saved_pr.get('headRefName') != self.branch):
-            branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs', 'watch_since')
+            branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs',
+                           'watch_since', 'outbox', 'event_sequence')
             if saved_branch is not None or any(self.state.get(key) for key in branch_keys):
                 stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
                 self.log(f"discarding saved PR state for branch {stale_branch} "
@@ -549,23 +559,36 @@ class Relay:
             self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
         return PrFetch(snapshot, fast, previous)
 
-    def flush_outbox(self) -> None:
+    def flush_outbox(self) -> bool:
         if self.dry_run or not self.state.get('outbox'):
-            return
-        for message in self.state['outbox']:
-            self.hub.write_message(**message)
-        self.state.pop('outbox')
-        self._save()
+            return True
+        outbox = self.state['outbox']
+        try:
+            for message in outbox:
+                self.hub.write_message(**message)
+            self.state.pop('outbox')
+            self._save()
+        except OSError as err:
+            self.state['outbox'] = outbox
+            self.log(f'outbox publication failed; will retry on a later tick: {err}')
+            return False
+        return True
 
     def watch_pr(self) -> bool:
         """Returns True when the PR is terminal; its filed notices must still be delivered."""
-        self.flush_outbox()
+        if not self.flush_outbox():
+            return False
         result = self.fetch_pr()
         if result is None:
             return False
         snapshot, fast = result.snapshot, result.fast
         seen_open = set(self.state.get('seen_open', []))
         completed = set(self.state.get('completed_prs', []))
+        previous = result.previous
+        if (previous and previous['number'] in seen_open
+                and previous['state'] in ('MERGED', 'CLOSED')):
+            snapshot, fast = previous, False
+            previous = None  # Drain this watch; the successor belongs to the next run.
         if fast:
             if snapshot['number'] in seen_open:
                 self.log(f'PR #{snapshot["number"]}: recovering terminal events for a previous watch')
@@ -575,17 +598,14 @@ class Relay:
         terminal_mail = list(self.state.get('terminal_mail', []))
         events = fast_terminal_events(snapshot) if fast else pr_events(self.state.get("pr"), snapshot)
         numbered_events = [(snapshot['number'], event) for event in events]
-        if result.previous:
-            previous = result.previous
+        if previous:
             numbered_events = [(previous['number'], event)
                                for event in pr_events(self.state.get('pr'), previous)] + numbered_events
             completed.add(previous['number'])
             self.log(f'PR #{previous["number"]}: resolved previous watch ({previous["state"]}); '
                      f'switching to PR #{snapshot["number"]}')
         outbox = []
-        sequence = self.state.get('event_sequence', 0)
         for number, event in numbered_events:
-            sequence += 1
             recipients = ["claude"]
             terminal_event = event.get('terminal', False)
             if terminal_event:
@@ -594,9 +614,7 @@ class Relay:
                 if self.dry_run:
                     self.log(f"[dry-run] would file github mail for {box}: {event['subject']}")
                     continue
-                # Sequence distinguishes repeated lifecycle events (e.g. close/reopen/close).
-                # It and these ids are checkpointed before any message becomes visible.
-                mid = f'github-pr{number}-{event["kind"]}-{sequence}-{box}'
+                mid = event_message_id(number, event, box)
                 outbox.append(dict(to=box, sender="github", subject=event["subject"],
                                    body=event["body"], kind=event["kind"], message_id=mid))
                 if terminal_event:
@@ -615,7 +633,7 @@ class Relay:
             self.state['terminal_mail'] = terminal_mail
             if completed or 'completed_prs' in self.state:
                 self.state['completed_prs'] = sorted(completed)
-            self.state['event_sequence'] = sequence
+            self.state.pop('event_sequence', None)  # Migrate the obsolete counter.
             if outbox:
                 self.state['outbox'] = outbox
             self._save()
@@ -631,7 +649,6 @@ class Relay:
 
     def run(self) -> int:
         self.log(f"relay up: {self.repo} {self.branch}; mailbox {self.hub_dir}")
-        self.flush_outbox()  # Recover publication before deciding whether final mail is drained.
         next_pr = 0.0
         saved_terminal = (self.state.get('pr') or {}).get('state') in ('MERGED', 'CLOSED')
         # Replayed mail might already be read. Still finish this saved watch without polling
@@ -646,17 +663,19 @@ class Relay:
             if self.stop_file.exists():
                 self.log("stop file found; exiting")
                 return 0
+            published = self.flush_outbox()
             self.deliver_mail()
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()
                 resets = {key for key, held in self.holds.items() if held.clear_pending}
                 resets.update((box, '') for box in self.state.get('reset_pending', []))
-                if not pending and not resets:
+                if not pending and not resets and published:
                     self.retire(self.state['pr']['number'])
                     self.log("PR is finished; final notices delivered or read; the relay's job is done")
                     return 0
                 if now() >= drain_deadline:
                     details = []
+                    pending.update((m['to'], m['message_id']) for m in self.state.get('outbox', []))
                     for box, mid in sorted(pending | resets):
                         held = self.holds.get((box, mid))
                         reason = (held.reason if held else 'status reset pending' if (box, mid) in resets
@@ -665,7 +684,7 @@ class Relay:
                     detail = '; '.join(details)
                     self.log(f"PR is finished; drain deadline reached; still held or awaiting status reset: {detail}")
                     return 0
-            elif now() >= next_pr:
+            elif published and now() >= next_pr:
                 next_pr = now() + self.pr_interval
                 if self.watch_pr():
                     if self.dry_run:
@@ -673,7 +692,8 @@ class Relay:
                         return 0
                     drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT
                     self.log('PR is finished; draining final notices before exit')
-                    continue
+                    if not self.state.get('outbox'):
+                        continue
             delay = self.mail_interval
             if drain_deadline is not None:
                 delay = min(delay, max(0, drain_deadline - now()))

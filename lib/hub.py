@@ -257,11 +257,19 @@ def write_message(*, to: str, sender: str, subject: str, body: str, kind: str = 
         raise ValueError('bad message id')
     directory = ensure_box(to)
     message_id = message_id or new_id(sender)
+
+    def existing_message(path: Path) -> Path:
+        stored = parse_message(path)
+        if stored.get('subject') != subject.strip():
+            append_log({'at': now_iso(), 'event': 'id-collision', 'id': message_id,
+                        'to': to, 'subject': subject, 'stored_subject': stored.get('subject')})
+        return path
+
     # Replaying an outbox must not overwrite or resurrect an already-read message.
     for folder in (directory, directory / 'read', directory / 'archive'):
         existing = folder / f'{message_id}.md'
         if existing.is_file():
-            return existing
+            return existing_message(existing)
     head = [
         "---",
         f"id: {message_id}",
@@ -279,17 +287,33 @@ def write_message(*, to: str, sender: str, subject: str, body: str, kind: str = 
     head.append("---")
     path = box_dir(to) / f"{message_id}.md"
     # Publish a complete file without replacing an existing id, even on a concurrent replay.
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
-                                     suffix='.tmp', delete=False) as handle:
-        tmp = Path(handle.name)
-        handle.write("\n".join(head) + "\n\n" + body.rstrip() + "\n")
+    text = "\n".join(head) + "\n\n" + body.rstrip() + "\n"
+    tmp = None
     try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
+                                         suffix='.tmp', delete=False) as handle:
+            tmp = Path(handle.name)
+            handle.write(text)
         try:
             os.link(tmp, path)
         except FileExistsError:
-            return path
+            return existing_message(path)
+        except OSError:
+            # Some filesystems do not support hard links. Exclusive creation still prevents
+            # replacing an existing id. Remove our partial file on a handled write failure.
+            try:
+                handle = path.open('x', encoding='utf-8')
+            except FileExistsError:
+                return existing_message(path)
+            try:
+                with handle:
+                    handle.write(text)
+            except BaseException:
+                path.unlink()
+                raise
     finally:
-        tmp.unlink()
+        if tmp is not None:
+            tmp.unlink()
     append_log({"at": now_iso(), "event": "send", "id": message_id, "from": sender, "to": to,
                 "kind": kind, "subject": subject})
     return path
