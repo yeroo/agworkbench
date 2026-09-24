@@ -208,12 +208,22 @@ up to 30 minutes, then logs any notices still waiting before exiting. A failed s
 persisted and retried on later ticks, including after a restart. Relay dry runs neither file
 GitHub-event mail nor save announcement state.
 
-The relay follows the newest open PR from the watched repository and branch. A PR already
-finished before the relay observed it open is recorded and ignored. OPEN observation survives
-restarts: if that PR finishes while the relay is offline, its merge or closure still ends the
-loop after the final notices drain. Once those notices and status resets are resolved, the PR
-is retired; restarting on the same branch waits for the next open PR. Pending final notices
-from older relay versions are also drained once for compatibility.
+The relay follows the newest open PR from the watched repository and branch. It also catches a
+PR created and finished between polls: discovery and discussion mail are followed by the normal
+merge or closure notices and drain. To distinguish these from older finished PRs, it saves a
+branch-specific `watch_since` from GitHub's server Date before polling. Creation at or after that
+second qualifies; an older PR first seen finished is recorded and ignored. Missing creation
+timestamps are retried. If the server Date is unavailable, PR watching waits and retries while
+mail delivery continues; there is no local-clock fallback or coverage before initialization.
+The boundary survives same-branch restarts, resets on a branch change, and is initialized the
+same way when upgrading state that has no boundary.
+
+OPEN observation also survives restarts: if that PR finishes while the relay is offline, its
+merge or closure still ends the loop after the final notices drain. Once those notices and
+status resets are resolved, the PR is retired. Each run handles one finished PR; if several
+eligible PRs finished between polls, the newest by creation time (then PR number) is handled
+first and the others remain available on restart. Pending final notices from older relay
+versions are also drained once for compatibility.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.

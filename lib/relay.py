@@ -12,9 +12,9 @@ Two jobs, one loop, one process per issue, running in its own visible agwinterm 
    message to Claude on every event that needs acting on: a new review, a changed review decision,
    a new comment, a merge, a close. After merge/closure the loop drains its final notices, with
    a bounded wait for recipients whose composers are unavailable.
-   It follows the newest OPEN PR from this repository. A PR already finished before observation
-   is ignored; observation survives restarts, and a fully drained PR is retired so a later run
-   on the same branch can wait for the next PR.
+   It follows the newest OPEN PR from this repository, and catches PRs created and finished
+   after the saved server-time watch boundary. Older PRs first seen finished are ignored;
+   observation survives restarts, and a fully drained PR is retired so a later run can continue.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory and the GitHub API, which cannot push to it.
@@ -34,6 +34,8 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -43,7 +45,7 @@ sys.path.insert(0, str(HERE))
 
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 
-PR_FIELDS = "number,url,state,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
+PR_FIELDS = "number,url,state,createdAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
@@ -152,6 +154,42 @@ def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[di
     return events
 
 
+def fast_terminal_events(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Discover a PR and its existing discussion, then announce its terminal transition."""
+    opened = dict(snapshot, state='OPEN')
+    return pr_events(None, opened) + pr_events(opened, snapshot)
+
+
+def timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def github_time() -> datetime | None:
+    """Use GitHub's response clock; never substitute the workstation's wall clock."""
+    try:
+        done = subprocess.run(['gh', 'api', '-i', 'rate_limit'], capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=10)
+        if done.returncode:
+            return None
+        for line in done.stdout.splitlines():
+            if not line.strip():
+                break  # Only the response headers, not JSON fields in the body.
+            name, separator, value = line.partition(':')
+            if separator and name.casefold() == 'date':
+                parsed = parsedate_to_datetime(value.strip())
+                if parsed.tzinfo is not None:
+                    return parsed.astimezone(timezone.utc).replace(microsecond=0)
+    except (OSError, ValueError, TypeError, OverflowError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 PANE_ID_RE = __import__("re").compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -221,7 +259,7 @@ class Relay:
         saved_branch = self.state.get('branch', (saved_pr or {}).get('headRefName'))
         changed = self.state.get('branch') != self.branch
         if saved_branch != self.branch or (saved_pr and saved_pr.get('headRefName') != self.branch):
-            branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs')
+            branch_keys = ('pr', 'terminal_mail', 'ignored_prs', 'seen_open', 'completed_prs', 'watch_since')
             if saved_branch is not None or any(self.state.get(key) for key in branch_keys):
                 stale_branch = saved_pr.get('headRefName') if saved_pr else saved_branch
                 self.log(f"discarding saved PR state for branch {stale_branch} "
@@ -231,6 +269,7 @@ class Relay:
             saved_pr = None
             changed = True
         self.state['branch'] = self.branch
+        self._dry_watch_since = None
         if saved_pr and saved_pr.get('state') == 'OPEN' and 'seen_open' not in self.state:
             self.state['seen_open'] = [saved_pr['number']]
             changed = True
@@ -386,7 +425,7 @@ class Relay:
     def ignore_finished(self, number: int, state: str) -> None:
         if number in self.state.get('ignored_prs', []) or number in self.state.get('completed_prs', []):
             return
-        self.log(f"ignoring finished PR #{number} ({state.lower()} before this relay observed it open)")
+        self.log(f"ignoring finished PR #{number} ({state.lower()}; predates this relay's watch boundary)")
         if not self.dry_run:
             self.state['ignored_prs'] = sorted({*self.state.get('ignored_prs', []), number})
             self._save()
@@ -399,7 +438,30 @@ class Relay:
         if not self.dry_run:
             self._save()
 
+    def watch_boundary(self) -> datetime | None:
+        if 'watch_since' in self.state:
+            boundary = timestamp(self.state['watch_since'])
+            if boundary is None:
+                self.log('invalid saved watch_since; repair relay state before PR watching can resume')
+            return boundary
+        if self.dry_run and self._dry_watch_since is not None:
+            return self._dry_watch_since
+        boundary = github_time()
+        if boundary is None:
+            self.log('GitHub Date unavailable; PR watching not initialized; will retry')
+            return None
+        if self.dry_run:
+            self._dry_watch_since = boundary
+        else:
+            self.state['watch_since'] = boundary.isoformat(timespec='seconds')
+            self._save()  # The boundary must survive a restart before any PR polling.
+        return boundary
+
     def fetch_pr(self) -> dict[str, Any] | None:
+        boundary = self.watch_boundary()
+        if boundary is None:
+            return None
+
         def endpoint(state: str) -> str:
             query = urlencode({'state': state, 'head': f'{self.repo.split("/")[0]}:{self.branch}',
                                'per_page': 100})
@@ -410,26 +472,61 @@ class Relay:
             return None
         selected = select_open(candidates, self.repo)
         tracked = self.state.get('pr') or {}
+        older = []
         if selected is not None:
             number = selected['number']
         elif (tracked.get('number') in self.state.get('seen_open', [])
               and tracked.get('number') not in self.state.get('completed_prs', [])):
             number = tracked['number']
         else:
+            eligible = []
             for pr in gh_pages(endpoint('all')) or []:
-                if pr.get('state') == 'closed' and same_repo(pr, self.repo):
+                if (pr.get('state') != 'closed' or not same_repo(pr, self.repo)
+                        or (pr.get('head') or {}).get('ref') != self.branch
+                        or pr['number'] in self.state.get('ignored_prs', [])
+                        or pr['number'] in self.state.get('completed_prs', [])):
+                    continue
+                created = timestamp(pr.get('created_at'))
+                if created is None:
+                    self.log(f'PR #{pr["number"]}: creation time unavailable; will retry')
+                elif created >= boundary:
+                    eligible.append((created, pr['number']))
+                else:
+                    older.append(pr)
+            if not eligible:
+                for pr in older:
                     self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
-            return None
+                return None
+            _, number = max(eligible)
         snapshot = gh_json(['pr', 'view', str(number), '--repo', self.repo, '--json', PR_FIELDS])
         if snapshot is None:
             return None
-        if snapshot.get('isCrossRepository') is not False or snapshot.get('headRefName') != self.branch:
+        if (snapshot.get('number') != number or snapshot.get('isCrossRepository') is not False
+                or snapshot.get('headRefName') != self.branch):
             self.log(f'ignoring PR #{number}: head repository or branch does not match')
             return None
         inline = gh_pages(f'repos/{self.repo}/pulls/{number}/comments')
         if inline is None:
             return None
         snapshot['inline'] = inline
+        if snapshot.get('state') in ('MERGED', 'CLOSED'):
+            if number in self.state.get('completed_prs', []):
+                return None
+            if number not in self.state.get('seen_open', []):
+                created = timestamp(snapshot.get('createdAt'))
+                if created is None:
+                    self.log(f'PR #{number}: creation time unavailable; will retry')
+                    return None
+                if created < boundary:
+                    self.ignore_finished(number, snapshot['state'])
+                    return None
+                # Only a validated view with a successful inline fetch can establish
+                # observation. watch_pr commits it with the actual terminal snapshot.
+                snapshot['_observed_after_watch'] = True
+        elif snapshot.get('state') != 'OPEN':
+            return None
+        for pr in older:
+            self.ignore_finished(pr['number'], 'MERGED' if pr.get('merged_at') else 'CLOSED')
         return snapshot
 
     def watch_pr(self) -> bool:
@@ -439,12 +536,17 @@ class Relay:
             return False
         seen_open = set(self.state.get('seen_open', []))
         completed = set(self.state.get('completed_prs', []))
+        fast = snapshot.pop('_observed_after_watch', False) and snapshot['number'] not in seen_open
+        if fast:
+            seen_open.add(snapshot['number'])
+            self.log(f'PR #{snapshot["number"]} opened and finished between polls')
         terminal = finished(snapshot, seen_open, completed)
         if snapshot.get('state') != 'OPEN' and not terminal:
             self.ignore_finished(snapshot['number'], snapshot.get('state', 'finished'))
             return False
         terminal_mail = list(self.state.get('terminal_mail', []))
-        for event in pr_events(self.state.get("pr"), snapshot):
+        events = fast_terminal_events(snapshot) if fast else pr_events(self.state.get("pr"), snapshot)
+        for event in events:
             recipients = ["claude"]
             terminal_event = event.get('terminal', False)
             if terminal_event:
