@@ -208,12 +208,35 @@ up to 30 minutes, then logs any notices still waiting before exiting. A failed s
 persisted and retried on later ticks, including after a restart. Relay dry runs neither file
 GitHub-event mail nor save announcement state.
 
-The relay follows the newest open PR from the watched repository and branch. A PR already
-finished before the relay observed it open is recorded and ignored. OPEN observation survives
-restarts: if that PR finishes while the relay is offline, its merge or closure still ends the
-loop after the final notices drain. Once those notices and status resets are resolved, the PR
-is retired; restarting on the same branch waits for the next open PR. Pending final notices
-from older relay versions are also drained once for compatibility.
+The relay follows the newest open PR from the watched repository and branch. It also catches a
+PR created and finished between polls: discovery and discussion mail are followed by the normal
+merge or closure notices and drain. To distinguish these from older finished PRs, it saves a
+branch-specific `watch_since` from GitHub's server Date before polling. Creation at or after that
+second qualifies; an older PR first seen finished is recorded and ignored. Missing creation
+timestamps are retried. If the server Date is unavailable, PR watching waits and retries while
+mail delivery continues; there is no local-clock fallback or coverage before initialization.
+The boundary survives same-branch restarts, resets on a branch change, and is initialized the
+same way when upgrading state that has no boundary.
+
+OPEN observation also survives restarts: if that PR finishes while the relay is offline, its
+merge or closure still ends the loop after the final notices drain. Once those notices and
+status resets are resolved, the PR is retired. Each run exits after its current watched PR
+finishes; if several eligible PRs finished between polls, the newest by creation time (then PR number) is handled
+first and the others remain available on restart. Pending final notices from older relay
+versions are also drained once for compatibility.
+
+When a newer open PR appears, the relay checks the previous PR before switching. If the watched
+PR has finished, the relay drains its terminal notices and exits; the newer PR waits for the next
+run. Otherwise, it logs that the unresolved watch was superseded. PR events are saved in an outbox
+with IDs derived from GitHub event identities before publication. A restart
+replays that outbox without overwriting existing mail or resurrecting mail already read or
+archived, then resumes normal delivery and final-notice draining. Publication errors are logged
+and retried on later ticks. A branch change discards any unpublished outbox from the old branch.
+Opening notices use creation time or the latest GitHub `reopened` timeline timestamp, so a
+reopening gets its own notice even after relay-state loss. Decision notices include the previous
+decision and the PR update time to distinguish repeated changes. Windows publishes complete mail
+atomically using a hard link or a no-replace rename; replay repairs an incomplete header while
+holding the message ID's publication lock.
 
 **Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
 never merges, never force-pushes over commits you have reviewed.

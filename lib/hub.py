@@ -14,7 +14,9 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -247,12 +249,64 @@ def ensure_box(box: str) -> Path:
     return directory
 
 
+@contextmanager
+def message_lock(path: Path):
+    """Serialize repair/publication of an id; process exit releases the lock too."""
+    if os.name == 'nt':
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_TEMPORARY, 0o600)
+    else:
+        # Keep the lock inode on POSIX so waiting publishers always lock the same file.
+        import fcntl
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if os.name != 'nt':
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)  # O_TEMPORARY deletes the Windows lock, including after a crash.
+
+
 def write_message(*, to: str, sender: str, subject: str, body: str, kind: str = "message",
-                  thread: str | None = None, refs: list[str] | None = None) -> Path:
+                  thread: str | None = None, refs: list[str] | None = None,
+                  message_id: str | None = None) -> Path:
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}: one of {', '.join(KINDS)}")
-    ensure_box(to)
-    message_id = new_id(sender)
+    if message_id is not None and not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}', message_id):
+        raise ValueError('bad message id')
+    directory = ensure_box(to)
+    message_id = message_id or new_id(sender)
+
+    with message_lock(directory / f'.{message_id}.lock'):
+        return _publish_message(directory, message_id, to=to, sender=sender, subject=subject,
+                                body=body, kind=kind, thread=thread, refs=refs)
+
+
+def _publish_message(directory: Path, message_id: str, *, to: str, sender: str,
+                     subject: str, body: str, kind: str, thread: str | None,
+                     refs: list[str] | None) -> Path:
+    # Link publication is atomic and never replaces a target. On Windows, the rename fallback
+    # has the same guarantees. Only POSIX without hard links falls back to exclusive creation:
+    # it cannot overwrite, but readers may see a partial write. Invalid headers are repaired
+    # on replay under the id lock, then installed through the same no-replace path.
+    def existing_message(path: Path) -> Path | None:
+        content = path.read_text(encoding='utf-8', errors='replace')
+        header = re.match(r'\A---\r?\n([\s\S]*?)^---[ \t]*\r?$', content, re.M)
+        if header is None or not re.search(r'^subject:', header[1], re.M):
+            return None
+        stored = parse_message(path)
+        if stored.get('subject') != subject.strip():
+            append_log({'at': now_iso(), 'event': 'id-collision', 'id': message_id,
+                        'to': to, 'subject': subject, 'stored_subject': stored.get('subject')})
+        return path
+
+    # Replaying an outbox must not overwrite or resurrect an already-read message.
+    for folder in (directory, directory / 'read', directory / 'archive'):
+        existing = folder / f'{message_id}.md'
+        if existing.is_file():
+            complete = existing_message(existing)
+            if complete is not None:
+                return complete
+            existing.unlink()  # Only while holding this id's exclusive publication lock.
     head = [
         "---",
         f"id: {message_id}",
@@ -269,10 +323,56 @@ def write_message(*, to: str, sender: str, subject: str, body: str, kind: str = 
         head += [f"  - {ref}" for ref in refs]
     head.append("---")
     path = box_dir(to) / f"{message_id}.md"
-    path.write_text("\n".join(head) + "\n\n" + body.rstrip() + "\n", encoding="utf-8")
+    text = "\n".join(head) + "\n\n" + body.rstrip() + "\n"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
+                                         suffix='.tmp', delete=False) as handle:
+            tmp = Path(handle.name)
+            handle.write(text)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            complete = existing_message(path)
+            if complete is None:
+                raise OSError(f'incomplete publication at {path}; retry')
+            return complete
+        except OSError:
+            if os.name == 'nt':
+                try:
+                    os.rename(tmp, path)  # Windows refuses an existing target.
+                    tmp = None
+                except FileExistsError:
+                    complete = existing_message(path)
+                    if complete is None:
+                        raise OSError(f'incomplete publication at {path}; retry')
+                    return complete
+            else:
+                if not _exclusive_copy(path, text, existing_message):
+                    return path
+    finally:
+        if tmp is not None:
+            tmp.unlink()
     append_log({"at": now_iso(), "event": "send", "id": message_id, "from": sender, "to": to,
                 "kind": kind, "subject": subject})
     return path
+
+
+def _exclusive_copy(path: Path, text: str, existing_message) -> bool:
+    # POSIX-only last resort when hard links are unavailable.
+    try:
+        handle = path.open('x', encoding='utf-8')
+    except FileExistsError:
+        if existing_message(path) is None:
+            raise OSError(f'incomplete publication at {path}; retry')
+        return False
+    try:
+        with handle:
+            handle.write(text)
+    except BaseException:
+        path.unlink()
+        raise
+    return True
 
 
 def parse_message(path: Path) -> dict[str, Any]:
