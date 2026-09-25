@@ -1,0 +1,5 @@
+■ You’ve hit your usage limit.
+
+Token usage: total=812,344 input=790,112 output=22,232
+To continue this session, run codex resume 0199aa11-2233-4455-8899-aabbccddeeff
+PS C:\Users\boris\source\workbench\repo-issue-7> 

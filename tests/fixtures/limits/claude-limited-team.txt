@@ -1,0 +1,9 @@
+● Reading the plan.
+
+  ⎿  You've hit your team's shared budget. /model to switch models.
+
+────────────────────────────────────────────────────────────
+> 
+────────────────────────────────────────────────────────────
+  [Opus 5.5] C:\Users\boris\source\workbench\repo-issue-7 on issue-7-fix
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

@@ -616,7 +616,9 @@ class Settings(unittest.TestCase):
         self.folder = Path(__file__).resolve().parent.parent / ('test wb settings ' + uuid.uuid4().hex)
         (self.folder / '.workbench/state').mkdir(parents=True)
         self.addCleanup(shutil.rmtree, self.folder)
-        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench')}))
+        self.config = self.folder / 'config.json'
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'),
+                                                 'AGWORKBENCH_CONFIG': str(self.config)}))
 
     def printed(self, record=None):
         if record is not None:
@@ -627,13 +629,66 @@ class Settings(unittest.TestCase):
         return out.getvalue().strip()
 
     def test_defaults_and_records(self):
-        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false', self.printed())
+        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false failover=true', self.printed())
         # a #20 record has no autoMerge key: off
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only"}'))
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only", "autoMerge": true}'))
         self.assertIn('autoMerge=false', self.printed('{"tool": "codex", "autoMerge": "true"}'))
+
+    def test_failover_is_on_unless_the_config_says_false(self):
+        # #24
+        for text, shown in (('{"failover": false}', 'false'), ('{"failover": true}', 'true'), ('{}', 'true'),
+                            ('not json', 'true'), ('{"failover": 0}', 'true')):
+            with self.subTest(config=text):
+                self.config.write_text(text, encoding='utf-8')
+                self.assertTrue(self.printed().endswith('failover=' + shown))
+
+
+class Handover(unittest.TestCase):
+    """#24: the facts for a HANDOVER mail, computed from the mailbox instead of guessed."""
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb handover ' + uuid.uuid4().hex)
+        self.hub = self.folder / '.workbench'
+        (self.hub / 'state').mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.hub)}))
+        hub.reload_paths()
+
+    def mail(self, box, mid, sender, subject, folder=''):
+        directory = self.hub / 'inbox' / box / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f'{mid}.md').write_text(f'---\nid: {mid}\nfrom: {sender}\nto: {box}\nsubject: {subject}\n---\nbody\n',
+                                             encoding='utf-8')
+
+    def test_the_newest_unanswered_request_is_open(self):
+        self.mail('codex', '20260925T080000Z-claude-0001', 'claude', 'plan v1', folder='read')
+        self.mail('claude', '20260925T081000Z-codex-0002', 'codex', 're: plan v1', folder='read')
+        self.mail('codex', '20260925T082000Z-claude-0003', 'claude', 'IMPLEMENT plan v2', folder='archive')
+        self.mail('codex', '20260925T083000Z-human-0004', 'human', 'not from the planner')
+        pending, recent = wb.open_request()
+        self.assertEqual('20260925T082000Z-claude-0003', pending['id'])
+        self.assertEqual(['plan v1', 'IMPLEMENT plan v2'], [m['subject'] for m in recent])
+
+    def test_an_answered_request_is_not_open(self):
+        self.mail('codex', '20260925T080000Z-claude-0001', 'claude', 'FIX r1', folder='read')
+        self.mail('claude', '20260925T081000Z-codex-0002', 'codex', 'FIXED abc')
+        self.assertIsNone(wb.open_request()[0])
+
+    def test_the_command_prints_branch_request_and_status(self):
+        self.mail('codex', '20260925T080000Z-claude-0001', 'claude', 'FIX r1')
+        runs = [subprocess.CompletedProcess([], 0, 'issue-24-x\n', ''), subprocess.CompletedProcess([], 0, ' M lib/wb.py\n', '')]
+        out = io.StringIO()
+        with patch.object(wb.subprocess, 'run', side_effect=runs), contextlib.redirect_stdout(out), \
+                patch.object(sys, 'argv', ['wb.py', 'handover']):
+            self.assertEqual(0, wb.main())
+        text = out.getvalue()
+        self.assertIn('branch: issue-24-x', text)
+        self.assertIn('open request: 20260925T080000Z-claude-0001 "FIX r1" (no reply yet)', text)
+        self.assertIn('   M lib/wb.py', text)
 
 
 class AutoMergeProse(unittest.TestCase):
@@ -667,6 +722,32 @@ class AutoMergeProse(unittest.TestCase):
     def test_implementer_never_merges(self):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/workbench-implementer.md').read_text(encoding='utf-8')
         self.assertIn("is the planner's act, never yours", text)
+
+
+class UsageLimitProse(unittest.TestCase):
+    """#24: what the planner does on a usage-limit mail, and what a new implementer does on HANDOVER."""
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def text(self, path):
+        return ' '.join((self.ROOT / path).read_text(encoding='utf-8').split())
+
+    def test_planner_section(self):
+        text = self.text('claude/commands/start-github-issue.md')
+        section = text.split("## Usage limits")[1].split('## Adopted session')[0]
+        for needle in ['usage limit: <box> (<tool>) <kind>', 'failover=true', "the agent's own limit message",
+                       'github-workbench <owner/repo#N> -Failover', 'timeout: 600000', 'wb.py" handover',
+                       'subject `HANDOVER`', 'uncommitted changes are the previous implementer',
+                       'refused** (exit 2)', 'status blocked --sound', '-Implementer <tool>',
+                       'never answer it', 'failover=false', 'only a record', 'never types into the limited agent']:
+            self.assertIn(needle, section)
+
+    def test_both_implementers_know_handover(self):
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+            with self.subTest(path=path):
+                text = self.text(path)
+                self.assertIn('## HANDOVER - you replace another implementer mid-loop', text)
+                self.assertIn('Run `git status`', text)
+                self.assertIn('Continue the phase the mail names', text)
 
 
 if __name__ == '__main__':

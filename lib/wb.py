@@ -5,7 +5,8 @@
   wb.py human-review --base origin/main                          # revdiff, selected, for the human
   wb.py status blocked --sound                                    # this pane's sidebar status
   wb.py wait-mail                                                 # background inbox waiter
-  wb.py settings                                                  # implementer, revmux profile, auto-merge
+  wb.py settings                                                  # implementer, revmux profile, auto-merge, failover
+  wb.py handover                                                  # open request, branch, git status (#24)
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
 
 Why a helper: Claude's shell is Git Bash, where $PWD is a POSIX path (/c/Users/...) that PowerShell
@@ -132,10 +133,68 @@ def checkout_settings(root: Path) -> dict:
     return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True}
 
 
+def failover_setting() -> bool:
+    """`failover` from ~/.agworkbench.json (#24): on unless the human set it to false."""
+    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return True
+    return not (isinstance(config, dict) and config.get("failover") is False)
+
+
 def cmd_settings(args: argparse.Namespace) -> int:
     settings = checkout_settings(checkout())
     print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
-          f"autoMerge={'true' if settings['autoMerge'] else 'false'}")
+          f"autoMerge={'true' if settings['autoMerge'] else 'false'} "
+          f"failover={'true' if failover_setting() else 'false'}")
+    return 0
+
+
+# --- handover (#24) --------------------------------------------------------------------------
+
+def _mail(box: str, sender: str) -> list[dict]:
+    """Every message in a box from one sender - unread, read and archived - oldest first."""
+    found = []
+    base = hub.box_dir(box)
+    for folder in (base, base / "read", base / "archive"):
+        for path in folder.glob("*.md") if folder.is_dir() else []:
+            try:
+                message = hub.parse_message(path)
+            except (OSError, ValueError):
+                continue
+            if message.get("from") == sender:
+                found.append(message)
+    return sorted(found, key=lambda message: message.get("id", ""))
+
+
+def open_request() -> tuple[dict | None, list[dict]]:
+    """The newest planner -> implementer message with no later implementer -> planner reply.
+    Message ids start with a UTC timestamp, so they order in time."""
+    sent = _mail("codex", "claude")
+    replies = _mail("claude", "codex")
+    last_reply = replies[-1].get("id", "") if replies else ""
+    pending = sent[-1] if sent and sent[-1].get("id", "") > last_reply else None
+    return pending, sent[-3:]
+
+
+def cmd_handover(args: argparse.Namespace) -> int:
+    root = checkout()
+    hub.reload_paths()
+    pending, recent = open_request()
+    branch = subprocess.run(["git", "-C", str(root), "branch", "--show-current"],
+                            capture_output=True, text=True).stdout.strip()
+    status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True, text=True).stdout
+    print(f"branch: {branch or '?'}")
+    if pending:
+        print(f"open request: {pending.get('id')} \"{pending.get('subject', '')}\" (no reply yet)")
+    else:
+        print("open request: none (the last message to the implementer was answered)")
+    print("last messages to the implementer:")
+    for message in recent:
+        print(f"  {message.get('id')} {message.get('subject', '')}")
+    print("git status --short:")
+    print("\n".join("  " + line for line in status.splitlines()) or "  (clean)")
     return 0
 
 
@@ -377,8 +436,10 @@ def main() -> int:
     p.add_argument("--scope", required=True, help="scope file, relative to the clone or absolute")
     p.add_argument("--profile", help="revmux profile (default: the one the launcher saved for this checkout)")
     p.set_defaults(func=cmd_revmux)
-    p = subs.add_parser("settings", help="print this checkout's settings record (implementer, revmux profile, auto-merge)")
+    p = subs.add_parser("settings", help="print this checkout's settings (implementer, revmux profile, auto-merge, failover)")
     p.set_defaults(func=cmd_settings)
+    p = subs.add_parser("handover", help="facts for a HANDOVER mail to a new implementer (#24)")
+    p.set_defaults(func=cmd_handover)
     p = subs.add_parser("merge-check", help="read-only: exit 0 and print ok only when the PR may be auto-merged")
     p.add_argument("--pr", required=True, help="PR number or URL")
     p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")

@@ -1,0 +1,9 @@
+● The message reads:
+
+  "You've hit your session limit · resets 3pm"
+
+────────────────────────────────────────────────────────────
+> 
+────────────────────────────────────────────────────────────
+  [Opus 5.5] C:\Users\boris\source\workbench\repo-issue-7 on issue-7-fix
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

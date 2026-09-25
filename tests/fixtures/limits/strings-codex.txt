@@ -1,0 +1,14 @@
+ for lower credit usage?
+"You’ve hit your usage limit for �
+Automatically switched to due to usage limits.Automatically switched back to because ordinary usage is available again.
+Heads up, you have less than � 
+Keep current modelKeep current model (never show again)Hide future rate limit reminders about switching models.Approaching rate limits
+SYou’ve hit your usage limit. To get more access now, send a request to your admin�
+You're out of credits. Your workspace is out of credits. Add credits to continue using Codex.Usage limit reached. You've reached your usage limit. Increase your limits to continue using codex.Goal budget reached - the turn was stopped.Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.Codex is currently experiencing high load
+You've reached your workspace credit limitYour workspace is out of credits. Ask your workspace owner to add more. Notify owner?Usage limit reachedRequest a limit increase from your owner to continue using codex. Request increase?
+Your workspace is out of credits. Add credits to continue.Your workspace is out of credits. Ask your workspace owner to refill in order to continue.You hit your spend cap set in your workspace. Increase your spend cap to continue.You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.
+You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits�
+You’ve hit your usage limit. �
+You’ve hit your usage limit.�
+fYou’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits�
+jYou’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus),�

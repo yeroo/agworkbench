@@ -25,6 +25,7 @@
   github-workbench -Version              # report the installed toolchain
   github-workbench 7 -Implementer claude  # Claude, not Codex, in the right pane (e.g. Codex out of quota)
   github-workbench 7 -AutoMerge           # the planner merges its own PR when every condition holds
+  github-workbench 7 -Failover            # the planner, on a usage-limit mail: switch the implementer tool
 .EXAMPLE
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
@@ -48,6 +49,7 @@ param(
     [string] $Implementer,
     [switch] $AutoMerge,
     [switch] $NoAutoMerge,
+    [switch] $Failover,
     [switch] $Version
 )
 
@@ -69,6 +71,10 @@ if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('c
     exit 2
 }
 
+if ($Failover -and ($Implementer -or $PSBoundParameters.ContainsKey('Queue') -or $NewSession -or $QueueMember)) {
+    Write-Host '-Failover picks the other tool itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
+    exit 2
+}
 if ($AutoMerge -and $NoAutoMerge) {
     Write-Host '-AutoMerge and -NoAutoMerge cannot be combined.' -ForegroundColor Yellow
     exit 2
@@ -104,7 +110,7 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
@@ -163,7 +169,7 @@ if ($QueueMember) {
 if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
-        -Implementer $Implementer -AutoMerge $autoMergeChoice
+        -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef

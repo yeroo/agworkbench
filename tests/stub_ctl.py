@@ -105,6 +105,8 @@ elif args[:2] == ["session", "type"]:
         if scenario.get("stop_file") and Path(scenario["stop_file"]).exists():
             finish("relay stop file must be cleared before restarting", 98, True)
         text = "relay up:"
+    elif (option("--select") if '--select' in args else args[2]).startswith("Clear-Host"):
+        text = "PS C:\\checkout> "          # #24: the failover clears the proven shell
     elif "pane-claude.ps1" in (option("--select") if '--select' in args else args[2]):
         text = "Claude running\nbypass permissions on"
     else:
