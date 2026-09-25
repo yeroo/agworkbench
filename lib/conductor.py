@@ -333,6 +333,28 @@ def checkout_root(config):
     return Path(settings.get('checkoutRoot', Path.home() / 'source/workbench')).expanduser().resolve()
 
 
+GIB = 1024 ** 3                 # minFreeGB counts what Explorer labels "GB" (#41)
+
+
+def min_free_gb(config):
+    """`minFreeGB` from the config (#41): default 20, 0 turns the guard off. Anything else is an error."""
+    settings = read_json(config) if Path(config).exists() else {}
+    value = settings.get('minFreeGB', 20)
+    if value is None:
+        return 20
+    if type(value) not in (int, float) or value < 0:
+        raise QueueError(f'minFreeGB in {config} must be a number >= 0 (got {value!r})')
+    return value
+
+
+def free_bytes(path):
+    """(free bytes, drive) for the drive holding `path`, from its nearest existing ancestor."""
+    path = Path(path)
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return shutil.disk_usage(path).free, path.anchor or str(path)
+
+
 class Store:
     def __init__(self, path):
         self.path = Path(path).resolve()
@@ -359,6 +381,8 @@ class Store:
                 raise ValueError('invalid autoMerge')
             if data.get('triage') is not None and type(data['triage']) is not bool:
                 raise ValueError('invalid triage')
+            if data.get('diskPaused') is not None and not isinstance(data['diskPaused'], str):
+                raise ValueError('invalid diskPaused')
             if (not isinstance(data['config'], str) or not Path(data['config']).is_absolute() or
                     type(data['yes']) is not bool or not isinstance(data['members'], list) or
                     not valid_watch(data)):
@@ -652,8 +676,9 @@ def summary(data):
 
 
 class Worker:
-    def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None):
+    def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None, disk_free=None):
         self.store, self.token, self.gh, self.clock = store, token, gh, clock
+        self.disk_free = disk_free or free_bytes
         self.spawn = spawn or self.spawn_launcher
         self.spawn_triage = spawn_triage or self.spawn_triage_run
         self.jobs = {}
@@ -930,6 +955,7 @@ class Worker:
         if not reasons:
             if attempt.autonomous():
                 attempt.close_issue_session()
+                attempt.start_cleanup(pr)
             else:
                 attempt.log('NOT closing: autonomy was turned off')
             self.end_close(m, pr, hub_dir, stuck=None)
@@ -947,6 +973,20 @@ class Worker:
             atomic_json(path, state)
         self.closes.pop(m['number'], None)
         self.mark(m['number'], closePending=None, closeStuck=stuck)
+
+    def disk_pause(self, config):
+        """Why admissions are paused for disk space (#41), or None. Low disk must never fail members:
+        a clone that cannot be written fails, so none is started until space returns."""
+        try:
+            minimum = min_free_gb(config)
+            if not minimum:
+                return None
+            free, drive = self.disk_free(checkout_root(config))
+        except (OSError, ValueError) as err:
+            return f'disk check failed: {err}'
+        if free < minimum * GIB:
+            return f'low disk: {free / GIB:.1f} GB free < {minimum:g} GB on {drive}'
+        return None
 
     def tick(self):
         self.poll_jobs()
@@ -974,11 +1014,20 @@ class Worker:
         self.step_triage()
         self.close_backstop()
         launches = []
+        disk = self.disk_pause(self.store.load()['config'])
         with self.store.transaction() as data:
+            # Notified on pause and on resume; the free-space figure in the text is refreshed silently.
+            disk_changed = bool(data.get('diskPaused')) != bool(disk)
+            if disk:
+                data['diskPaused'] = disk
+            else:
+                data.pop('diskPaused', None)
             count = sum(m['state'] in {'launching', 'active'} and not m['slotReleased'] for m in data['members'])
             # While triage is paused (a usage limit, or facts it could not read) nobody waits for it.
             paused = self.clock() < self.triage_paused_until
             for m in sorted((m for m in data['members'] if m['state'] == 'pending'), key=admission_key):
+                if disk:
+                    break                  # low disk: nothing is admitted, and every member stays pending
                 if count >= data['parallel'] or (awaits_triage(data, m) and not paused):
                     break                  # strictly in order: nothing behind a member still being triaged
                 if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
@@ -1003,6 +1052,11 @@ class Worker:
                 self.jobs[m['number']] = self.spawn(settings, m)
             except (OSError, ValueError) as err:
                 member_result(self.store.path, m['number'], m['attempt'], m['token'], dict(result='failed', detail=str(err)))
+        if disk_changed:
+            message = f'queue paused: {disk}' if disk else 'queue resumed: disk space is back'
+            print(message, flush=True)
+            self.notify(message)
+            self.status('blocked' if disk else 'active')
         current = self.store.load()
         for m in current['members']:
             display = (m['state'], m.get('prState'), m.get('reason'))

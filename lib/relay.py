@@ -588,6 +588,8 @@ class Relay:
             return
         try:
             close.close_issue_session()
+            # Before this relay's own session goes (that ends this process), and detached from it (#41).
+            close.start_cleanup(number)
             self.close_own_session(close, number, left_open)
         except (agw.CtlError, OSError) as err:
             close.log(f"close failed: {err}")

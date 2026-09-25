@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import relay  # noqa: E402
 import closer  # noqa: E402
+import cleanup  # noqa: E402
 import agw
 import hub
 import peerchat
@@ -2104,9 +2105,15 @@ class AutonomousClose(unittest.TestCase):
         self.notify = self.enterContext(patch.object(agw, 'notify'))
         self.status = self.enterContext(patch.object(agw, 'set_status'))
         self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('unexpected terminal request')))
+        # #41: the checkout cleanup is started, never run, here.
+        self.spawn = self.enterContext(patch.object(cleanup, 'start_after_close', side_effect=self.spawned))
         # #33: the finished revmux helper left its completion marker; its direct-mode pane has ended
         # (no foreground shell) and shows exactly those rows.
         self.marker(self.REVMUX, ['revmux exit 1 (findings reported).'])
+
+    def spawned(self, checkout, repo, issue, pr, mode):
+        self.actions.append(('cleanup', (Path(checkout), repo, issue, pr, mode)))
+        return 4242, 'wmi'
 
     def marker(self, pane, rows):
         directory = self.state / 'helpers'
@@ -2345,6 +2352,67 @@ class AutonomousClose(unittest.TestCase):
         message = self.notify.call_args.args[1]
         self.assertTrue(message.startswith('autonomous close stopped:'), message)
         self.assertNotIn('workbench mail for', message)
+
+
+    # --- #41: the checkout cleanup after the close -------------------------------------------------
+    def test_the_cleanup_starts_after_the_issue_session_and_before_the_relay_closes(self):
+        self.r.close_after_merge(7)
+        order = [action for action in self.actions if action[0] in ('close', 'cleanup')]
+        self.assertEqual([('close', self.REVMUX), ('close', self.PLANNER),
+                          ('cleanup', (self.folder, 'o/repo', '7', 7, 'merged')), ('close', self.RELAY)], order)
+        self.assertIn('checkout cleanup (merged) started as pid 4242 (wmi)', self.log())
+
+    def test_the_cleanup_mode_comes_from_the_launch_record(self):
+        for value, expected in (('merged', 'merged'), ('build', 'build'), ('off', None), ('nonsense', None), (3, None)):
+            with self.subTest(value=value):
+                self.actions.clear()
+                (self.state / 'relay-close.log').unlink(missing_ok=True)
+                self.write('implementer.json', {'tool': 'claude', 'autonomous': True, 'cleanup': value})
+                self.r.close_after_merge(7)
+                started = [target for action, target in self.actions if action == 'cleanup']
+                self.assertEqual([] if expected is None else [(self.folder, 'o/repo', '7', 7, expected)], started)
+                self.assertIn(self.RELAY, self.closes())                     # the close itself is unchanged
+                if value not in ('merged', 'build', 'off'):
+                    self.assertIn('is not merged, build or off: treated as off', self.log())
+
+    def test_the_cleanup_starts_even_when_the_relay_leaves_its_own_session_open(self):
+        self.tree['workspaces'][0]['sessions'][3]['name'] = 'my shell'
+        self.r.close_after_merge(7)
+        self.assertIn(('cleanup', (self.folder, 'o/repo', '7', 7, 'merged')), self.actions)
+        self.assertNotIn(self.RELAY, self.closes())
+
+    def test_no_cleanup_when_the_close_does_not_happen(self):
+        def autonomy_off():
+            self.write('implementer.json', {'tool': 'claude', 'autonomous': False})
+
+        def not_done():
+            (self.state / 'loop-done.json').unlink()
+
+        def dry_run():
+            self.r.dry_run = True
+
+        def issue_close_fails():
+            real = agw.close_session.side_effect
+
+            def close(sid):
+                if sid == self.PLANNER:
+                    raise agw.CtlError('pipe gone')
+                real(sid)
+            agw.close_session.side_effect = close
+        for name, arrange in (('autonomy off', autonomy_off), ('refused on timeout', not_done), ('dry run', dry_run),
+                              ('issue session close failed', issue_close_fails)):
+            with self.subTest(name):
+                self.setUp()
+                arrange()
+                self.r.close_after_merge(7)
+                self.assertEqual([], [a for a in self.actions if a[0] == 'cleanup'])
+                self.spawn.assert_not_called()
+
+    def test_a_cleanup_that_cannot_start_does_not_stop_the_close(self):
+        self.spawn.side_effect = OSError('no python')
+        self.r.close_after_merge(7)
+        self.assertIn(self.RELAY, self.closes())
+        self.assertIn('could not start the checkout cleanup: no python', self.log())
 
 
 class HelperMarkers(unittest.TestCase):

@@ -24,6 +24,7 @@ delivering mail, and the conductor can advance one check per tick without blocki
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -85,6 +86,39 @@ class Closer:
         except (OSError, ValueError):
             return False
         return isinstance(settings, dict) and settings.get('autonomous') is True
+
+    def cleanup_mode(self) -> str:
+        """`cleanup` as the launcher recorded it from the config (#41): a missing key is the default,
+        `merged`; a value that is not one of the modes is `off` - never delete on a value we cannot read."""
+        try:
+            settings = json.loads((self.hub_dir / 'state' / 'implementer.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return 'off'
+        value = settings.get('cleanup', 'merged') if isinstance(settings, dict) else None
+        if value not in ('merged', 'build', 'off'):
+            self.log(f'cleanup {value!r} in state/implementer.json is not merged, build or off: treated as off')
+            return 'off'
+        return value
+
+    def start_cleanup(self, pr: int) -> None:
+        """After the issue session is closed: start the detached after-close (#41), which waits for
+        every `#N` session to go and then deletes the checkout if it is safe. Never raises."""
+        mode = self.cleanup_mode()
+        if mode == 'off' or not self.issue:
+            self.log(f'checkout cleanup: {mode}; the checkout stays')
+            return
+        if self.dry_run:
+            self.log(f'[dry-run] would start the checkout cleanup ({mode})')
+            return
+        import cleanup
+        try:
+            pid, how = cleanup.start_after_close(self.hub_dir.parent, self.repo, self.issue, pr, mode)
+        except (OSError, ValueError) as err:
+            self.log(f'could not start the checkout cleanup: {err}')
+            return
+        self.log(f'checkout cleanup ({mode}) started as pid {pid} ({how})'
+                 + (' - it may end with this session: the job refused breakaway and WMI failed' if how == 'detached' and os.name == 'nt' else '')
+                 + f'; its log: {self.hub_dir.parent.parent / cleanup.LOG_NAME}')
 
     def timed_out(self) -> bool:
         return self.clock() >= self.deadline
