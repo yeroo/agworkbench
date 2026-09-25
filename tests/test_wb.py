@@ -629,11 +629,11 @@ class Settings(unittest.TestCase):
         return out.getvalue().strip()
 
     def test_defaults_and_records(self):
-        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false failover=true', self.printed())
+        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false autonomous=false failover=true', self.printed())
         # a #20 record has no autoMerge key: off
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false failover=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false autonomous=false failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only"}'))
-        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true failover=true',
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true autonomous=false failover=true',
                          self.printed('{"tool": "claude", "revmuxProfile": "claude-only", "autoMerge": true}'))
         self.assertIn('autoMerge=false', self.printed('{"tool": "codex", "autoMerge": "true"}'))
 
@@ -761,6 +761,241 @@ class UsageLimitProse(unittest.TestCase):
                 self.assertIn('## HANDOVER - you replace another implementer mid-loop', text)
                 self.assertIn('Run `git status`', text)
                 self.assertIn('Continue the phase the mail names', text)
+
+
+class FakeGh:
+    """gh at the subprocess boundary: issue view (labels), label create, issue list, issue create."""
+
+    def __init__(self, source_labels=(), open_issues=(), label_fails=False, create_fails=()):
+        self.source_labels = list(source_labels)
+        self.open_issues = list(open_issues)
+        self.label_fails = label_fails
+        self.create_fails = set(create_fails)
+        self.calls = []
+        self.bodies = {}
+        self.next = 100
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        args = argv[1:]
+        done = lambda out='', code=0, err='': subprocess.CompletedProcess(argv, code, out, err)
+        if args[:2] == ['issue', 'view']:
+            return done(json.dumps({'labels': [{'name': n} for n in self.source_labels]}))
+        if args[:2] == ['label', 'create']:
+            return done(code=1, err='HTTP 403: Resource not accessible') if self.label_fails else done()
+        if args[:2] == ['issue', 'list']:
+            return done(json.dumps(self.open_issues))
+        if args[:2] == ['issue', 'create']:
+            title = args[args.index('--title') + 1]
+            if title in self.create_fails:
+                return done(code=1, err='HTTP 502')
+            self.bodies[title] = Path(args[args.index('--body-file') + 1]).read_text(encoding='utf-8')
+            self.next += 1
+            return done(f'https://github.com/o/r/issues/{self.next}\n')
+        raise AssertionError(argv)
+
+
+class FollowUps(unittest.TestCase):
+    """#27: follow-ups are recorded, deduped and filed before the merge; merge-check gates on them."""
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb follow ' + uuid.uuid4().hex)
+        self.state = self.folder / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'),
+                                                 'AGWORKBENCH_CONFIG': str(self.folder / 'none.json')}))
+        hub.reload_paths()
+        self.out, self.err = io.StringIO(), io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.out))
+        self.enterContext(contextlib.redirect_stderr(self.err))
+
+    def run_wb(self, *argv, gh=None):
+        with patch.object(sys, 'argv', ['wb.py', *argv]), \
+                patch.object(wb.subprocess, 'run', side_effect=gh or AssertionError('gh called')):
+            return wb.main()
+
+    def add(self, key, severity='minor', disputed=False, title=None):
+        body = self.folder / f'{key}.md'
+        body.write_text(f'evidence for {key}: lib/x.py:12 fails', encoding='utf-8')
+        argv = ['follow-up', 'add', '--key', key, '--title', title or f'Fix {key}', '--body-file', str(body),
+                '--severity', severity, '--origin', 'review r2']
+        self.assertEqual(0, self.run_wb(*argv + (['--disputed'] if disputed else [])))
+
+    def items(self):
+        return json.loads((self.state / 'follow-ups.json').read_text(encoding='utf-8'))
+
+    def settings(self, autonomous):
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'claude', 'autonomous': autonomous}),
+                                                    encoding='utf-8')
+
+    def test_add_records_and_is_idempotent_on_key(self):
+        self.add('r2-m1')
+        self.add('r2-m1', severity='major')
+        self.assertEqual([('r2-m1', 'major', 'review r2', False)],
+                         [(i['key'], i['severity'], i['origin'], i['disputed']) for i in self.items()])
+
+    def test_file_creates_issues_with_markers_label_and_writes_urls_back(self):
+        self.add('r2-m1')
+        self.add('plan-queue', severity='plan')
+        gh = FakeGh()
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', '--pr', '30', gh=gh))
+        urls = [i['url'] for i in self.items()]
+        self.assertEqual(['https://github.com/o/r/issues/101', 'https://github.com/o/r/issues/102'], urls)
+        body = gh.bodies['Fix r2-m1']
+        for needle in ('evidence for r2-m1', 'Source: #27, PR #30', '<!-- agworkbench:follow-up source=#27 -->',
+                       wb.PLANNER_MARKER):
+            self.assertIn(needle, body)
+        creates = [c for c in gh.calls if c[1:3] == ['issue', 'create']]
+        self.assertTrue(all(c[c.index('--label') + 1] == 'follow-up' for c in creates))
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=FakeGh()))   # nothing left
+        self.assertIn('no unfiled follow-ups', self.out.getvalue())
+
+    def test_an_open_issue_with_exactly_the_title_is_reused(self):
+        self.add('r2-m1', title='Fix the relay')
+        gh = FakeGh(open_issues=[{'title': 'Fix the relay drain', 'url': 'u-fuzzy'},
+                                 {'title': 'Fix the relay', 'url': 'https://github.com/o/r/issues/9'}])
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+        self.assertEqual('https://github.com/o/r/issues/9', self.items()[0]['url'])
+        self.assertFalse([c for c in gh.calls if c[1:3] == ['issue', 'create']])
+
+    def test_a_follow_up_of_a_follow_up_gets_the_nested_label(self):
+        self.add('r2-m1')
+        gh = FakeGh(source_labels=['follow-up'])
+        self.run_wb('follow-up', 'file', '--source', '31', gh=gh)
+        create = next(c for c in gh.calls if c[1:3] == ['issue', 'create'])
+        self.assertEqual('follow-up-nested', create[create.index('--label') + 1])
+
+    def test_a_label_that_cannot_be_created_files_without_it(self):
+        self.add('r2-m1')
+        gh = FakeGh(label_fails=True)
+        self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+        create = next(c for c in gh.calls if c[1:3] == ['issue', 'create'])
+        self.assertNotIn('--label', create)
+        self.assertIn('filing without it', self.out.getvalue())
+
+    def test_a_failed_create_keeps_the_others_and_exits_1(self):
+        self.add('a')
+        self.add('b')
+        gh = FakeGh(create_fails={'Fix a'})
+        self.assertEqual(1, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+        self.assertEqual([None, 'https://github.com/o/r/issues/101'], [i.get('url') for i in self.items()])
+
+    def test_loop_done_requires_every_follow_up_filed(self):
+        self.add('a')
+        self.assertEqual(1, self.run_wb('loop-state', 'done', '--pr', '30', '--sha', 'abc'))
+        self.assertFalse((self.state / 'loop-done.json').exists())
+        self.run_wb('follow-up', 'file', '--source', '27', gh=FakeGh())
+        self.assertEqual(0, self.run_wb('loop-state', 'done', '--pr', 'https://github.com/o/r/pull/30', '--sha', 'abc'))
+        record = json.loads((self.state / 'loop-done.json').read_text(encoding='utf-8'))
+        self.assertEqual((30, 'abc', ['https://github.com/o/r/issues/101']), (record['pr'], record['sha'], record['followUps']))
+        self.assertEqual(2, self.run_wb('loop-state', 'done'))
+
+    def test_settings_prints_autonomous(self):
+        self.settings(True)
+        self.run_wb('settings')
+        self.assertIn('autonomous=true', self.out.getvalue())
+
+    # --- merge-check's autonomous conditions ------------------------------------------------------
+
+    def test_unfiled_follow_ups_and_severe_disputes_block_only_when_autonomous(self):
+        self.add('r2-m1')
+        self.add('r2-M1', severity='major', disputed=True)
+        self.add('r2-m2', severity='minor', disputed=True)
+        self.settings(False)
+        self.assertEqual([], wb.check_follow_ups(self.folder))      # #23's gate is unchanged
+        self.settings(True)
+        lines = wb.check_follow_ups(self.folder)
+        self.assertEqual(["review: the major finding 'r2-M1' ended disputed; an autonomous merge stops here and the human decides"],
+                         [line for line in lines if line.startswith('review:')])
+        self.assertEqual(3, len([line for line in lines if line.startswith('follow-up:')]))
+        items = self.items()
+        for item in items:
+            item['url'] = 'https://github.com/o/r/issues/1'
+        (self.state / 'follow-ups.json').write_text(json.dumps(items), encoding='utf-8')
+        self.assertEqual(['review:'], [line.split()[0] for line in wb.check_follow_ups(self.folder)])
+
+    def test_any_deferred_major_review_finding_blocks_but_plan_items_do_not(self):
+        # r18 M4/m1: only Minor/Immaterial findings (and plan items) may be deferred when autonomous.
+        self.settings(True)
+        items = [{'key': 'r2-M1', 'title': 'a', 'severity': 'major', 'origin': 'review r2', 'disputed': False, 'url': 'u'},
+                 {'key': 'r2-B1', 'title': 'b', 'severity': 'blocker', 'origin': 'review r2', 'disputed': True, 'url': 'u'},
+                 {'key': 'plan-x', 'title': 'c', 'severity': 'plan', 'origin': 'plan', 'disputed': False, 'url': 'u'},
+                 {'key': 'r2-m1', 'title': 'd', 'severity': 'minor', 'origin': 'review r2', 'disputed': True, 'url': 'u'}]
+        (self.state / 'follow-ups.json').write_text(json.dumps(items), encoding='utf-8')
+        self.assertEqual(["review: the major finding 'r2-M1' is deferred; an autonomous merge stops here and the human decides",
+                          "review: the blocker finding 'r2-B1' ended disputed; an autonomous merge stops here and the human decides"],
+                         wb.check_follow_ups(self.folder))
+
+    def test_re_adding_a_filed_key_updates_what_merge_check_gates_on(self):
+        # r18 m8
+        self.settings(True)
+        self.add('r2-m1')
+        self.run_wb('follow-up', 'file', '--source', '27', gh=FakeGh())
+        self.add('r2-m1', severity='major', disputed=True)
+        item = self.items()[0]
+        self.assertEqual(('major', True, 'https://github.com/o/r/issues/101'), (item['severity'], item['disputed'], item['url']))
+        self.assertIn('severity/origin/disputed updated', self.out.getvalue())
+        self.assertTrue(any(line.startswith('review:') for line in wb.check_follow_ups(self.folder)))
+
+    def test_titles_are_searched_as_a_quoted_phrase_and_matched_exactly(self):
+        # r18 m9
+        for title in ('Fix -Failover under PowerShell 5.1', 'relay: close waits', 'Follow up #12', 'The "hold" rule'):
+            with self.subTest(title=title):
+                (self.state / 'follow-ups.json').unlink(missing_ok=True)
+                self.add('k', title=title)
+                gh = FakeGh(open_issues=[{'title': title, 'url': 'https://github.com/o/r/issues/5'}])
+                self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+                search = next(c for c in gh.calls if c[1:3] == ['issue', 'list'])
+                query = search[search.index('--search') + 1]
+                self.assertTrue(query.startswith('"') and query.endswith('" in:title'), query)
+                self.assertNotIn('"', query[1:-len('" in:title')])      # an embedded quote cannot end the phrase
+                self.assertEqual('https://github.com/o/r/issues/5', self.items()[0]['url'])
+
+    def test_a_nested_source_also_nests(self):
+        # r18 m4
+        self.add('r2-m1')
+        gh = FakeGh(source_labels=['follow-up-nested'])
+        self.run_wb('follow-up', 'file', '--source', '31', gh=gh)
+        create = next(c for c in gh.calls if c[1:3] == ['issue', 'create'])
+        self.assertEqual('follow-up-nested', create[create.index('--label') + 1])
+
+    def test_merge_failures_include_the_follow_up_gate(self):
+        self.settings(True)
+        self.add('r2-m1')
+        (self.state / 'relay.json').write_text(json.dumps({'seen_open': [7]}), encoding='utf-8')
+        lines = wb.merge_failures(clean_pr(), [], HEAD, self.folder)
+        self.assertEqual(["follow-up: 'r2-m1' is not filed yet - run wb.py follow-up file, then check again"], lines)
+
+
+class AutonomyProse(unittest.TestCase):
+    """#27: what the planner does when autonomous."""
+
+    def test_planner_autonomy_section_and_gates(self):
+        text = ' '.join((Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md')
+                        .read_text(encoding='utf-8').split())
+        section = text.split('## Full autonomy')[1].split('## When the implementer is Claude')[0]
+        for needle in ['autonomous=true', 'wb.py" follow-up add --key', '--disputed', 'follow-up file --source <N> --pr <P>',
+                       'filed before the merge', 'never lower it below revmux', 'A Major or blocker **never** may, disputed or not',
+                       'merge comment** lists every follow-up URL', 'loop-state done --pr <P> --sha <merged sha>',
+                       'never closes on a timeout', 'brakes are unchanged']:
+            self.assertIn(needle, section)
+        self.assertIn('deferred **with a filed follow-up issue**; a Major or blocker never may, disputed or not',
+                      text.split('## Phase 6')[1])
+        self.assertIn('loop-state done --pr <P> --sha <sha>` as the very last step', text.split('## Phase 7')[1])
+
+
+class LoopEndProse(unittest.TestCase):
+    """#27 r18b: an implementer does not answer the end of the loop, so no unread reply blocks the close."""
+
+    def test_both_implementers_stop_without_replying(self):
+        root = Path(__file__).resolve().parent.parent
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+            with self.subTest(path=path):
+                text = ' '.join((root / path).read_text(encoding='utf-8').split())
+                self.assertIn('When mail says the loop is complete, or the relay reports the PR MERGED or CLOSED', text)
+                self.assertIn('do not reply', text)
 
 
 if __name__ == '__main__':

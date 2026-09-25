@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Three jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Four jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -22,6 +22,13 @@ Three jobs, one loop, one process per issue, running in its own visible agwinter
    notification; mail to a limited implementer is held until the planner fails it over. Checks
    stop once the PR is finished.
 
+4. **The close after merge (#27).** On an autonomous checkout, after a MERGED PR's final notices
+   are delivered, it closes the issue's helper sessions that are back at a shell, then the issue
+   session, then its own - only when the planner has recorded `loop-state done`, no mail is unread
+   and both agent panes are provably idle, while it keeps delivering mail. Every step goes to
+   `.workbench/state/relay-close.log`; a stop request, a human's mail or autonomy turned off stops it,
+   and it never closes on a timeout. A pending close survives a restart (`close_pending`).
+
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
 none of which can push to it.
@@ -38,6 +45,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -60,6 +68,8 @@ AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
+CLOSE_WAIT = 600.0       # how long the autonomous close waits for the loop to be provably over (#27)
+CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be closed
 
 
 @dataclass(frozen=True)
@@ -332,6 +342,7 @@ class Relay:
         if (saved_pr and saved_pr.get('state') in ('MERGED', 'CLOSED')
                 and not self.state.get('outbox')
                 and not self.pending_terminal_mail() and not self.state.get('reset_pending')):
+            # A restart after a complete drain: retire() records the pending close (#27) for run().
             self.retire(saved_pr['number'])
 
     def _load(self) -> dict[str, Any]:
@@ -505,6 +516,191 @@ class Relay:
         except (agw.CtlError, OSError) as err:
             self.log(f"could not notify {peer.box}: {err}")
 
+    # the autonomous close (#27) ------------------------------------------------------------------
+    def close_log(self, text: str) -> None:
+        """Every close step goes to state/relay-close.log BEFORE it is acted on: closing this
+        relay's own session destroys its console."""
+        self.log(f"close: {text}")
+        if self.dry_run:
+            return
+        path = self.hub_dir / 'state' / 'relay-close.log'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('a', encoding='utf-8') as handle:
+            handle.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {text}\n")
+
+    def close_blockers(self, number: int, settled: dict[str, tuple[str, float]]) -> list[str]:
+        """What still stops the close. Empty only when the loop is provably over."""
+        import agw
+        import peerchat
+        reasons = []
+        try:
+            done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            done = {}
+        if not isinstance(done, dict) or done.get('pr') != number:
+            reasons.append(f'the planner has not recorded `wb.py loop-state done --pr {number}`')
+        for path in self.hub.unread('claude'):
+            # Anything the planner has not read - above all a human's "don't close" - stops the close.
+            reasons.append(f'the planner has unread mail {path.stem}')
+        for path in self.hub.unread('codex'):
+            try:
+                sender = self.hub.parse_message(path).get('from')
+            except (OSError, ValueError):
+                sender = None
+            if sender in (None, 'claude', 'human', 'github'):
+                reasons.append(f'the implementer has not read {path.stem}')
+        if (self.hub_dir.parent / '.git' / 'index.lock').exists():
+            reasons.append('.git/index.lock exists')
+        for peer in self.peers:
+            try:
+                text = agw.pane_text(peer.pane)
+            except (agw.CtlError, OSError) as err:
+                reasons.append(f'{peer.box} pane unreadable: {err}')
+                continue
+            tail = limits.tail_hash(text)
+            seen = settled.get(peer.pane)
+            if seen is None or seen[0] != tail:
+                settled[peer.pane] = (tail, now())
+                reasons.append(f'{peer.box} pane changed')
+            elif now() - seen[1] < CLOSE_SETTLE:
+                reasons.append(f'{peer.box} pane settling')
+            if is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:])):
+                reasons.append(f'{peer.box} is running a turn')
+            profile = peerchat.PROFILES[peer.tool]
+            content = (peerchat.claude_composer(text) if peer.tool == 'claude' else peerchat.codex_composer(text))
+            if content is None or not peerchat.looks_empty(profile, content):
+                reasons.append(f'{peer.box} composer is not provably empty')
+        return reasons
+
+    def autonomous(self) -> bool:
+        try:
+            settings = json.loads((self.hub_dir / 'state' / 'implementer.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return False
+        return isinstance(settings, dict) and settings.get('autonomous') is True
+
+    def finish_close(self) -> None:
+        """The close is done or refused: nothing to resume on a restart."""
+        if self.state.pop('close_pending', None) is not None and not self.dry_run:
+            self._save()
+
+    def close_alert(self, reason: str) -> None:
+        import agw
+        message = f"autonomous close stopped: {reason} (log: .workbench/state/relay-close.log)"
+        if self.dry_run:
+            return
+        for peer in self.peers:
+            if peer.box != 'claude':
+                continue
+            try:
+                agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not set blocked status: {err}")
+            try:
+                agw.notify(peer.pane, message, title='workbench relay')
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not notify: {err}")
+
+    def close_after_merge(self, number: int) -> None:
+        """After a merged PR and a complete drain, on an autonomous checkout: close the issue's
+        helper sessions (only those back at a shell), then the issue session (only when both agents
+        are provably done and idle), then this relay's own session. Mail keeps flowing while it
+        waits; a stop request, a human's mail or autonomy turned off stops it; never on a timeout."""
+        import agw
+        if not self.autonomous():
+            self.log("autonomy is off for this checkout; the sessions stay open")
+            self.finish_close()
+            return
+        self.close_log(f"PR #{number} merged; autonomous close starting")
+        deadline = now() + CLOSE_WAIT
+        settled: dict[str, tuple[str, float]] = {}
+        while True:
+            if self.stop_file.exists():
+                # The launcher is restarting this relay; the pending close resumes after it.
+                self.close_log("NOT closing: stop requested; the close resumes when the relay restarts")
+                return
+            # The planner's "loop complete" mail (and any human mail) must still be rung.
+            self.flush_outbox()
+            self.deliver_mail()
+            reasons = self.close_blockers(number, settled)
+            if not reasons:
+                break
+            if now() >= deadline:
+                self.close_log(f"NOT closing, still waiting after {CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
+                self.close_alert('; '.join(reasons))
+                self.finish_close()
+                return
+            pause(self.mail_interval)
+        if not self.autonomous():
+            self.close_log("NOT closing: autonomy was turned off during the wait")
+            self.finish_close()
+            return
+        if self.dry_run:
+            self.close_log('[dry-run] would close the helpers, the issue session and the relay')
+            return
+        try:
+            self.close_sessions(number)
+        except (agw.CtlError, OSError) as err:
+            self.close_log(f"close failed: {err}")
+            self.close_alert(f"a close step failed: {err}")
+            self.finish_close()
+
+    def close_sessions(self, number: int) -> None:
+        import agw
+        match = re.match(r'issue-(\d+)', self.branch)
+        issue = match.group(1) if match else None
+        workspace_name = self.repo.split('/')[-1]
+        snapshot = agw.tree()
+        left_open = []
+        helper_re = re.compile(rf'#{issue} (revmux r\d+|your review)') if issue else None
+        for workspace, session in agw.sessions(snapshot):
+            if helper_re is None or workspace.get('name') != workspace_name or not helper_re.fullmatch(session.get('name', '')):
+                continue
+            panes = agw.panes_of(session)
+            try:
+                rows = limits._rows(agw.pane_text(panes[0])) if panes else []
+            except (agw.CtlError, OSError):
+                rows = []
+            if not limits.shell_prompt(rows):
+                left_open.append(session.get('name'))
+                self.close_log(f"left open: {session.get('name')} (still running)")
+                continue
+            self.close_log(f"closing helper {session.get('name')} ({session.get('id')})")
+            for pane in panes:
+                agw.clear_restore(pane)
+            agw.close_session(session.get('id'))
+        agents = {peer.pane for peer in self.peers}
+        issue_session = next((session for _, session in agw.sessions(snapshot)
+                              if set(agw.panes_of(session)) == agents), None)
+        if issue_session is None:
+            self.close_log('the issue session is already gone')
+        else:
+            self.close_log(f"closing the issue session {issue_session.get('name')} ({issue_session.get('id')})")
+            for pane in sorted(agents):
+                agw.clear_restore(pane)
+            agw.close_session(issue_session.get('id'))
+        summary = (f"PR #{number} merged; sessions closed"
+                   + (f"; left open: {', '.join(left_open)}" if left_open else '')
+                   + "; log: .workbench/state/relay-close.log")
+        mine = agw.my_pane()
+        found = agw.find_pane(mine, agw.tree()) if mine else None
+        try:
+            agw.notify(mine or 'active', summary, title='workbench relay')
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not notify: {err}")
+        self.finish_close()
+        # Its own session only when it is provably the relay's: the name, this repo's workspace, and
+        # no pane but this one - a human's shell split beside it must never go with it.
+        own = found[1] if found else None
+        if (own is None or found[0].get('name') != workspace_name or own.get('name') != f'#{issue} relay'
+                or agw.panes_of(own) != [mine]):
+            self.close_log(f"leaving this relay's session open: it is not a single-pane '#{issue} relay' "
+                           f"in workspace {workspace_name}")
+            return
+        self.close_log(f"closing the relay session {own.get('id')}: {summary}")
+        agw.clear_restore(mine)
+        agw.close_session(own.get('id'))
+
     def deliver_mail(self) -> None:
         import agw
         import peerchat
@@ -573,6 +769,9 @@ class Relay:
             self._save()
 
     def retire(self, number: int) -> None:
+        if (self.state.get('pr') or {}).get('state') == 'MERGED':
+            # Persisted, so a relay that dies or restarts during the close wait resumes it (#27).
+            self.state['close_pending'] = number
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
@@ -800,6 +999,8 @@ class Relay:
                 self.log('[dry-run] saved PR is finished; no final mail filed')
                 return 0
             self.log('saved PR is finished; resuming final notice drain')
+        if self.state.get('close_pending') and not self.dry_run:
+            self.close_after_merge(self.state['close_pending'])
         next_limit = 0.0
         while True:
             if self.stop_file.exists():
@@ -816,8 +1017,11 @@ class Relay:
                 resets = {key for key, held in self.holds.items() if held.clear_pending}
                 resets.update((box, '') for box in self.state.get('reset_pending', []))
                 if not pending and not resets and published:
-                    self.retire(self.state['pr']['number'])
+                    number, state = self.state['pr']['number'], self.state['pr'].get('state')
+                    self.retire(number)
                     self.log("PR is finished; final notices delivered or read; the relay's job is done")
+                    if state == 'MERGED':
+                        self.close_after_merge(number)
                     return 0
                 if now() >= drain_deadline:
                     details = []

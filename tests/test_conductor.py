@@ -572,6 +572,35 @@ class QueueCase(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             q.main(['start', '--spec', 'o/r#1', '--auto-merge', '--no-auto-merge'])
 
+    # #27: -Autonomous / -NoAutonomous on a queue are saved (false included) and passed to members.
+    def test_autonomy_is_saved_and_passed_to_members(self):
+        self.start('o/r#1')
+        self.assertNotIn('-Autonomous', self.launched_args())
+        self.assertNotIn('-NoAutonomous', self.launched_args())
+        self.start('o/r#2', autonomous=True)
+        self.assertIs(True, self.store.load()['autonomous'])
+        self.assertIn('-Autonomous', self.launched_args())
+        self.start('o/r#3', autonomous=False)
+        args = self.launched_args()
+        self.assertIn('-NoAutonomous', args)
+        self.assertNotIn('-Autonomous', args)
+
+    def test_an_autonomous_queue_never_passes_no_auto_merge(self):
+        self.start('o/r#1', autonomous=True, auto_merge=False)
+        args = self.launched_args()
+        self.assertIn('-Autonomous', args)
+        self.assertNotIn('-NoAutoMerge', args)
+
+    def test_invalid_saved_autonomy_is_refused(self):
+        self.start('o/r#1')
+        data = json.loads(self.store.path.read_text())
+        for bad in ('yes', 1):
+            with self.subTest(value=bad):
+                data['autonomous'] = bad
+                self.store.path.write_text(json.dumps(data))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
+
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
         self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('o/r#3,#4,3'))

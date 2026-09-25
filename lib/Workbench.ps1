@@ -114,14 +114,16 @@ function Get-WorkbenchConfig {
          revmuxProfile  revmux profile for review rounds (default: comprehensive with codex,
                         claude-only with claude)
          autoMerge      let the planner merge its own PR when every condition holds (default false)
-         failover       switch the implementer to the other tool when it hits its usage limit (default true) #>
+         failover       switch the implementer to the other tool when it hits its usage limit (default true)
+         autonomous     full autonomy (#27): auto-merge, follow-up issues, sessions closed after the merge
+                        (default false) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
-                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true }
+                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -133,6 +135,7 @@ function Get-WorkbenchConfig {
     }
     if ($config.autoMerge -isnot [bool]) { throw "autoMerge in '$path' must be true or false (got '$($config.autoMerge)')" }
     if ($config.failover -isnot [bool]) { throw "failover in '$path' must be true or false (got '$($config.failover)')" }
+    if ($config.autonomous -isnot [bool]) { throw "autonomous in '$path' must be true or false (got '$($config.autonomous)')" }
     return $config
 }
 
@@ -740,8 +743,12 @@ function Resolve-Implementer {
        or it is a proven shell. Otherwise it is refused before anything is changed.
        Auto-merge (#23) is policy, not a process: the saved value wins over the config default and an
        explicit -AutoMerge / -NoAutoMerge ($RequestedAutoMerge true/false) changes it, with no pane check.
-       Returns @{ Tool; RevmuxProfile; AutoMerge; Conflict }, Conflict being a refusal message or $null. #>
-    param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null)
+       Autonomy (#27) is policy too, and implies auto-merge: an autonomous checkout cannot be told
+       -NoAutoMerge (use -NoAutonomous); -NoAutonomous alone leaves auto-merge as saved.
+       Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; Conflict }, Conflict being a refusal
+       message or $null. #>
+    param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null,
+          $RequestedAutonomous = $null)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex or claude (got '$Requested')") }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
@@ -762,19 +769,30 @@ function Resolve-Implementer {
         } else { $tool = $Requested }
     } elseif ($Requested) { $tool = $Requested }
     $autoMerge = [bool]$Config.autoMerge
-    $savedAutoMerge = Get-SavedAutoMerge $Checkout
+    $savedAutoMerge = Get-SavedSetting $Checkout 'autoMerge'
     if ($null -ne $savedAutoMerge) { $autoMerge = $savedAutoMerge }
     if ($null -ne $RequestedAutoMerge) { $autoMerge = [bool]$RequestedAutoMerge }
+    $autonomous = [bool]$Config.autonomous
+    $savedAutonomous = Get-SavedSetting $Checkout 'autonomous'
+    if ($null -ne $savedAutonomous) { $autonomous = $savedAutonomous }
+    if ($null -ne $RequestedAutonomous) { $autonomous = [bool]$RequestedAutonomous }
+    if ($autonomous) {
+        if ($null -ne $RequestedAutoMerge -and -not $RequestedAutoMerge) {
+            throw [ImplementerConflict]::new('autonomy implies auto-merge: -NoAutoMerge on an autonomous checkout is refused; use -NoAutonomous')
+        }
+        $autoMerge = $true
+    }
     return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); AutoMerge = $autoMerge;
-              Conflict = $conflict }
+              Autonomous = $autonomous; Conflict = $conflict }
 }
 
-function Get-SavedAutoMerge([string] $Checkout) {
-    # A record from before #23 has no autoMerge key: that is "not decided", so the config default applies.
+function Get-SavedSetting([string] $Checkout, [string] $Name) {
+    # A boolean from the checkout's settings record, or $null when it was never decided there: a
+    # record from before #23 has no autoMerge key, and that means "the config default applies".
     $path = Get-ImplementerStatePath $Checkout
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     try { $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
-    if ($data.autoMerge -is [bool]) { return $data.autoMerge }
+    if ($data.$Name -is [bool]) { return $data.$Name }
     return $null
 }
 
@@ -782,18 +800,20 @@ function Save-Implementer([string] $Checkout, $Resolved) {
     # state\implementer.json is the checkout's settings record: the implementer tool (#20), its
     # revmux profile, and auto-merge (#23). wb.py reads it for the planner.
     $path = Get-ImplementerStatePath $Checkout
-    $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge }
+    $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge;
+                                 autonomous = [bool]$Resolved.Autonomous }
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
             # Recorded usage limits (#24) belong to the checkout, not to this launch: keep them.
             if ($current.limits) { $record | Add-Member -NotePropertyName limits -NotePropertyValue $current.limits }
             if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile -and
-                $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge) { return }
+                $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge -and
+                $current.autonomous -is [bool] -and $current.autonomous -eq $record.autonomous) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
     }
     Write-AtomicJson $path $record
-    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge)"
+    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous)"
 }
 
 function Format-AutoMerge([bool] $Value) {
@@ -1654,7 +1674,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
-          [string] $Implementer, $AutoMerge = $null, [switch] $Failover)
+          [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -1722,7 +1742,7 @@ function Invoke-LauncherBody {
                   Restore = (Get-PaneLaunch 'pane-codex.ps1' @{ Checkout = $co.Dir; Issue = $issueRef } -Switches @('Resume')) }
     }
     if ($DryRun) {
-        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
             Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$repoName'"
@@ -1732,7 +1752,7 @@ function Invoke-LauncherBody {
             Write-Step "would open session '#$($ref.Number) $slug' in workspace '$repoName'"
             Write-Step "left pane:  $claudeLaunch"
         }
-        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge)"
+        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         if ($Failover) {
             $target = 'claude'
@@ -1763,7 +1783,7 @@ function Invoke-LauncherBody {
             $Implementer = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
             Set-LaunchStage implementer
         }
-        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge
+        $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         Save-Implementer $co.Dir $resolved
         # The human choosing a tool explicitly says its limit has reset (#24).

@@ -2058,5 +2058,246 @@ class UsageLimits(DeliveryFixture):
         self.assertEqual(12.0, args.limit_interval)
 
 
+class AutonomousClose(unittest.TestCase):
+    """#27: after a merged PR on an autonomous checkout the relay closes the sessions - only when
+    the loop is provably over, only helpers back at a shell, only this repo's, and never on a timeout."""
+    PLANNER = '11111111-1111-4111-8111-111111111111'
+    IMPLEMENTER = '22222222-2222-4222-8222-222222222222'
+    RELAY = '33333333-3333-4333-8333-333333333333'
+    REVMUX, REVIEW, OTHER = 'a1', 'a2', 'a3'
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test relay close ' + uuid.uuid4().hex)
+        self.state = self.folder / '.workbench' / 'state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ))
+        self.write('implementer.json', {'tool': 'claude', 'autonomous': True})
+        self.write('loop-done.json', {'pr': 7, 'sha': 'abc', 'followUps': []})
+        peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
+        self.r = relay.Relay(self.folder / '.workbench', peers, 'o/repo', 'issue-7-fix', 5, 60)
+        self.r.log = lambda text: None
+        self.enterContext(patch.object(relay, 'CLOSE_WAIT', 120.0))
+        # The wait keeps ringing mail (r18 M1); a ring "reads" nothing unless a test says so.
+        self.send = self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
+        self.t = 0.0
+        self.enterContext(patch.object(relay, 'now', lambda: self.t))
+        self.enterContext(patch.object(relay, 'pause', self.advance))
+        self.text = {self.PLANNER: CLAUDE_IDLE, self.IMPLEMENTER: CLAUDE_IDLE,
+                     self.REVMUX: 'revmux exit 1 (findings reported).\nPS C:\\repo> ', self.REVIEW: 'revdiff: 3 annotations',
+                     self.OTHER: 'PS C:\\other> ', self.RELAY: 'relay up:'}
+        self.tree = {'workspaces': [
+            {'name': 'repo', 'sessions': [{'id': self.PLANNER, 'name': '#7 fix', 'paneIds': [self.PLANNER, self.IMPLEMENTER]},
+                                          {'id': self.REVMUX, 'name': '#7 revmux r1'},
+                                          {'id': self.REVIEW, 'name': '#7 your review'},
+                                          {'id': self.RELAY, 'name': '#7 relay'}]},
+            {'name': 'other', 'sessions': [{'id': self.OTHER, 'name': '#7 revmux r1'}]}]}
+        self.actions = []
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=lambda pane: self.text[pane]))
+        self.enterContext(patch.object(agw, 'tree', side_effect=lambda: self.tree))
+        self.enterContext(patch.object(agw, 'my_pane', return_value=self.RELAY))
+        self.enterContext(patch.object(agw, 'close_session', side_effect=lambda sid: self.actions.append(('close', sid))))
+        self.enterContext(patch.object(agw, 'clear_restore', side_effect=lambda pane: self.actions.append(('unpin', pane))))
+        self.notify = self.enterContext(patch.object(agw, 'notify'))
+        self.status = self.enterContext(patch.object(agw, 'set_status'))
+        self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('unexpected terminal request')))
+
+    def write(self, name, data):
+        (self.state / name).write_text(json.dumps(data), encoding='utf-8')
+
+    def advance(self, seconds):
+        self.t += max(seconds, 1)
+
+    def closes(self):
+        return [target for action, target in self.actions if action == 'close']
+
+    def log(self):
+        path = self.state / 'relay-close.log'
+        return path.read_text(encoding='utf-8') if path.exists() else ''
+
+    def test_the_close_order_and_what_is_left_open(self):
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())      # helper, issue, own
+        self.assertNotIn(self.OTHER, [t for _, t in self.actions])                    # another repo's #7
+        self.assertNotIn(self.REVIEW, [t for _, t in self.actions])                   # revdiff still running
+        unpinned = [t for a, t in self.actions if a == 'unpin']
+        self.assertEqual([self.REVMUX, self.PLANNER, self.IMPLEMENTER, self.RELAY], unpinned)
+        for action in (('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER)):
+            self.assertLess(self.actions.index(action), self.actions.index(('close', self.PLANNER)))
+        self.assertIn('left open: #7 your review (still running)', self.log())
+        self.assertIn('closing the relay session', self.log())
+        self.assertIn('left open: #7 your review', self.notify.call_args.args[1])
+        self.assertGreaterEqual(self.t, relay.CLOSE_SETTLE)                            # panes had to settle
+
+    def blocked(self):
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.closes())
+        self.assertIn('NOT closing', self.log())
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id=self.PLANNER)
+        return self.log()
+
+    def test_autonomy_off_closes_nothing(self):
+        self.write('implementer.json', {'tool': 'claude', 'autonomous': False})
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.actions)
+        self.assertEqual('', self.log())
+
+    def test_no_loop_done_record_for_this_pr(self):
+        (self.state / 'loop-done.json').unlink()
+        self.assertIn('the planner has not recorded `wb.py loop-state done --pr 7`', self.blocked())
+        self.write('loop-done.json', {'pr': 6})
+        self.actions.clear()
+        self.assertIn('loop-state done --pr 7', self.blocked())
+
+    def test_the_implementer_has_not_read_its_last_mail(self):
+        box = self.folder / '.workbench' / 'inbox' / 'codex'
+        box.mkdir(parents=True)
+        (box / 'm1.md').write_text('---\nid: m1\nfrom: claude\nto: codex\nsubject: loop complete\n---\nbye\n', encoding='utf-8')
+        self.assertIn('the implementer has not read m1', self.blocked())
+
+    def test_a_pane_that_keeps_changing(self):
+        texts = iter(f'{CLAUDE_IDLE}\n{i}' for i in range(10000))
+        self.text[self.IMPLEMENTER] = None
+        agw.pane_text.side_effect = lambda pane: next(texts) if pane == self.IMPLEMENTER else self.text[pane]
+        self.assertIn('codex pane changed', self.blocked())
+
+    def test_a_draft_a_running_turn_or_a_git_lock(self):
+        for case, text, reason in (('draft', CLAUDE_IDLE.replace('\n>\n', '\n> half a thought\n'), 'composer is not provably empty'),
+                                   ('busy', CLAUDE_RUNNING, 'is running a turn'), ('lock', None, '.git/index.lock exists')):
+            with self.subTest(case=case):
+                self.actions.clear()
+                (self.state / 'relay-close.log').unlink(missing_ok=True)
+                self.text[self.IMPLEMENTER] = CLAUDE_IDLE if text is None else text
+                lock = self.folder / '.git' / 'index.lock'
+                if case == 'lock':
+                    lock.parent.mkdir(exist_ok=True)
+                    lock.write_text('', encoding='utf-8')
+                self.assertIn(reason, self.blocked())
+                lock.unlink(missing_ok=True)
+
+    def test_dry_run_closes_nothing(self):
+        self.r.dry_run = True
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.actions)
+
+    def restart(self, saved):
+        self.write('relay.json', dict({'branch': 'issue-7-fix', 'announced': [],
+                                       'watch_since': '2026-09-24T16:00:00+00:00'}, **saved))
+        restarted = relay.Relay(self.folder / '.workbench', self.r.peers, 'o/repo', 'issue-7-fix', 5, 60)
+        restarted.log = lambda text: None
+        restarted.close_after_merge = Mock()
+        restarted.stop_file = SimpleNamespace(exists=lambda: True)
+        self.assertEqual(0, restarted.run())
+        return restarted
+
+    def test_a_restart_after_the_drain_still_closes(self):
+        restarted = self.restart({'pr': {'number': 7, 'state': 'MERGED', 'headRefName': 'issue-7-fix'}})
+        restarted.close_after_merge.assert_called_once_with(7)
+        self.assertEqual(7, restarted.state['close_pending'])
+
+    def test_a_restart_with_the_pr_already_retired_resumes_the_pending_close(self):
+        # r18 m2: the relay died during the close wait, after retire() had saved.
+        restarted = self.restart({'close_pending': 7, 'completed_prs': [7]})
+        restarted.close_after_merge.assert_called_once_with(7)
+
+    def test_a_closed_pr_leaves_nothing_pending(self):
+        restarted = self.restart({'pr': {'number': 7, 'state': 'CLOSED', 'headRefName': 'issue-7-fix'}})
+        restarted.close_after_merge.assert_not_called()
+        self.assertNotIn('close_pending', restarted.state)
+
+    def test_the_wait_rings_the_loop_complete_mail_for_a_codex_implementer(self):
+        # r18 M1: the drain has retired the PR; only then does the planner mail "loop complete".
+        # A Codex implementer has no waiter: unless the close wait rings it, it is never read.
+        self.r.peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'codex', self.IMPLEMENTER)]
+        self.text[self.IMPLEMENTER] = CODEX_IDLE
+        box = self.folder / '.workbench' / 'inbox' / 'codex'
+        box.mkdir(parents=True)
+        mail = box / 'm9.md'
+        mail.write_text('---\nid: m9\nfrom: claude\nto: codex\nsubject: loop complete\n---\nbye\n', encoding='utf-8')
+
+        def rung(pane, profile, text, **kwargs):
+            self.assertIn('[id m9]', text)
+            (box / 'read').mkdir(exist_ok=True)
+            mail.rename(box / 'read' / 'm9.md')           # Codex reads it when rung
+            return 'submitted'
+        self.send.side_effect = rung
+        self.r.state['close_pending'] = 7
+        self.r.close_after_merge(7)
+        self.send.assert_called_once()
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_a_stop_request_during_the_wait_keeps_the_close_pending(self):
+        # r18 M2
+        (self.state / 'loop-done.json').unlink()
+        self.r.state['close_pending'] = 7
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t >= 20)
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.closes())
+        self.assertIn('NOT closing: stop requested', self.log())
+        self.assertEqual(7, self.r.state['close_pending'])
+
+    def test_autonomy_turned_off_during_the_wait_stops_the_close(self):
+        # r18 M2: re-read right before the first close action.
+        real = self.r.close_blockers
+
+        def blockers(number, settled):
+            reasons = real(number, settled)
+            if not reasons:
+                self.write('implementer.json', {'tool': 'claude', 'autonomous': False})
+            return reasons
+        self.r.close_blockers = blockers
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.actions)
+        self.assertIn('NOT closing: autonomy was turned off during the wait', self.log())
+
+    def test_unread_mail_to_the_planner_or_from_a_human_blocks(self):
+        # r18 M3
+        for box, sender in (('claude', 'codex'), ('claude', 'human'), ('codex', 'human'), ('codex', 'github')):
+            with self.subTest(box=box, sender=sender):
+                self.actions.clear()
+                (self.state / 'relay-close.log').unlink(missing_ok=True)
+                directory = self.folder / '.workbench' / 'inbox' / box
+                directory.mkdir(parents=True, exist_ok=True)
+                for old in directory.glob('*.md'):
+                    old.unlink()
+                (directory / 'h1.md').write_text(f'---\nid: h1\nfrom: {sender}\nto: {box}\nsubject: wait\n---\nx\n',
+                                                 encoding='utf-8')
+                self.send.side_effect = peerchat.Refused('held for the test')
+                self.blocked()
+
+    def test_a_failing_close_step_is_logged_and_alerted(self):
+        # r18 m2
+        agw.close_session.side_effect = agw.CtlError('pipe gone')
+        self.r.state['close_pending'] = 7
+        self.r.close_after_merge(7)
+        self.assertIn('close failed: pipe gone', self.log())
+        self.assertIn('autonomous close stopped: a close step failed', self.notify.call_args.args[1])
+        self.assertNotIn('close_pending', self.r.state)
+
+    def test_the_relay_leaves_its_own_session_unless_it_is_provably_its_own(self):
+        # r18 m7
+        relay_session = self.tree['workspaces'][0]['sessions'][3]
+        for case, change in (('split', {'paneIds': [self.RELAY, 'human-shell']}), ('renamed', {'name': 'my shell'})):
+            with self.subTest(case=case):
+                self.actions.clear()
+                saved = dict(relay_session)
+                relay_session.update(change)
+                self.r.close_after_merge(7)
+                self.assertNotIn(self.RELAY, self.closes())
+                self.assertIn("leaving this relay's session open", self.log())
+                relay_session.clear()
+                relay_session.update(saved)
+
+    def test_the_close_alert_is_its_own_message(self):
+        # r18 m5
+        (self.state / 'loop-done.json').unlink()
+        self.r.close_after_merge(7)
+        message = self.notify.call_args.args[1]
+        self.assertTrue(message.startswith('autonomous close stopped:'), message)
+        self.assertNotIn('workbench mail for', message)
+
+
 if __name__ == "__main__":
     unittest.main()
