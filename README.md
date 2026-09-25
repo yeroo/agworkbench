@@ -93,7 +93,29 @@ github-workbench -Queue 'owner/repo#3,#4,#5'
 github-workbench -Queue '3,4,5' -Repo owner/repo -Parallel 2
 github-workbench -Queue 'label:workbench' -Repo owner/repo -Watch
 github-workbench -Queue 'owner/repo#3,#4,#5' -Retry
+github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous
 ```
+
+**`-Queue bugs`** is `label:<bugLabel>`, with `bugLabel` in `~/.agworkbench.json`, default `bug`.
+A label spec, `bugs` or `label:X`, queues only issues nobody is handling yet. Each issue it leaves
+out is printed as `#N skipped: <reason>`:
+- `pr`: an open pull request will close it, or an open PR is on its `issue-<N>-*` branch in this
+  repo;
+- `session`: a workbench session `#N ...` is open for it in the repo's workspace;
+- `checkout-lock`: a launcher currently holds its checkout;
+- `checkout`: its checkout exists from an earlier loop outside this queue (resume or delete it);
+- `queued (<state>)`: it is already a member of this queue.
+
+Skipped issues are not recorded, so a later run or `-Watch` rescan looks at them again. For
+example, a PR closed without merging makes the bug eligible again. A lookup that fails stops the
+start and changes nothing; on a rescan, that scan adds nothing. An explicit list is never
+filtered. `-DryRun` prints the members it would add, the skipped issues with their reasons, the
+setting changes, and whether it would start the queue or append to it (running or stopped).
+
+The repo's queue is appended to when one exists, running or not, and `-Watch` onto a queue started
+from a list turns watching on. A switch on an append (`-Autonomous`, `-Implementer`, `-AutoMerge`,
+`-Parallel`) changes the queue for every member launched from then on, including ones already
+waiting. The append prints each such change (`settings: autonomous null -> true`).
 
 A visible, restart-pinned `#queue owner/repo` conductor starts one issue at a time by default
 (`-Parallel 1..8`). Each issue has its own clone, Claude, Codex, and review relay. PR-open or blocked
@@ -373,6 +395,7 @@ are trusted.
 | `implementer` | `"codex"` | who runs the right pane (`"codex"` or `"claude"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
+| `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
