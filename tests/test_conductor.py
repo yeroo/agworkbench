@@ -631,7 +631,8 @@ class QueueBugs(unittest.TestCase):
         self.closing = {}
 
     def fake_in_hand(self, repo, numbers, root, queue_path, gh=None, tree=None):
-        return self.real_in_hand(repo, numbers, root, queue_path, gh or self.fake_gh, self.tree)
+        # The tree is passed through (None -> the live agw.tree(), which each test patches).
+        return self.real_in_hand(repo, numbers, root, queue_path, gh or self.fake_gh, tree)
 
     def fake_gh(self, *args):
         if args[:2] == ('repo', 'view'):
@@ -646,9 +647,9 @@ class QueueBugs(unittest.TestCase):
             return {'data': {'repository': data}}
         raise AssertionError(args)
 
-    def start_bugs(self, spec='bugs', **kwargs):
-        with patch.object(q, 'gh_json', self.fake_gh):
-            return q.start_queue(spec, repo='o/r', root=self.root / 'queues', gh=self.fake_gh, tree=self.tree, **kwargs)
+    def start_bugs(self, spec='bugs', repo='o/r', **kwargs):
+        with patch.object(q, 'gh_json', self.fake_gh), patch.object(q.agw, 'tree', side_effect=lambda: self.tree):
+            return q.start_queue(spec, repo=repo, root=self.root / 'queues', gh=self.fake_gh, **kwargs)
 
     def members(self):
         return [m['number'] for m in self.store.load()['members']]
@@ -739,8 +740,8 @@ class QueueBugs(unittest.TestCase):
                 raise q.QueueError('HTTP 502')
             return self.fake_gh(*args)
         with self.assertRaises(q.QueueError):
-            with patch.object(q, 'gh_json', broken):
-                q.start_queue('bugs', repo='o/r', root=self.root / 'queues', gh=broken, tree=self.tree)
+            with patch.object(q, 'gh_json', broken), patch.object(q.agw, 'tree', return_value=self.tree):
+                q.start_queue('bugs', repo='o/r', root=self.root / 'queues', gh=broken)
         self.assertFalse(self.store.path.exists())
 
     def test_a_failed_lookup_on_a_rescan_adds_nothing(self):
@@ -781,8 +782,37 @@ class QueueBugs(unittest.TestCase):
         self.assertEqual([{'number': 1, 'reason': 'queued (pending)'},
                           {'number': 2, 'reason': 'pr: open PR #40 on issue-2-fix'}], result['skipped'])
         self.assertEqual({'autonomous': [None, True]}, result['settings'])
-        self.assertIn(result['mode'], ('append to a running queue', 'append to a stopped queue'))
+        self.assertEqual('append to a stopped queue', result['mode'])     # no worker holds the lock here
         self.assertEqual(before, self.store.path.read_text())
+
+    def test_dry_run_of_a_new_queue_is_a_start_with_no_setting_changes(self):
+        # r19
+        self.start_bugs(dry_run=True, autonomous=True)
+        result = json.loads(self.output().strip().splitlines()[-1])
+        self.assertEqual(('start', {}, [1, 2, 3, 4, 5]), (result['mode'], result['settings'], result['members']))
+        self.assertFalse(self.store.path.exists())
+
+    def test_repo_and_workspace_names_match_in_any_case(self):
+        # r19 M1: repo_name() lowercases; GitHub and the launcher's workspace keep the real case.
+        self.pulls = [{'number': 40, 'head': {'ref': 'issue-1-fix', 'repo': {'full_name': 'O/R'}}}]
+        self.tree = {'workspaces': [{'name': 'R', 'sessions': [{'id': 's2', 'name': '#2 fix'}]}]}
+        self.start_bugs(repo='O/R')
+        self.assertEqual([3, 4, 5], self.members())
+        out = self.output()
+        self.assertIn('#1 skipped: pr: open PR #40 on issue-1-fix', out)
+        self.assertIn('#2 skipped: session: a live workbench session is open for it', out)
+
+    def test_an_unreachable_terminal_on_a_rescan_adds_nothing_and_keeps_running(self):
+        # r19: CtlError is a RuntimeError, which Worker.run would not catch.
+        self.start_bugs(watch=True)
+        worker = self.worker()
+        worker.gh = self.fake_gh
+        with self.store.transaction() as data:
+            data['members'] = [m for m in data['members'] if m['number'] != 5]
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('agwinterm is not running')):
+            worker.refresh_remote()
+        self.assertEqual([1, 2, 3, 4], self.members())
+        self.assertIn('label scan', worker.errors)
 
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
