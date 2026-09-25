@@ -613,21 +613,35 @@ function Write-ClaudeQuietSettings([string] $Path) {
     }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
     $temp = "$Path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    $overwritingMove = [bool][IO.File].GetMethod('Move', [type[]]@([string], [string], [bool]))
     try {
         [IO.File]::WriteAllText($temp, $content, (New-Object Text.UTF8Encoding $false))
-        if ([IO.File].GetMethod('Move', [type[]]@([string], [string], [bool]))) {
-            [IO.File]::Move($temp, $Path, $true)
-        } elseif (Test-Path -LiteralPath $Path) {
-            [IO.File]::Replace($temp, $Path, [NullString]::Value)     # Windows PowerShell 5.1: no overwriting Move
-        } else {
-            [IO.File]::Move($temp, $Path)
+        $failure = $null
+        for ($try = 1; $try -le 5; $try++) {
+            try {
+                if ($overwritingMove) {
+                    [IO.File]::Move($temp, $Path, $true)
+                } elseif (Test-Path -LiteralPath $Path) {
+                    # Windows PowerShell 5.1: no overwriting Move. Replace needs the file to exist; if a
+                    # concurrent writer removed it meanwhile, this throws and the next try Moves instead.
+                    [IO.File]::Replace($temp, $Path, [NullString]::Value)
+                } else {
+                    # Throws if a concurrent writer created it meanwhile; the next try Replaces it.
+                    [IO.File]::Move($temp, $Path)
+                }
+                $failure = $null
+                break
+            } catch {
+                $failure = $_
+            }
         }
-    } catch {
-        # A concurrent writer (the other pane) won the race or holds the file; what it wrote is the
-        # same content. Anything else - the file still missing or different - is a real failure.
-        $ok = $false
-        try { $ok = [IO.File]::ReadAllText($Path) -ceq $content } catch { }
-        if (-not $ok) { throw }
+        if ($failure) {
+            # A concurrent writer (the other pane) holds the file; what it wrote is the same content.
+            # Anything else - the file still missing or different - is a real failure.
+            $ok = $false
+            try { $ok = [IO.File]::ReadAllText($Path) -ceq $content } catch { }
+            if (-not $ok) { throw $failure }
+        }
     } finally {
         Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
     }
