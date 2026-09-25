@@ -93,6 +93,19 @@ why once, clearly, and let the planner take it to them.
 
 When mail says the loop is complete, stop your waiter and stop.
 
+## HANDOVER - you replace another implementer mid-loop
+
+A mail with subject `HANDOVER` means the previous implementer (Codex or Claude) hit its usage
+limit, and you now run in its pane with the same mailbox box. Do this before anything else:
+1. Read every message the mail names. `agmsg read <id>` also finds messages the previous
+   implementer already read.
+2. Run `git status`. Uncommitted changes are the previous implementer's work: review them, and
+   finish and commit them as your own.
+3. Continue the phase the mail names, starting with its open request.
+
+Reply exactly as the phase asks (`AGREED: plan vK`, `IMPLEMENTED <sha>`, `FIXED <sha>`). Say in the
+reply that you took over.
+
 ## Never
 
 - push, force-push, rewrite commits that were already pushed, or touch the default branch;

@@ -82,6 +82,19 @@ Silence on a finding is not an answer. Reply `FIXED <short sha>` with the per-fi
 Human feedback arrives the same way, relayed by Claude. It is not up for dispute in the same way:
 if you think the human is wrong, say why once, clearly, and let Claude take it to them.
 
+## HANDOVER - you replace another implementer mid-loop
+
+A mail with subject `HANDOVER` means the previous implementer (Codex or Claude) hit its usage
+limit, and you now run in its pane with the same mailbox box. Do this before anything else:
+1. Read every message the mail names. `agmsg read <id>` also finds messages the previous
+   implementer already read.
+2. Run `git status`. Uncommitted changes are the previous implementer's work: review them, and
+   finish them, and commit as usual.
+3. Continue the phase the mail names, starting with its open request.
+
+Reply exactly as the phase asks (`AGREED: plan vK`, `IMPLEMENTED <sha>`, `FIXED <sha>`). Say in the
+reply that you took over.
+
 ## Never
 
 - push, force-push, rewrite commits that were already pushed, or touch the default branch;

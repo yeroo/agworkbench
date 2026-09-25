@@ -47,6 +47,45 @@ The differences:
 - `wb.py revmux` defaults to the `claude-only` revmux profile, so a review round does not depend on
   Codex's quota (a `revmuxProfile` key in `~/.agworkbench.json` overrides it).
 
+## Usage limits (the relay's `usage limit:` mail)
+
+The relay watches both panes for an agent's own usage-limit message. When it sees one on two
+consecutive reads, it mails you from `relay` with the subject `usage limit: <box> (<tool>) <kind>`.
+The mail carries the matched line and the pane's last rows. It also sets that pane blocked, with a
+desktop notification. It stops ringing a limited implementer: mail to it waits.
+
+- **The implementer is `limited`, and `wb.py settings` says `failover=true`** (the default):
+  1. Check the frame in the mail. The matched line must be the agent's own limit message at the end
+     of its pane, not text it printed from a file, a diff or a test.
+  2. Fail over. The command may take up to two minutes while it checks that the pane is idle, so
+     run it through Bash with `timeout: 600000`:
+
+     ```bash
+     github-workbench <owner/repo#N> -Failover
+     ```
+
+     If the agent already exited, it switches straight away. If it is still running, the launcher
+     stops it only when it is provably idle at its limit (an unchanged pane, no `.git/index.lock`,
+     exactly one agent process). It records the limit, clears the pane, starts the other tool
+     there, and restarts the relay for it. It never types into the limited agent.
+  3. Hand over. Run `python "$AGWORKBENCH/lib/wb.py" handover`, then mail the new implementer
+     (kind `task`, subject `HANDOVER`):
+     - the current phase and plan version;
+     - the open request's id and subject from that output;
+     - the branch;
+     - "run git status: uncommitted changes are the previous implementer's work - review, finish
+       and commit them".
+  4. Tell the human in one line which tool was stopped and which took over.
+- **`-Failover` refused** (exit 2): tell the human the refusal line and set `wb.py status blocked
+  --sound`. A refusal changed nothing. A tool with a recorded limit is never switched back to
+  automatically: the human clears it with `github-workbench <issue> -Implementer <tool>` once its
+  limit has reset.
+- **`warning`** (Codex's "Approaching rate limits" chooser): never answer it. Tell the human in one
+  line and set blocked.
+- **`failover=false`**: tell the human and set blocked.
+- **Box `claude`** (you): this mail is only a record; the human was already notified. Carry on
+  when you can act again.
+
 ## Adopted session
 
 If the launcher printed `WORKBENCH ADOPTED`, this existing Claude session now owns that issue.
