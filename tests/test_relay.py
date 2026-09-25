@@ -2062,7 +2062,7 @@ class UsageLimits(DeliveryFixture):
 
 class AutonomousClose(unittest.TestCase):
     """#27: after a merged PR on an autonomous checkout the relay closes the sessions - only when
-    the loop is provably over, only helpers back at a shell, only this repo's, and never on a timeout."""
+    the loop is provably over (helpers: once each has provably ended), only this repo's, never on a timeout."""
     PLANNER = '11111111-1111-4111-8111-111111111111'
     IMPLEMENTER = '22222222-2222-4222-8222-222222222222'
     RELAY = '33333333-3333-4333-8333-333333333333'
@@ -2080,7 +2080,6 @@ class AutonomousClose(unittest.TestCase):
         peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
         self.r = relay.Relay(self.folder / '.workbench', peers, 'o/repo', 'issue-7-fix', 5, 60)
         self.r.log = lambda text: None
-        self.enterContext(patch.object(relay, 'CLOSE_WAIT', 120.0))
         self.enterContext(patch.object(closer, 'CLOSE_WAIT', 120.0))
         # The wait keeps ringing mail (r18 M1); a ring "reads" nothing unless a test says so.
         self.send = self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
@@ -2088,7 +2087,7 @@ class AutonomousClose(unittest.TestCase):
         self.enterContext(patch.object(relay, 'now', lambda: self.t))
         self.enterContext(patch.object(relay, 'pause', self.advance))
         self.text = {self.PLANNER: CLAUDE_IDLE, self.IMPLEMENTER: CLAUDE_IDLE,
-                     self.REVMUX: 'revmux exit 1 (findings reported).\nPS C:\\repo> ', self.REVIEW: 'revdiff: 3 annotations',
+                     self.REVMUX: 'revmux exit 1 (findings reported).', self.REVIEW: 'revdiff: 3 annotations',
                      self.OTHER: 'PS C:\\other> ', self.RELAY: 'relay up:'}
         self.tree = {'workspaces': [
             {'name': 'repo', 'sessions': [{'id': self.PLANNER, 'name': '#7 fix', 'paneIds': [self.PLANNER, self.IMPLEMENTER]},
@@ -2105,7 +2104,8 @@ class AutonomousClose(unittest.TestCase):
         self.notify = self.enterContext(patch.object(agw, 'notify'))
         self.status = self.enterContext(patch.object(agw, 'set_status'))
         self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('unexpected terminal request')))
-        # #33: the finished revmux helper left its completion marker (its rows before the shell's prompt).
+        # #33: the finished revmux helper left its completion marker; its direct-mode pane has ended
+        # (no foreground shell) and shows exactly those rows.
         self.marker(self.REVMUX, ['revmux exit 1 (findings reported).'])
 
     def marker(self, pane, rows):
@@ -2141,7 +2141,7 @@ class AutonomousClose(unittest.TestCase):
         self.assertIn('closing the relay session', self.log())
         self.assertIn('left open: #7 your review (no completion marker', self.notify.call_args.args[1])
         self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())     # its marker is gone
-        self.assertGreaterEqual(self.t, relay.CLOSE_SETTLE)                            # panes had to settle
+        self.assertGreaterEqual(self.t, closer.CLOSE_SETTLE)                            # panes had to settle
 
     def blocked(self):
         self.r.close_after_merge(7)
@@ -2158,18 +2158,23 @@ class AutonomousClose(unittest.TestCase):
         self.blocked()
         self.assertEqual([self.REVMUX], self.closes())
 
-    def test_a_helper_touched_after_it_finished_stays_open(self):
-        # #33 B2: the human typed at the helper's prompt; the marker's rows no longer lead the screen.
-        self.text[self.REVMUX] = 'revmux exit 1 (findings reported).\nPS C:\\repo> git status'
+    def test_a_helper_pane_showing_anything_else_stays_open(self):
+        # #33 r20 M3: strict - a prompt, a typed command or more output after the marker's rows.
+        for extra in ('PS C:\\repo> ', 'PS C:\\repo> git status', '~/src/docxy on main\n#'):
+            with self.subTest(extra=extra):
+                self.actions.clear()
+                (self.state / 'relay-close.log').unlink(missing_ok=True)
+                self.text[self.REVMUX] = 'revmux exit 1 (findings reported).\n' + extra
+                self.r.close_after_merge(7)
+                self.assertNotIn(self.REVMUX, self.closes())
+                self.assertIn('stays open: the pane shows something other than what the helper left', self.log())
+
+    def test_a_helper_with_a_live_shell_stays_open(self):
+        # #33 r20 M3: started the old way, inside a shell - the same rows, but it can still be typed into.
+        self.tree['workspaces'][0]['sessions'][1]['foregroundShells'] = ['powershell']
         self.r.close_after_merge(7)
         self.assertNotIn(self.REVMUX, self.closes())
-        self.assertIn('stays open: the pane changed after the helper finished', self.log())
-
-    def test_a_helper_ending_at_a_starship_prompt_closes(self):
-        # #33: the docxy helpers ended at the human's own prompt - a path line, then `#`.
-        self.text[self.REVMUX] = 'revmux exit 1 (findings reported).\n~/src/docxy on main\n#'
-        self.r.close_after_merge(7)
-        self.assertIn(self.REVMUX, self.closes())
+        self.assertIn('stays open: a powershell shell is live in it', self.log())
 
     def test_a_marker_is_found_through_the_helpers_session(self):
         # #33 B2: markers are keyed by pane id; the relay maps the session to its single pane.
@@ -2346,20 +2351,18 @@ class HelperMarkers(unittest.TestCase):
     """#33: a helper proves it finished, and the close proves nobody touched its pane since."""
     DONE = ['revmux exit 1 (findings reported).', 'Report posted to Claude.']
 
-    def test_untouched_means_the_same_rows_plus_only_a_bare_prompt(self):
+    def test_untouched_means_exactly_the_rows_the_helper_left(self):
+        rows = [f'row {i}' for i in range(20)]
         for current, untouched in ((self.DONE, True),
-                                   (self.DONE + ['PS C:\\repo>'], True),
-                                   (self.DONE + ['~/src/docxy on main', '#'], True),
-                                   (self.DONE + ['PS C:\\repo> git status'], False),       # typed, not sent
-                                   (self.DONE + ['#', 'ls', 'a b', '#'], False),             # used since
-                                   (['something else', '#'], False)):
+                                   (self.DONE + ['PS C:\\repo>'], False),                  # no prompt allowed
+                                   (self.DONE + ['~/src/docxy on main', '#'], False),
+                                   (self.DONE + ['PS C:\\repo> git status'], False),
+                                   (self.DONE[1:], False),
+                                   (['something else'], False)):
             with self.subTest(current=current):
                 self.assertEqual(untouched, closer.helper_untouched(self.DONE, current))
-        self.assertFalse(closer.helper_untouched([], ['#']))                               # no rows recorded
-
-    def test_the_window_slides_when_the_prompt_is_added(self):
-        rows = [f'row {i}' for i in range(20)]
-        self.assertTrue(closer.helper_untouched(rows, rows[1:] + ['#']))
+        self.assertFalse(closer.helper_untouched([], []))                                  # no rows recorded
+        self.assertFalse(closer.helper_untouched(rows, rows[1:] + ['#']))                  # the window slid: printed since
 
     def test_helper_done_writes_the_marker_keyed_by_its_pane(self):
         import helper_done

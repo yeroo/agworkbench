@@ -307,13 +307,14 @@ merges, unless you opted in for that checkout.
 - **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
   waits for you, whether it was deferred or ended disputed. Minor and Immaterial ones may be
   deferred as follow-ups. The merge comment lists them all with their severity and issue links.
-- **It closes the sessions.** After a MERGED PR, never a closed one, the relay closes nothing until
-  the planner has recorded `wb.py loop-state done`, the implementer has read its last mail, and
-  both panes are unchanged for 30 s with empty composers and no `.git/index.lock`. Then it closes
-  the issue's revmux and review sessions that are back at a shell (a running revdiff stays open and
-  is named), then the issue session, then itself. It only ever touches this repository's
-  workspace. Every step goes to `.workbench/state/relay-close.log`. It never closes on a timeout: it
-  alerts you instead. The checkout stays on disk.
+- **It closes the sessions.** After a MERGED PR, never a closed one, the relay first closes the
+  issue's revmux and review sessions that have finished, each on its own evidence (below), whatever
+  the agents are doing; a running revdiff stays open and is named. The issue session and the relay
+  itself close only once the planner has recorded `wb.py loop-state done`, the implementer has
+  read its last mail, and both panes are unchanged for 30 s with empty composers and no
+  `.git/index.lock`. It only ever touches this repository's workspace. Every step goes to
+  `.workbench/state/relay-close.log`. It never closes on a timeout: it alerts you instead. The
+  checkout stays on disk.
 
 How the close proves each thing (#33):
 - **Agents:** every Claude the workbench launches (planner and implementer) starts with prompt
@@ -323,10 +324,13 @@ How the close proves each thing (#33):
   close its session. `claudeArgs` may not pass its own `--settings`; put your settings in
   `~/.claude/settings.json`. An adopted Claude (your own session) needs
   `"promptSuggestionEnabled": false` there too, and the relay's hold and close logs say so.
-- **Helpers:** revmux and revdiff write a completion marker (`.workbench/state/helpers/<pane>.done`,
-  holding what the pane showed) as their last act. A helper closes when its marker exists, the pane
-  shows the same rows plus at most its shell's bare prompt (nothing typed since), and it has been
-  unchanged for 30 s. Helpers close first, even while the agents are still busy.
+- **Helpers:** `wb.py revmux` and `wb.py human-review` start their sessions in agwinterm's direct
+  command mode: the helper runs with no shell around it, and when it ends its pane stays on screen
+  with its input closed, so nothing can be typed there and nothing more is printed. As its last act
+  the helper writes a completion marker (`.workbench/state/helpers/<pane>.done`, holding what the
+  pane showed). A helper closes when its marker exists, no shell is live in its pane, the pane shows
+  exactly the marker's rows, and it has been unchanged for 30 s. Helpers close first, even while the
+  agents are still busy. A helper session opened the old way, inside a shell, is left for you.
 - **A relay that died:** the queue's conductor runs the same close for a merged member whose close
   has been pending for 15 minutes and whose `#N relay` session is gone. While that relay is still
   alive, the member is only flagged `closeStuck` in the queue file, because one closer at a time.

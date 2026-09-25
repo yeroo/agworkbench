@@ -828,12 +828,13 @@ class CloseBackstop(unittest.TestCase):
         self.start('o/r#7')
         with self.store.transaction() as data:
             m = data['members'][0]
-            m.update(state='merged', slotReleased=True)
+            # Issue 7's PR is 42: relay.json and loop-done.json hold the PR number, not the issue's.
+            m.update(state='merged', slotReleased=True, pr='https://github.com/o/r/pull/42', prState='MERGED')
             self.checkout = Path(m['checkout'])
         self.state = self.checkout / '.workbench' / 'state'
         self.state.mkdir(parents=True)
-        for name, value in (('relay.json', {'close_pending': 7}), ('implementer.json', {'autonomous': True}),
-                            ('loop-done.json', {'pr': 7}),
+        for name, value in (('relay.json', {'close_pending': 42}), ('implementer.json', {'autonomous': True}),
+                            ('loop-done.json', {'pr': 42}),
                             ('agents.json', {'agents': {'claude': {'pane': self.PLANNER, 'tool': 'claude'},
                                                         'codex': {'pane': self.IMPLEMENTER, 'tool': 'claude'}}})):
             q.atomic_json(self.state / name, value)
@@ -899,6 +900,36 @@ class CloseBackstop(unittest.TestCase):
         self.assertIn('the backstop close timed out', self.member(7)['closeStuck'])
         self.assertIn('the planner has unread mail h1', self.w.notify.call_args.args[0])
         self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+
+    def test_close_pending_is_matched_against_the_pr_number_not_the_issue(self):
+        self.relay_gone()
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 7})       # the issue's number: not this PR
+        self.run_for(1000)
+        self.assertEqual([], self.actions)
+        self.assertNotIn('closePending', self.member(7))
+        q.atomic_json(self.state / 'loop-done.json', {'pr': 7})              # the planner's done for another PR
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 42})
+        self.run_for(900 + closer.CLOSE_WAIT + 60)
+        self.assertEqual([], [a for a in self.actions if a[0] == 'close'])
+        self.assertIn('loop-state done --pr 42', self.member(7)['closeStuck'])
+
+    def test_a_relay_that_comes_back_takes_the_close_back(self):
+        self.relay_gone()
+        self.run_for(910)                                        # the attempt has started: panes settling
+        self.assertIsNotNone(self.w.closes[7]['attempt'])
+        self.tree['workspaces'][0]['sessions'].append({'id': 'relay-7', 'name': '#7 relay'})
+        self.run_for(200)
+        self.assertEqual([], self.actions)
+        self.assertIsNone(self.w.closes[7]['attempt'])
+        self.assertIn('relay is alive', self.member(7)['closeStuck'])
+        self.assertIn('the relay is back', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_end_close_leaves_a_close_pending_it_did_not_run(self):
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 43, 'other': 1})
+        self.w.end_close(self.member(7), 42, self.checkout / '.workbench', stuck=None)
+        self.assertEqual({'close_pending': 43, 'other': 1}, q.read_json(self.state / 'relay.json'))
+        self.w.end_close(self.member(7), 43, self.checkout / '.workbench', stuck=None)
+        self.assertEqual({'other': 1}, q.read_json(self.state / 'relay.json'))
 
     def test_an_unreadable_tree_closes_nothing(self):
         self.w.close_backstop()                                  # starts the 15-minute clock

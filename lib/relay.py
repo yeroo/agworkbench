@@ -22,12 +22,14 @@ Four jobs, one loop, one process per issue, running in its own visible agwinterm
    notification; mail to a limited implementer is held until the planner fails it over. Checks
    stop once the PR is finished.
 
-4. **The close after merge (#27).** On an autonomous checkout, after a MERGED PR's final notices
-   are delivered, it closes the issue's helper sessions that are back at a shell, then the issue
-   session, then its own - only when the planner has recorded `loop-state done`, no mail is unread
-   and both agent panes are provably idle, while it keeps delivering mail. Every step goes to
-   `.workbench/state/relay-close.log`; a stop request, a human's mail or autonomy turned off stops it,
-   and it never closes on a timeout. A pending close survives a restart (`close_pending`).
+4. **The close after merge (#27, #33).** On an autonomous checkout, after a MERGED PR's final
+   notices are delivered, it runs closer.py while it keeps delivering mail. Helper sessions close
+   first, each on its own evidence (its completion marker, an ended direct-mode pane showing exactly
+   the marker's rows), whatever the agents are doing. The gates - the planner has recorded
+   `loop-state done`, no mail is unread, both agent panes are provably idle - apply to the issue
+   session and the relay's own session only. Every step goes to `.workbench/state/relay-close.log`;
+   a stop request, a human's mail or autonomy turned off stops it, and it never closes on a timeout.
+   A pending close survives a restart (`close_pending`).
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
@@ -69,8 +71,6 @@ AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
-CLOSE_WAIT = closer.CLOSE_WAIT        # the close itself lives in closer.py (#33), shared with the conductor
-CLOSE_SETTLE = closer.CLOSE_SETTLE
 
 
 @dataclass(frozen=True)
@@ -519,7 +519,7 @@ class Relay:
 
     # the autonomous close (#27) ------------------------------------------------------------------
     def closer(self) -> "closer.Closer":
-        return closer.Closer(self.hub_dir, self.repo, self.branch, self.peers, log=self.log, clock=now,
+        return closer.Closer(self.hub_dir, self.repo, closer.issue_from_branch(self.branch), self.peers, log=self.log, clock=now,
                              dry_run=self.dry_run)
 
     def finish_close(self) -> None:
@@ -574,7 +574,7 @@ class Relay:
             if not reasons:
                 break
             if close.timed_out():
-                close.log(f"NOT closing, still waiting after {CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
+                close.log(f"NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
                 self.close_alert('; '.join(reasons))
                 self.finish_close()
                 return

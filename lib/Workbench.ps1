@@ -603,8 +603,34 @@ function Get-ClaudeQuietSettings([string] $Checkout) {
 }
 
 function Write-ClaudeQuietSettings([string] $Path) {
+    # Both agent panes start at once and write the same file: write only when it is missing or
+    # different, through a temp file and a rename, so a reader never sees it half written (#33).
+    $content = '{"promptSuggestionEnabled": false}'
+    try {
+        if ([IO.File]::ReadAllText($Path) -ceq $content) { return }
+    } catch {
+        # missing or unreadable: (re)write it below
+    }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-    [IO.File]::WriteAllText($Path, '{"promptSuggestionEnabled": false}', (New-Object Text.UTF8Encoding $false))
+    $temp = "$Path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, $content, (New-Object Text.UTF8Encoding $false))
+        if ([IO.File].GetMethod('Move', [type[]]@([string], [string], [bool]))) {
+            [IO.File]::Move($temp, $Path, $true)
+        } elseif (Test-Path -LiteralPath $Path) {
+            [IO.File]::Replace($temp, $Path, [NullString]::Value)     # Windows PowerShell 5.1: no overwriting Move
+        } else {
+            [IO.File]::Move($temp, $Path)
+        }
+    } catch {
+        # A concurrent writer (the other pane) won the race or holds the file; what it wrote is the
+        # same content. Anything else - the file still missing or different - is a real failure.
+        $ok = $false
+        try { $ok = [IO.File]::ReadAllText($Path) -ceq $content } catch { }
+        if (-not $ok) { throw }
+    } finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Read-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Role = 'planner') {

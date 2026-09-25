@@ -2548,6 +2548,27 @@ class ClaudeImplementer(LauncherFixtures):
                     self.assertEqual('false', seen['env'])
                     self.assertEqual({'promptSuggestionEnabled': False}, json.loads(settings.read_text(encoding='utf-8')))
 
+    def test_the_quiet_settings_file_is_written_atomically_and_only_when_needed(self):
+        # #33 r20 m1: both panes start at once; a writer never leaves it half written or fails the other.
+        path = self.temp / 'state' / 'claude-settings.json'
+        code = ('. ./lib/Workbench.ps1; $p = ' + ps_quote(path) + '; '
+                'Write-ClaudeQuietSettings $p; $first = (Get-Item -LiteralPath $p).LastWriteTimeUtc; '
+                'Start-Sleep -Milliseconds 50; Write-ClaudeQuietSettings $p; '
+                'if ((Get-Item -LiteralPath $p).LastWriteTimeUtc -ne $first) { throw "rewritten though unchanged" }; '
+                '[IO.File]::WriteAllText($p, "{}"); Write-ClaudeQuietSettings $p; '
+                '$jobs = 1..6 | ForEach-Object { Start-Job -ScriptBlock { param($root, $file) Set-Location $root; '
+                '. ./lib/Workbench.ps1; 1..20 | ForEach-Object { try { [IO.File]::Delete($file) } catch { }; '
+                'Write-ClaudeQuietSettings $file } } -ArgumentList (Get-Location).Path, $p }; '
+                '$jobs | Wait-Job | Receive-Job -ErrorAction Stop; '
+                "Get-ChildItem -LiteralPath (Split-Path $p) -Filter '*.tmp' | ForEach-Object { throw ('temp left: ' + $_.Name) }")
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                shutil.rmtree(path.parent, ignore_errors=True)
+                result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', code],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=180)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual('{"promptSuggestionEnabled": false}', path.read_bytes().decode('utf-8'))
+
     def test_settings_in_claude_args_are_refused_for_the_planner_too(self):
         self.identity(role='planner', pane=MAIN_ID)
         for flag in ('--settings', '--settings=x.json'):

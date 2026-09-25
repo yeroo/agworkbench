@@ -8,10 +8,14 @@ Stepwise on purpose: `step_helpers()` and `agent_blockers()` each look once and 
 their evidence (settled pane hashes) in the object, so the relay can loop on them while it keeps
 delivering mail, and the conductor can advance one check per tick without blocking its queue.
 
-- Helpers (`#N revmux rK`, `#N your review` in this repo's workspace) close on their own evidence:
-  a completion marker the helper script wrote as its last act (`state/helpers/<pane>.done`, with the
-  pane's rows at that moment), the pane untouched since, and unchanged for CLOSE_SETTLE seconds.
-  They close first, independently of the agents.
+- Helpers (`#N revmux rK`, `#N your review` in this repo's workspace) close on their own evidence,
+  first and independently of the agents. wb.py launches them in agwinterm's DIRECT command mode: the
+  pane runs the helper with no shell around it, and when it ends the pane stays on screen with its
+  input closed - nothing can be typed into it and nothing more is printed. So a helper closes when
+  its completion marker exists (`state/helpers/<pane>.done`, written as its last act with the
+  pane's rows at that moment), the pane shows exactly those rows, no live shell is in its foreground
+  (a helper started with a shell, the old way, never qualifies), and it has been unchanged for
+  CLOSE_SETTLE seconds. No prompt parsing.
 - The issue session (exactly the two agent panes) closes only when the planner recorded
   `loop-state done` for this PR, no mail is unread, no .git/index.lock exists, and both agent panes
   are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds.
@@ -31,9 +35,6 @@ import limits
 
 CLOSE_WAIT = 600.0       # how long a close waits for the loop to be provably over (#27)
 CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be closed
-HELPER_EXTRA_ROWS = 3    # rows the pane's own shell may add after a helper ends (its prompt)
-# A prompt row with nothing typed after its glyph: `#`, `PS C:\x>`, `❯`, `user@host:~$`, `%`.
-BARE_PROMPT = re.compile(r'^(?:PS [A-Za-z]:\\[^>]*>|\S*\s*[#>$%❯›])\s*$')
 
 
 def issue_from_branch(branch: str) -> str | None:
@@ -46,27 +47,18 @@ def filled_rows(text: str) -> list[str]:
 
 
 def helper_untouched(marker_rows: list[str], current_rows: list[str]) -> bool:
-    """True when the pane shows exactly what the helper left, plus at most HELPER_EXTRA_ROWS rows
-    its shell printed afterwards (the prompt), the last of them a bare prompt: nothing typed since."""
-    if not marker_rows:
-        return False
-    if current_rows == marker_rows[-len(current_rows):] and current_rows:
-        return True                       # nothing printed after the marker at all
-    for extra in range(1, HELPER_EXTRA_ROWS + 1):
-        if len(current_rows) <= extra:
-            break
-        head, tail = current_rows[:-extra], current_rows[-extra:]
-        if head == marker_rows[-len(head):] and BARE_PROMPT.match(tail[-1].strip()):
-            return True
-    return False
+    """True only when the pane shows exactly what the helper left when it wrote its marker. A direct
+    mode helper prints nothing after that and cannot be typed into, so anything else - a prompt, a
+    typed command, more output - means the pane is not the finished helper's."""
+    return bool(marker_rows) and current_rows == marker_rows
 
 
 class Closer:
-    def __init__(self, hub_dir: Path, repo: str, branch: str, peers, *, log: Callable[[str], None],
+    def __init__(self, hub_dir: Path, repo: str, issue: str | int | None, peers, *, log: Callable[[str], None],
                  clock: Callable[[], float] = time.monotonic, dry_run: bool = False):
         self.hub_dir = Path(hub_dir)
         self.repo = repo
-        self.issue = issue_from_branch(branch)
+        self.issue = str(issue) if issue else None
         self.workspace_name = repo.split('/')[-1]
         self.peers = peers
         self.echo = log
@@ -126,7 +118,7 @@ class Closer:
         snapshot = agw.tree()
         for session in self.helper_sessions(snapshot):
             panes = agw.panes_of(session)
-            reason = self.helper_reason(panes)
+            reason = self.helper_reason(panes, session)
             label = f"{session.get('name')} ({session.get('id')})"
             if reason:
                 left_open.append(f"{session.get('name')} ({reason})")
@@ -148,7 +140,7 @@ class Closer:
             self.marker_path(panes[0]).unlink(missing_ok=True)
         return left_open
 
-    def helper_reason(self, panes: list[str]) -> str | None:
+    def helper_reason(self, panes: list[str], session: dict) -> str | None:
         if len(panes) != 1:
             return 'not a single-pane helper'
         try:
@@ -161,8 +153,12 @@ class Closer:
             text = agw.pane_text(panes[0])
         except (agw.CtlError, OSError) as err:
             return f'pane unreadable: {err}'
+        shells = session.get('foregroundShells') or [session.get('foregroundShell')]
+        if shells and shells[0]:
+            # A shell is running in it: started the old way (with a shell), or not a finished helper.
+            return f'a {shells[0]} shell is live in it (only a direct-mode helper that has ended closes)'
         if not helper_untouched(marker.get('rows') or [], filled_rows(text)):
-            return 'the pane changed after the helper finished'
+            return 'the pane shows something other than what the helper left'
         state = self.settle(panes[0], text)
         return f'pane {state}' if state else None
 

@@ -120,6 +120,12 @@ def pr_url(value, repo):
     return value
 
 
+def pr_number(value):
+    """The PR number from a member's PR URL (`.../pull/42`), or None."""
+    match = re.search(r'/pull/([1-9][0-9]*)$', value or '')
+    return int(match.group(1)) if match else None
+
+
 def run_gh(args, timeout=60):
     argv = [shutil.which('gh') or 'gh', *args]
     process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -706,12 +712,13 @@ class Worker:
             if m['state'] != 'merged':
                 continue
             number = m['number']
+            pr = pr_number(m.get('pr'))    # relay.json's close_pending holds the PR number, not the issue's
             hub_dir = Path(m['checkout']) / '.workbench'
             try:
                 relay_state = read_json(hub_dir / 'state' / 'relay.json') if (hub_dir / 'state' / 'relay.json').exists() else {}
             except (OSError, ValueError):
                 relay_state = {}
-            if relay_state.get('close_pending') != number:
+            if pr is None or relay_state.get('close_pending') != pr:
                 # Nothing pending: the relay closed (or refused), or autonomy was off. A "relay alive"
                 # flag is resolved by that; a refused backstop close stays flagged for the human.
                 self.closes.pop(number, None)
@@ -725,43 +732,49 @@ class Worker:
             if self.clock() - watch['since'] < CLOSE_BACKSTOP_AFTER:
                 continue
             try:
-                self.step_close(data, m, hub_dir, watch)
+                self.step_close(data, m, pr, hub_dir, watch)
             except (agw.CtlError, OSError, ValueError, KeyError) as err:
                 self.error(f'close #{number}', err)
 
-    def step_close(self, data, m, hub_dir, watch):
+    def step_close(self, data, m, pr, hub_dir, watch):
         number = m['number']
+        # Every tick: a relay that came back owns the close again, and this attempt is dropped.
+        if closer.relay_alive(data['repo'], str(number), agw.tree()):
+            if watch['attempt'] is not None:
+                watch['attempt'].log('the relay is back; the conductor leaves the close to it')
+                watch['attempt'] = None
+            if not m.get('closeStuck'):
+                print(f'#{number}: {RELAY_ALIVE}', flush=True)
+                self.mark(number, closeStuck=RELAY_ALIVE)
+            return
         if watch['attempt'] is None:
-            if closer.relay_alive(data['repo'], str(number), agw.tree()):
-                if not m.get('closeStuck'):
-                    print(f'#{number}: {RELAY_ALIVE}', flush=True)
-                    self.mark(number, closeStuck=RELAY_ALIVE)
-                return
             registry = read_json(hub_dir / 'state' / 'agents.json')['agents']
             peers = [types.SimpleNamespace(box=box, tool=registry[box].get('tool', box), pane=registry[box]['pane'])
                      for box in ('claude', 'codex')]
-            watch['attempt'] = closer.Closer(hub_dir, data['repo'], f'issue-{number}', peers,
+            watch['attempt'] = closer.Closer(hub_dir, data['repo'], number, peers,
                                              log=lambda text: print(f'#{number} {text}', flush=True), clock=self.clock)
-            watch['attempt'].log(f'PR #{number} merged and its relay is gone; the conductor runs the close')
+            watch['attempt'].log(f'PR #{pr} (issue #{number}) merged and its relay is gone; the conductor runs the close')
         attempt = watch['attempt']
         attempt.step_helpers()
-        reasons = attempt.agent_blockers(number)
+        reasons = attempt.agent_blockers(pr)
         if not reasons:
             if attempt.autonomous():
                 attempt.close_issue_session()
             else:
                 attempt.log('NOT closing: autonomy was turned off')
-            self.end_close(m, hub_dir, stuck=None)
+            self.end_close(m, pr, hub_dir, stuck=None)
         elif attempt.timed_out():
             attempt.log(f'NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: ' + '; '.join(reasons))
             self.notify(f'#{number}: autonomous close stopped: ' + '; '.join(reasons))
-            self.end_close(m, hub_dir, stuck='the backstop close timed out: ' + '; '.join(reasons))
+            self.end_close(m, pr, hub_dir, stuck='the backstop close timed out: ' + '; '.join(reasons))
 
-    def end_close(self, m, hub_dir, stuck):
+    def end_close(self, m, pr, hub_dir, stuck):
         path = hub_dir / 'state' / 'relay.json'
         state = read_json(path)
-        state.pop('close_pending', None)
-        atomic_json(path, state)
+        if state.get('close_pending') == pr:
+            # Only the close this attempt ran: a relay may have rewritten the file since.
+            state.pop('close_pending')
+            atomic_json(path, state)
         self.closes.pop(m['number'], None)
         self.mark(m['number'], closePending=None, closeStuck=stuck)
 
