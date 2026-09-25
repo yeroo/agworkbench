@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
@@ -651,15 +652,33 @@ def check(name, bucket, state=None, link=None, workflow='CI'):
                 link=link or f'https://github.com/o/r/actions/runs/9{len(name)}/job/5{len(name)}', workflow=workflow)
 
 
+def remove_tree(path):
+    """rmtree that also removes git's read-only object files on Windows."""
+    def writable(function, target, *_):
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable)
+    else:
+        shutil.rmtree(path, onerror=writable)
+
+
+def scratch(case, prefix):
+    """A temporary folder outside the checkout, removed after the test - and proved removed."""
+    folder = Path(tempfile.mkdtemp(prefix=prefix))
+    case.addCleanup(lambda: case.assertFalse(folder.exists(), f'{folder} was left behind'))
+    case.addCleanup(remove_tree, folder)             # cleanups run last-in first-out: removal, then the check
+    return folder
+
+
 class MergeReadiness(unittest.TestCase):
     """#32: merge-check routes the ordinary cases (CI pending or failed, behind, conflict); wait-ci,
     update-check, merge-round, ci-log and ci-rerun keep the routing in code."""
 
     def setUp(self):
-        self.folder = Path(__file__).resolve().parent.parent / ('test wb ready ' + uuid.uuid4().hex)
+        self.folder = scratch(self, 'wb-ready-')
         self.state = self.folder / '.workbench/state'
         self.state.mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.folder, True)
         self.addCleanup(hub.reload_paths)
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
         hub.reload_paths()
@@ -921,9 +940,8 @@ class UpdateCheck(unittest.TestCase):
     """#32: an UPDATE round is exactly one merge of the pinned base into the reviewed head (real git)."""
 
     def setUp(self):
-        self.repo = Path(__file__).resolve().parent.parent / ('test wb update ' + uuid.uuid4().hex)
+        self.repo = scratch(self, 'wb-update-')     # a git repo: never inside the checkout (r22b)
         (self.repo / '.workbench').mkdir(parents=True)
-        self.addCleanup(shutil.rmtree, self.repo, True)
         self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.repo / '.workbench')}))
         self.out = io.StringIO()
         self.enterContext(contextlib.redirect_stdout(self.out))
