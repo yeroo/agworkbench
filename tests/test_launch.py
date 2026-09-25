@@ -1315,7 +1315,8 @@ class QueueEntry(LauncherFixtures):
                               parallel=1, watch=False, yes=False, label=None, owner=None, members=[member]))
         self.entry_lib = self.temp / 'queue entry'
         self.entry_lib.mkdir()
-        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py', 'triage.py']:
+        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py', 'triage.py',
+                     'labelquery.py']:
             shutil.copyfile(LIB / name, self.entry_lib / name)
         self.overrides = (
             "\nfunction Get-IssueInfo { return @{title='fix-x';state='OPEN'} }\n"
@@ -1340,17 +1341,142 @@ class QueueEntry(LauncherFixtures):
         with self.store.transaction() as data:
             data['members'][0].update(state='launching', token=self.token, result=None)
 
-    def test_queue_bugs_reaches_the_conductor_unchanged(self):
-        # #28: `bugs` is resolved by the conductor, so the launcher passes it through as a spec.
-        args_file = self.temp / 'conductor-args.txt'
-        self.cmd('python', f'echo %* > "{args_file}"')
-        result = subprocess.run([PWSH, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'),
-                                 '-Queue', 'bugs', '-Repo', 'o/repo', '-Watch', '-Autonomous'],
+    def conductor_start(self, spec, *extra, shell=PWSH):
+        """Run the launcher with a python stub that records its argv and the spec variable."""
+        dump = self.temp / 'conductor-start.json'
+        dump.unlink(missing_ok=True)
+        (self.temp / 'dump_start.py').write_text(
+            'import json, os, sys\n'
+            f'json.dump({{"args": sys.argv[1:], "spec": os.environ.get("AGWORKBENCH_QUEUE_SPEC")}}, '
+            f'open(r"{dump}", "w", encoding="utf-8"))\n', encoding='utf-8')
+        self.cmd('python', f'"{sys.executable}" "{self.temp / "dump_start.py"}" %*')
+        result = subprocess.run([shell, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'),
+                                 '-Queue', spec, '-Repo', 'o/repo', *extra],
                                 env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        args = args_file.read_text(encoding='utf-8', errors='replace')
-        self.assertIn('start --spec bugs --repo o/repo --watch', args)
-        self.assertIn('--autonomous', args)
+        return json.loads(dump.read_text(encoding='utf-8'))
+
+    def test_queue_bugs_reaches_the_conductor_unchanged(self):
+        # #28: `bugs` is resolved by the conductor, so the launcher passes it through as a spec.
+        seen = self.conductor_start('bugs', '-Watch', '-Autonomous')
+        self.assertEqual(['start', '--spec-env', '--repo', 'o/repo', '--watch'], seen['args'][1:6])
+        self.assertIn('--autonomous', seen['args'])
+        self.assertEqual('bugs', seen['spec'])
+
+    def test_a_query_spec_reaches_the_conductor_exactly_under_both_shells(self):
+        # #38: 5.1 strips double quotes from a native argument; the spec goes through the environment.
+        import labelquery
+        spec = r'''where: label IN [bug, "a, b [c]"] AND NOT "needs design" AND 'it\'s' OR "q\"x" OR "back\\slash" OR "a & b"'''
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                seen = self.conductor_start(spec, shell=shell)
+                self.assertEqual(spec, seen['spec'])
+                self.assertNotIn(spec, seen['args'])
+                self.assertEqual(labelquery.parse(spec[6:]), labelquery.parse(seen['spec'][6:]))
+                self.assertFalse(any('AGWORKBENCH_QUEUE_SPEC' in arg for arg in seen['args']))
+
+    # --- #38 r23: the entry point itself, called by name -------------------------------------------
+
+    def installed(self):
+        """A temporary install: the .cmd, the PowerShell entry point and the lib, first on PATH."""
+        root = Path(tempfile.mkdtemp(prefix='wb-install-'))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copytree(self.entry_lib, root / 'lib')
+        shutil.copyfile(ROOT / 'github-workbench.cmd', root / 'github-workbench.cmd')
+        shutil.copyfile(LIB / 'github-workbench-entry.ps1', root / 'github-workbench.ps1')
+        dump = self.temp / 'conductor-start.json'
+        (self.temp / 'dump_start.py').write_text(
+            'import json, os, sys\n'
+            f'json.dump({{"args": sys.argv[1:], "spec": os.environ.get("AGWORKBENCH_QUEUE_SPEC")}}, '
+            f'open(r"{dump}", "w", encoding="utf-8"))\n'
+            'sys.exit(int(os.environ.get("STUB_EXIT", "0")))\n', encoding='utf-8')
+        self.cmd('python', f'"{sys.executable}" "{self.temp / "dump_start.py"}" %*')
+        shells = [str(Path(PWSH).parent)] + ([str(Path(WINDOWS_PS).parent)] if WINDOWS_PS else [])
+        system = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32')
+        env = dict(self.env, PATH=os.pathsep.join([str(root), self.env['PATH'], *shells, system]))
+        return root, dump, env
+
+    def by_name(self, shell, call, env):
+        """Run `call` (PowerShell text calling github-workbench by name) in a script, and report
+        what the caller's session looks like afterwards."""
+        caller = Path(tempfile.mkdtemp(prefix='wb-caller-'))
+        self.addCleanup(shutil.rmtree, caller, True)
+        script = caller / 'caller.ps1'
+        script.write_text(
+            "$before = (Get-Location).Path\n"
+            "$envBefore = @(Get-ChildItem Env: | ForEach-Object Name)\n"
+            "$kind = (Get-Command github-workbench).CommandType.ToString()\n"
+            + call + "\n"
+            "$code = $LASTEXITCODE\n"
+            "$leaked = @(Get-ChildItem Env: | Where-Object { $_.Name -notin $envBefore } | ForEach-Object Name)\n"
+            "$vars = @('shell', 'name', 'list') | Where-Object { Get-Variable $_ -ErrorAction SilentlyContinue }\n"
+            "ConvertTo-Json -Compress @{ kind = $kind; code = $code; same = ((Get-Location).Path -eq $before); "
+            "leaked = $leaked; vars = @($vars) }\n", encoding='utf-8')
+        result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)],
+                                env=env, cwd=ROOT, capture_output=True, text=True, timeout=60)
+        return json.loads(result.stdout.strip().splitlines()[-1]), result
+
+    def test_a_double_quoted_query_survives_github_workbench_by_name(self):
+        # r23 M1: PowerShell resolves github-workbench.ps1 before the .cmd, whose command line would
+        # split 'where: bug AND NOT "needs design"' at the inner quotes.
+        root, dump, env = self.installed()
+        spec = 'where: bug AND NOT "needs design" AND label IN ["a,b"] OR "x & y" OR "p | q"'
+        # Without pwsh on PATH the entry point starts Windows PowerShell, which then rebuilds the arguments.
+        no_pwsh = dict(env, PATH=os.pathsep.join(d for d in env['PATH'].split(os.pathsep)
+                                                  if not (Path(d) / 'pwsh.exe').exists()))
+        cases = [(PWSH, env)] + ([(WINDOWS_PS, env), (WINDOWS_PS, no_pwsh)] if WINDOWS_PS else [])
+        for shell, case_env in cases:
+            with self.subTest(shell=shell, pwsh_on_path=case_env is env):
+                dump.unlink(missing_ok=True)
+                seen, result = self.by_name(shell, "github-workbench -Queue '" + spec.replace("'", "''") +
+                                            "' -Repo o/repo -Par 2 -DryRun:$false -Yes", case_env)
+                self.assertEqual('ExternalScript', seen['kind'], result.stderr)       # the .ps1, not the .cmd
+                self.assertEqual(0, seen['code'], result.stdout + result.stderr)
+                sent = json.loads(dump.read_text(encoding='utf-8'))
+                self.assertEqual(spec, sent['spec'])
+                self.assertIn('--parallel', sent['args'])
+                self.assertEqual('2', sent['args'][sent['args'].index('--parallel') + 1])   # a prefix, as PowerShell allows
+                self.assertIn('--yes', sent['args'])
+                self.assertNotIn('--dry-run', sent['args'])                            # -DryRun:$false
+                self.assertTrue(seen['same'])                                          # the caller's session is untouched
+                self.assertEqual([], seen['leaked'])
+                self.assertEqual([], seen['vars'])
+
+    def test_the_entry_point_keeps_the_exit_code_and_refuses_what_the_launcher_refuses(self):
+        root, dump, env = self.installed()
+        seen, result = self.by_name(PWSH, "github-workbench -Queue bugs -Repo o/repo", dict(env, STUB_EXIT='7'))
+        self.assertEqual(7, seen['code'], result.stdout + result.stderr)
+        for call, message in (("github-workbench -Queue bugs -Nonsense", '-Nonsense is not a parameter'),
+                              ("github-workbench -Queue bugs -No", '-No is ambiguous'),
+                              ("github-workbench -Queue", '-Queue needs a value')):
+            with self.subTest(call=call):
+                seen, result = self.by_name(PWSH, call, env)
+                self.assertEqual(2, seen['code'])
+                self.assertIn(message, result.stdout)
+
+    def test_cmd_callers_keep_the_cmd_and_single_quotes_inside_a_query(self):
+        root, dump, env = self.installed()
+        spec = "where: bug AND NOT 'needs design'"
+        result = subprocess.run(f'cmd /d /c github-workbench -Queue "{spec}" -Repo o/repo', env=env, cwd=ROOT,
+                                capture_output=True, text=True, timeout=60, shell=False)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(spec, json.loads(dump.read_text(encoding='utf-8'))['spec'])
+
+    def test_the_entry_point_is_installed_only_where_powershell_may_run_it(self):
+        root = Path(tempfile.mkdtemp(prefix='wb-install-'))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / 'lib').mkdir()
+        shutil.copyfile(LIB / 'github-workbench-entry.ps1', root / 'lib' / 'github-workbench-entry.ps1')
+        for policies, installed in (("[ordered]@{pwsh='RemoteSigned'; 'powershell.exe'='Unrestricted'}", True),
+                                    ("[ordered]@{pwsh='RemoteSigned'; 'powershell.exe'='Restricted'}", False),
+                                    ("[ordered]@{'powershell.exe'='AllSigned'}", False),
+                                    ("[ordered]@{pwsh='Bypass'}", True)):
+            with self.subTest(policies=policies):
+                result = ps(". ./lib/Workbench.ps1; Install-PowerShellEntry " + ps_quote(root) + " (" + policies + ")")
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual(installed, (root / 'github-workbench.ps1').exists())
+                if not installed:
+                    self.assertIn('quote labels with single quotes', result.stdout + result.stderr)
 
     def launcher(self, *args, shell=PWSH):
         args_file = self.temp / 'python-args.txt'

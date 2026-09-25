@@ -18,6 +18,7 @@ from urllib.parse import quote, urlparse
 
 import agw
 import closer
+import labelquery
 import triage
 
 HERE = Path(__file__).resolve().parent
@@ -151,7 +152,20 @@ def gh_json(*args):
 
 
 def resolve_spec(spec, hint=None, gh=gh_json):
+    """(repo, numbers, watched): `watched` is the label of a `label:` spec, a labelquery.Query for a
+    `where:` spec (#38), else None."""
     label = None
+    if spec[:6].casefold() == 'where:':
+        # Parsed before any network: a malformed query changes nothing and costs no call.
+        try:
+            node, query = labelquery.compile_query(spec[6:])
+        except labelquery.QueryError as err:
+            raise UsageError(f'invalid query: {err}') from None
+        repo = repo_name(hint or gh('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner'])
+        pages = gh('api', f'repos/{repo}/issues?state=open&per_page=100', '--paginate', '--slurp')
+        issues = [issue for page in pages for issue in page if 'pull_request' not in issue and
+                  labelquery.evaluate(node, labelquery.labels_of(label.get('name') for label in issue.get('labels') or []))]
+        return repo, list(dict.fromkeys(i['number'] for i in sorted(issues, key=lambda i: (i['created_at'], i['number'])))), query
     if spec.startswith('label:'):
         label = spec[6:].strip()
         if not label:
@@ -273,6 +287,43 @@ def in_hand(repo, numbers, root, queue_path, gh=gh_json, tree=None):
     return skip_reasons(numbers, repo, root, queue_path, pr_reasons(repo, numbers, gh), session_numbers(repo, tree))
 
 
+def valid_watch(data):
+    """A watching queue names exactly one spec: a label or a query (#38); `query` is a string or absent."""
+    label, query = data.get('label'), data.get('query')
+    if query is not None and (not isinstance(query, str) or not query):
+        return False
+    if not data['watch']:
+        return True
+    has_label = isinstance(label, str) and bool(label)
+    return has_label != (query is not None)
+
+
+def watch_fields(watched):
+    """The queue-file fields for a watched spec."""
+    if isinstance(watched, labelquery.Query):
+        return {'label': None, 'query': watched.text}
+    return {'label': watched, 'query': None}
+
+
+def watch_key(data):
+    """The identity of a queue's watched spec: the label, or the query's normalised form."""
+    if data.get('query'):
+        try:
+            return ('query', labelquery.compile_query(data['query'])[1].key)
+        except labelquery.QueryError:
+            return ('query', data['query'])
+    return ('label', data.get('label'))
+
+
+def spec_key(watched):
+    return ('query', watched.key) if isinstance(watched, labelquery.Query) else ('label', watched)
+
+
+def watched_spec(data):
+    """The spec a watching queue rescans: rebuilt from the saved fields, never from the environment."""
+    return 'where: ' + data['query'] if data.get('query') else 'label:' + data['label']
+
+
 def config_path():
     return Path(os.environ.get('AGWORKBENCH_CONFIG', Path.home() / '.agworkbench.json')).resolve()
 
@@ -310,7 +361,7 @@ class Store:
                 raise ValueError('invalid triage')
             if (not isinstance(data['config'], str) or not Path(data['config']).is_absolute() or
                     type(data['yes']) is not bool or not isinstance(data['members'], list) or
-                    (data['watch'] and (not isinstance(data['label'], str) or not data['label']))):
+                    not valid_watch(data)):
                 raise ValueError('invalid settings/members')
             seen = set()
             for m in data['members']:
@@ -390,17 +441,25 @@ def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, w
     current = data or {}
     wanted = {'parallel': parallel, 'yes': True if yes else None, 'implementer': implementer,
               'autoMerge': auto_merge, 'autonomous': autonomous, 'triage': True if triage_on else None}
-    if watch:
-        wanted.update(watch=True, label=label)
-    return {key: [current.get(key), value] for key, value in wanted.items()
-            if value is not None and data is not None and current.get(key) != value}
+    changes = {key: [current.get(key), value] for key, value in wanted.items()
+               if value is not None and data is not None and current.get(key) != value}
+    if watch and data is not None:
+        if not current.get('watch'):
+            changes['watch'] = [current.get('watch'), True]
+        if watch_key(current) != spec_key(label):
+            # Another spelling of the same query is not a change (#38).
+            for key, value in watch_fields(label).items():
+                if current.get(key) != value:
+                    changes[key] = [current.get(key), value]
+    return changes
 
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
                 implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False):
     repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
+    matches = len(numbers)
     if watch and not label:
-        raise UsageError('-Watch requires a label spec')
+        raise UsageError('-Watch requires a label:, bugs or where: spec')
     root = Path(root or os.environ.get('AGWORKBENCH_QUEUE_ROOT', Path.home() / '.agworkbench/queues')).resolve()
     store = Store(root / (repo + '.json'))
     if parallel is not None and not 1 <= parallel <= 8:
@@ -421,7 +480,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         live = store.running() if store.worker_lock.exists() else False
         mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
         changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
-        print(json.dumps(dict(repo=repo, members=numbers, running=live, mode=mode,
+        query = dict(query=label.text, matches=matches) if isinstance(label, labelquery.Query) else {}
+        print(json.dumps(dict(repo=repo, **query, members=numbers, running=live, mode=mode,
                               skipped=[dict(number=n, reason=r) for n, r in sorted(skipped.items())],
                               settings=changes, owner=existing.get('owner') if existing else None)))
         return 0
@@ -432,7 +492,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
             if data['repo'] != repo:
                 raise QueueError(f'queue repository mismatch in {store.path}')
         else:
-            data = dict(version=1, repo=repo, parallel=parallel or 1, watch=watch, label=label if watch else None,
+            data = dict(version=1, repo=repo, parallel=parallel or 1, watch=watch,
+                        **(watch_fields(label) if watch else {'label': None}),
                         yes=yes, config=str(config_path()), members=[], owner=None)
         validate_append(data, watch, label)
         # One mapping decides and applies every switch, and is what gets reported (#28). All apply to
@@ -480,9 +541,10 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
 
 
 def validate_append(data, watch, label):
-    # One watched label per queue. An unwatched queue may start watching (#28); a watched one keeps its label.
-    if data and watch and data['watch'] and data['label'] != label:
-        raise UsageError('one watched label per queue; cannot change saved watch semantics')
+    # One watched spec per queue. An unwatched queue may start watching (#28); a watched one keeps its
+    # label or query (#38: compared in normalised form, so another spelling of the same query passes).
+    if data and watch and data['watch'] and watch_key(data) != spec_key(label):
+        raise UsageError('one watched label or query per queue; cannot change saved watch semantics')
 
 
 def member_context(path, number, attempt, token):
@@ -692,7 +754,7 @@ class Worker:
         if data['watch'] and self.clock() >= self.next_scan:
             self.next_scan = self.clock() + 300
             try:
-                _, numbers, _ = resolve_spec('label:' + data['label'], data['repo'], self.gh)
+                _, numbers, _ = resolve_spec(watched_spec(data), data['repo'], self.gh)
                 known = {m['number'] for m in data['members']}
                 fresh = [n for n in numbers if n not in known]
                 skipped = in_hand(data['repo'], fresh, checkout_root(data['config']), self.store.path, self.gh)
@@ -1032,7 +1094,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
     start = sub.add_parser('start')
-    start.add_argument('--spec', required=True)
+    source = start.add_mutually_exclusive_group(required=True)
+    source.add_argument('--spec')
+    # The launcher passes the spec in AGWORKBENCH_QUEUE_SPEC: Windows PowerShell 5.1 strips the double
+    # quotes out of a native argument, which would change a quoted label in a query (#38).
+    source.add_argument('--spec-env', action='store_true')
     start.add_argument('--repo')
     start.add_argument('--parallel', type=int)
     for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage'):
@@ -1069,7 +1135,12 @@ def main(argv=None):
         if args.command == 'start':
             if os.environ.get('AGWINTERM_ENABLED') != '1' or not os.environ.get('AGWINTERM_SESSION_ID'):
                 raise UsageError('queue mode requires running inside agwinterm')
-            return start_queue(args.spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
+            spec = args.spec
+            if args.spec_env:
+                spec = os.environ.get('AGWORKBENCH_QUEUE_SPEC', '')
+                if not spec.strip():
+                    raise UsageError('--spec-env: AGWORKBENCH_QUEUE_SPEC is empty')
+            return start_queue(spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
                                implementer=args.implementer, auto_merge=args.auto_merge,
                                autonomous=args.autonomous, triage_on=args.triage)
         if args.command == 'run':

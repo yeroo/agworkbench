@@ -15,7 +15,7 @@
 
   Each issue gets its own full clone under ~/source/workbench, on branch issue-<n>-<slug>, and its
   own mailbox in .workbench/ inside that clone. Running it again for the same issue resumes.
-  Inside agwinterm, -Queue runs an issue list or watched label in separate sessions.
+  Inside agwinterm, -Queue runs an issue list, or a watched label or query, in separate sessions.
 
 .EXAMPLE
   github-workbench 42                     # issue 42 of the repo in the current directory
@@ -35,6 +35,9 @@
   github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous   # every open bug nobody is handling
 .EXAMPLE
   github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous -Triage   # P0 first; untriaged triaged first
+.EXAMPLE
+  github-workbench -Queue 'where: bug AND priority IN [P0, P1] AND NOT wontfix' -Repo yeroo/docxy
+  github-workbench -Queue "where: label IN [bug, regression] AND NOT 'needs design'" -Repo yeroo/docxy
 .EXAMPLE
   github-workbench -Triage -Repo yeroo/docxy            # label every untriaged open issue priority:P0..P3
   github-workbench -Triage -Repo yeroo/docxy -Watch     # and keep doing it for new ones, in its own session
@@ -64,10 +67,65 @@ param(
     [switch] $Triage,
     [switch] $Retriage,
     [int] $Limit,
-    [switch] $Version
+    [switch] $Version,
+    [string] $ArgsEnv
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ArgsEnv) {
+    # From the PowerShell entry point (github-workbench.ps1 next to the .cmd, #38): the caller's
+    # arguments as a JSON array in a one-off environment variable, bound here by name, exactly as
+    # typed - no command line in between that could split them or strip their quotes.
+    $raw = [Environment]::GetEnvironmentVariable($ArgsEnv)
+    Remove-Item -LiteralPath "Env:\$ArgsEnv" -ErrorAction SilentlyContinue
+    if ($PSBoundParameters.Count -ne 1 -or $null -eq $raw) {
+        Write-Host '-ArgsEnv is internal to the PowerShell entry point and takes no other arguments.' -ForegroundColor Yellow
+        exit 2
+    }
+    # A foreach statement, not the pipeline: 5.1's ConvertFrom-Json emits the array as one object.
+    $tokens = @()
+    foreach ($token in (ConvertFrom-Json $raw)) { $tokens += [string]$token }
+    $parameters = (Get-Command $PSCommandPath).Parameters
+    $named = @{}
+    $positional = @()
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $token = $tokens[$i]
+        if ($token -notmatch '^-([A-Za-z][A-Za-z0-9]*)(:(.*))?$') {
+            $positional += $token
+            continue
+        }
+        $given, $hasValue, $value = $Matches[1], [bool]$Matches[2], $Matches[3]
+        # PowerShell's own rule: a unique prefix of a parameter name (or an alias) names it.
+        $found = @($parameters.Values | Where-Object {
+                $_.Name -ne 'ArgsEnv' -and ($_.Name -like "$given*" -or @($_.Aliases | Where-Object { $_ -like "$given*" }))
+            })
+        $exact = @($found | Where-Object { $_.Name -eq $given -or $_.Aliases -contains $given })
+        if ($exact.Count -eq 1) { $found = $exact }
+        if ($found.Count -ne 1) {
+            $why = if ($found.Count) { 'is ambiguous' } else { 'is not a parameter' }
+            Write-Host "github-workbench: -$given $why" -ForegroundColor Yellow
+            exit 2
+        }
+        $parameter = $found[0]
+        if ($parameter.SwitchParameter) {
+            if ($hasValue -and $value -eq '' -and $i + 1 -lt $tokens.Count) { $i++; $value = $tokens[$i] }
+            $named[$parameter.Name] = if ($hasValue) { $value -notin @('False', '$false', '0') } else { $true }
+            continue
+        }
+        if (-not $hasValue -or $value -eq '') {
+            if ($i + 1 -ge $tokens.Count) {
+                Write-Host "github-workbench: -$($parameter.Name) needs a value" -ForegroundColor Yellow
+                exit 2
+            }
+            $i++
+            $value = $tokens[$i]
+        }
+        $named[$parameter.Name] = $value
+    }
+    & $PSCommandPath @named @positional
+    exit $LASTEXITCODE
+}
 . (Join-Path $PSScriptRoot 'Workbench.ps1')
 
 if ($Version) {
@@ -116,7 +174,9 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
         Write-Host 'Queue requires agwinterm, a spec and Parallel 1..8; Issue/NewSession/NoRelay/internal member options cannot be combined with it.'
         exit 2
     }
-    $queueArgs = @((Join-Path $script:Lib 'conductor.py'), 'start', '--spec', $Queue)
+    # The spec travels in the environment, not argv: Windows PowerShell 5.1 strips the double quotes
+    # out of a native argument, and a query quotes labels (#38).
+    $queueArgs = @((Join-Path $script:Lib 'conductor.py'), 'start', '--spec-env')
     if ($Repo) { $queueArgs += @('--repo', $Repo) }
     if ($PSBoundParameters.ContainsKey('Parallel')) { $queueArgs += @('--parallel', "$Parallel") }
     if ($Watch) { $queueArgs += '--watch' }
@@ -133,8 +193,14 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
         Write-Host '-Retriage and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
         exit 2
     }
-    & python @queueArgs
-    exit $LASTEXITCODE
+    $env:AGWORKBENCH_QUEUE_SPEC = $Queue
+    try {
+        & python @queueArgs
+        $code = $LASTEXITCODE
+    } finally {
+        Remove-Item Env:\AGWORKBENCH_QUEUE_SPEC -ErrorAction SilentlyContinue
+    }
+    exit $code
 }
 if ($Triage -or $Retriage) {
     # Issue triage (#34): lib/triage.py labels the repo's open issues priority:P0..P3.
@@ -166,7 +232,7 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $PSBoun
 if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
-    Write-Host "       (<spec> is a list like 3,4,5, label:<name>, or bugs = label:<bugLabel>)"
+    Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
     Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-Watch]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"

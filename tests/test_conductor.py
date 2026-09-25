@@ -1118,6 +1118,136 @@ class PriorityOrder(unittest.TestCase):
         self.assertEqual([1], [x[0] for x in self.launches])
 
 
+def listed(number, created, *labels, pr=False):
+    issue = {'number': number, 'created_at': created, 'labels': [{'name': name} for name in labels]}
+    if pr:
+        issue['pull_request'] = {}
+    return issue
+
+
+class LabelQuery(unittest.TestCase):
+    """#38: `-Queue 'where: <query>'` selects open issues by a boolean label query; the queue
+    machinery is unchanged, and a watched query is stored and compared in normalised form."""
+    terminal, start, member = QueueCase.terminal, QueueCase.start, QueueCase.member
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.calls = []
+        self.pages = [[listed(5, '2026-01-05', 'bug', 'priority:P1'), listed(3, '2026-01-03', 'Bug', 'priority:P0'),
+                       listed(9, '2026-01-09', 'bug', 'priority:P0', pr=True)],
+                      [listed(4, '2026-01-04', 'bug', 'priority:P3'), listed(2, '2026-01-02', 'bug', 'wontfix', 'priority:P0'),
+                       listed(1, '2026-01-06', 'bug')]]
+
+    def fake_gh(self, *args):
+        self.calls.append(args)
+        if args[:2] == ('repo', 'view'):
+            return {'nameWithOwner': 'o/r'}
+        if args[0] == 'api' and args[1].startswith('repos/o/r/issues?state=open'):
+            return self.pages
+        if args[0] == 'api' and args[1].startswith('repos/o/r/issues?labels='):
+            return [[]]
+        raise AssertionError(args)
+
+    def query(self, spec, **kwargs):
+        return self.start(spec, gh=self.fake_gh, **kwargs)
+
+    def test_a_query_selects_open_issues_oldest_first_prs_excluded(self):
+        repo, numbers, query = q.resolve_spec('where: bug AND priority IN [P0, P1] AND NOT wontfix', 'o/r', self.fake_gh)
+        self.assertEqual(('o/r', [3, 5]), (repo, numbers))                     # 9 is a PR, 2 is wontfix
+        self.assertEqual('(bug AND priority IN [P0, P1] AND NOT wontfix)', query.text)
+        self.assertEqual([('api', 'repos/o/r/issues?state=open&per_page=100', '--paginate', '--slurp')], self.calls)
+        _, numbers, _ = q.resolve_spec('WHERE:bug AND priority NOT IN [P2, P3]', 'o/r', self.fake_gh)
+        self.assertEqual([2, 3, 5, 1], numbers)                                # untriaged #1 included
+
+    def test_a_malformed_query_is_refused_before_any_call(self):
+        with self.assertRaises(q.UsageError) as caught:
+            q.resolve_spec('where: bug AND', None, self.fake_gh)
+        self.assertIn('column 8', str(caught.exception))
+        self.assertEqual([], self.calls)
+        with self.assertRaises(q.UsageError):
+            self.query('where: priority IN []')
+        self.assertFalse(self.store.path.exists())                             # nothing written
+
+    def test_a_listing_failure_is_an_error_never_no_issues(self):
+        def failing(*args):
+            raise q.QueueError('HTTP 502')
+        with self.assertRaises(q.QueueError):
+            q.resolve_spec('where: bug', 'o/r', failing)
+
+    def test_dry_run_shows_the_canonical_query_the_matches_and_the_members(self):
+        self.in_hand.return_value = {3: 'pr: open PR #40 will close it'}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(0, self.query('where: bug and priority in [P0,P1] and not wontfix', repo='o/r', dry_run=True))
+        report = json.loads(out.getvalue())
+        self.assertEqual('(bug AND priority IN [P0, P1] AND NOT wontfix)', report['query'])
+        self.assertEqual(2, report['matches'])
+        self.assertEqual([5], report['members'])
+        self.assertEqual([{'number': 3, 'reason': 'pr: open PR #40 will close it'}], report['skipped'])
+        self.assertFalse(self.store.path.exists())
+
+    def test_members_go_through_the_usual_skip_rules(self):
+        self.in_hand.return_value = {5: 'session: a live workbench session is open for it'}
+        self.query('where: bug AND priority IN [P0, P1]', repo='o/r')
+        self.assertEqual([2, 3], [m['number'] for m in self.store.load()['members']])
+        self.in_hand.assert_called_once()
+
+    def test_a_watched_query_is_saved_rescanned_and_compared_by_its_normalised_form(self):
+        self.query('where: bug AND priority IN [P0]', repo='o/r', watch=True)
+        data = self.store.load()
+        self.assertEqual((True, None, '(bug AND priority IN [P0])'), (data['watch'], data['label'], data['query']))
+        self.assertEqual('where: (bug AND priority IN [P0])', q.watched_spec(data))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.query('where: Bug and (PRIORITY in ["p0"])', repo='o/r', watch=True)   # the same query
+        self.assertNotIn('settings:', out.getvalue())
+        self.assertEqual('(bug AND priority IN [P0])', self.store.load()['query'])     # as first written
+        for other in ('where: bug AND priority IN [P1]', 'label:bug'):
+            with self.subTest(other=other), self.assertRaises(q.UsageError):
+                self.query(other, repo='o/r', watch=True)
+
+    def test_a_label_watch_refuses_a_query(self):
+        with patch.object(q, 'resolve_spec', return_value=('o/r', [], 'work')):
+            self.start('label:work', watch=True)
+        with self.assertRaises(q.UsageError):
+            self.query('where: work', repo='o/r', watch=True)
+
+    def test_the_rescan_uses_the_saved_query(self):
+        self.query('where: bug AND priority IN [P0]', repo='o/r', watch=True)
+        worker = q.Worker(self.store, self.store.load()['owner']['token'], clock=lambda: self.now,
+                          gh=lambda *args: [] if args[:2] == ('issue', 'list') else self.fake_gh(*args),
+                          spawn=QueueCase.spawn.__get__(self))
+        self.launches = []
+        self.pages[1].append(listed(12, '2026-02-01', 'bug', 'priority:P0'))
+        self.now += 400
+        with patch.dict(os.environ, {'AGWORKBENCH_QUEUE_SPEC': 'where: nonsense ((('}):   # never read by the rescan
+            worker.refresh_remote()
+        self.assertIn(12, [m['number'] for m in self.store.load()['members']])
+
+    def test_queue_files_old_and_invalid(self):
+        self.start('o/r#1')
+        data = q.read_json(self.store.path)
+        self.assertNotIn('query', data)                                         # an old file, as it was
+        for change in ({'watch': True, 'label': 'bug', 'query': '(bug)'}, {'watch': True, 'label': None, 'query': None},
+                       {'watch': False, 'query': 7}, {'watch': True, 'label': None, 'query': ''}):
+            with self.subTest(change=change):
+                q.atomic_json(self.store.path, dict(data, **change))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
+        q.atomic_json(self.store.path, dict(data, watch=True, label=None, query='(bug)'))
+        self.assertEqual('(bug)', self.store.load()['query'])
+
+    def test_the_spec_can_come_from_the_environment(self):
+        with patch.object(q, 'start_queue', return_value=0) as start:
+            with patch.dict(os.environ, {'AGWORKBENCH_QUEUE_SPEC': 'where: NOT "needs design" & x'}):
+                self.assertEqual(0, q.main(['start', '--spec-env', '--repo', 'o/r']))
+            self.assertEqual('where: NOT "needs design" & x', start.call_args.args[0])
+            with patch.dict(os.environ, {'AGWORKBENCH_QUEUE_SPEC': '  '}), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(2, q.main(['start', '--spec-env']))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            q.main(['start', '--spec', 'bugs', '--spec-env'])
+
+
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
         self.assertEqual(('o/r', [3, 4], None), q.resolve_spec('o/r#3,#4,3'))

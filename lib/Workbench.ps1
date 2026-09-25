@@ -602,6 +602,37 @@ function Get-ClaudeQuietSettings([string] $Checkout) {
     return Join-Path $Checkout '.workbench\state\claude-settings.json'
 }
 
+function Get-ShellScriptPolicies {
+    # The effective execution policy of each installed PowerShell, as that shell reports it.
+    $policies = [ordered]@{}
+    foreach ($shell in @('pwsh', 'powershell.exe')) {
+        if (-not (Get-Command $shell -CommandType Application -ErrorAction SilentlyContinue)) { continue }
+        $policies[$shell] = (& $shell -NoLogo -NoProfile -NonInteractive -Command 'Get-ExecutionPolicy' 2>$null | Select-Object -Last 1)
+    }
+    return $policies
+}
+
+function Install-PowerShellEntry([string] $Root, $Policies = $null) {
+    # github-workbench.ps1 next to github-workbench.cmd (#38): PowerShell resolves it first, so a
+    # query's double-quoted labels survive; the .cmd would split them. Only when every installed
+    # PowerShell may run local scripts - under Restricted or AllSigned the .ps1 would be found first
+    # and refused, with no fallback to the .cmd.
+    if ($null -eq $Policies) { $Policies = Get-ShellScriptPolicies }
+    $target = Join-Path $Root 'github-workbench.ps1'
+    $blocked = @($Policies.Keys | Where-Object { "$($Policies[$_])".Trim() -notin @('RemoteSigned', 'Unrestricted', 'Bypass') })
+    if ($blocked) {
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+        $which = ($blocked | ForEach-Object { "$_ ($($Policies[$_]))" }) -join ', '
+        Write-Warning ("PowerShell may not run local scripts in $which, so github-workbench runs through " +
+            "github-workbench.cmd there: inside a -Queue 'where: ...' query, quote labels with single " +
+            "quotes (for example -Queue ""where: bug AND NOT 'needs design'"").")
+        return $false
+    }
+    Copy-Item -Force -LiteralPath (Join-Path $Root 'lib\github-workbench-entry.ps1') -Destination $target
+    Write-Done "PowerShell entry point: $target"
+    return $true
+}
+
 function Write-ClaudeQuietSettings([string] $Path) {
     # Both agent panes start at once and write the same file: write only when it is missing or
     # different, through a temp file and a rename, so a reader never sees it half written (#33).
