@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'lib'))
 import cleanup  # noqa: E402
 import conductor  # noqa: E402
+import triage  # noqa: E402
 
 EMPTY_TREE = {'workspaces': [{'name': 'repo', 'sessions': []}]}
 
@@ -26,12 +27,18 @@ def run(cwd, *args):
     return done.stdout.strip()
 
 
+def junction(link, target):
+    """A directory junction: no privilege needed on Windows."""
+    import _winapi
+    _winapi.CreateJunction(str(target), str(link))
+
+
 class Clones(unittest.TestCase):
     def setUp(self):
         self.base = ROOT / ('test cleanup ' + uuid.uuid4().hex)
         self.root = self.base / 'clones'
         self.root.mkdir(parents=True)
-        self.addCleanup(lambda: shutil.rmtree(cleanup.long_path(self.base), onexc=cleanup._writable_retry))
+        self.addCleanup(lambda: triage.remove_tree(cleanup.long_path(self.base)))
 
     def clone(self, number=7, name='repo', origin='https://github.com/o/repo.git', pushed=True):
         """A workbench-shaped clone: `<root>/<name>-issue-<N>` on `issue-<N>-fix`, `.workbench/` excluded
@@ -140,6 +147,22 @@ class Check(Clones):
         self.push(checkout)                    # the new branch's commit is already on origin/issue-7-fix
         self.assertReason('it has linked worktrees', self.check(checkout))
 
+    def test_submodules_keep_it(self):
+        # r1 M2: a submodule's unpushed commits live in .git/modules, where no other check looks.
+        checkout = self.clone()
+        (checkout / '.gitmodules').write_text('[submodule "lib"]\n\tpath = lib\n\turl = https://github.com/o/lib.git\n',
+                                              encoding='utf-8')
+        run(checkout, 'add', '.gitmodules')
+        run(checkout, 'commit', '-q', '-m', 'submodule')
+        self.push(checkout)
+        self.assertReason('it has submodules', self.check(checkout))
+        run(checkout, 'rm', '-q', '.gitmodules')
+        run(checkout, 'commit', '-q', '-m', 'no submodule')
+        self.push(checkout)
+        self.assertEqual([], self.check(checkout))
+        (checkout / '.git' / 'modules' / 'lib').mkdir(parents=True)             # left behind by a removed one
+        self.assertReason('it has submodules', self.check(checkout))
+
     def test_a_queue_still_running_the_member_keeps_it(self):
         checkout = self.clone()
         queue = self.base / 'queues' / 'o' / 'repo.json'
@@ -221,6 +244,40 @@ class Remove(Clones):
         for kept in ('bin/tool.ps1', 'bin/built.exe', '.git/target', 'README.md', 'web', 'src'):
             self.assertTrue((checkout / kept).exists(), kept)
 
+    def test_read_only_files_delete_on_python_before_3_12(self):
+        # r1 M1: shutil.rmtree has no onexc before 3.12; the project's helper falls back to onerror.
+        checkout = self.clone()
+        (checkout / 'locked.txt').write_text('x', encoding='utf-8')
+        os.chmod(checkout / 'locked.txt', 0o444)
+        real = shutil.rmtree
+
+        def old_rmtree(path, ignore_errors=False, onerror=None, **kwargs):
+            if kwargs:
+                raise TypeError(f'rmtree() got unexpected keyword arguments {sorted(kwargs)}')
+            return real(path, ignore_errors, onerror)
+        with patch.object(triage.sys, 'version_info', (3, 11, 9)), patch.object(shutil, 'rmtree', old_rmtree):
+            cleanup.remove(checkout, 'merged', pause=lambda s: None)
+        self.assertEqual([], list(self.root.iterdir()))
+
+    def test_build_mode_needs_no_is_junction(self):
+        # r1 M1: Path.is_junction is 3.12+.
+        checkout = self.clone()
+        (checkout / 'target').mkdir()
+        with patch.object(type(checkout), 'is_junction', None, create=True):
+            self.assertEqual([checkout / 'target'], cleanup.build_outputs(checkout))
+
+    @unittest.skipUnless(os.name == 'nt', 'directory junctions are Windows only')
+    def test_build_mode_never_follows_a_junction(self):
+        checkout = self.clone()
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'precious').write_text('keep', encoding='utf-8')
+        junction(checkout / 'target', outside)
+        self.assertEqual([], cleanup.build_outputs(checkout))
+        cleanup.remove(checkout, 'build')
+        self.assertTrue((outside / 'precious').exists())
+        os.rmdir(checkout / 'target')                                           # the junction, not its target
+
     def test_a_second_cleanup_of_the_same_checkout_waits_its_turn(self):
         checkout = self.clone()
         with conductor.Lock(cleanup.lock_path(self.root, checkout), 0):
@@ -250,7 +307,7 @@ class AfterClose(Clones):
         self.t += seconds
 
     def after_close(self, checkout, mode='merged'):
-        return cleanup.after_close(checkout, 'o/repo', 7, 42, mode, tree=self.tree, gh=self.gh,
+        return cleanup.after_close(checkout, 'o/repo', 7, 42, mode, read_tree=self.tree, gh=self.gh,
                                    clock=lambda: self.t, pause=self.pause)
 
     def root_log(self):
@@ -283,7 +340,7 @@ class AfterClose(Clones):
         for number, (arrange, reason) in enumerate(((dirty, 'uncommitted changes'), (unpushed, 'unpushed: issue-7-fix'),
                                                     (stashed, 'stash: 1')), start=1):
             with self.subTest(reason=reason):
-                shutil.rmtree(cleanup.long_path(self.root), onexc=cleanup._writable_retry)
+                triage.remove_tree(cleanup.long_path(self.root))
                 self.root.mkdir()
                 checkout = self.clone()
                 arrange(checkout)
@@ -405,7 +462,7 @@ class Sweep(Clones):
     def sweep(self, tree=EMPTY_TREE, **kwargs):
         self.lines = []
         read = (lambda: tree) if tree is not None else Mock(side_effect=OSError('no pipe'))
-        return cleanup.sweep(self.root, gh=self.gh, tree=read, out=self.lines.append, **kwargs)
+        return cleanup.sweep(self.root, gh=self.gh, read_tree=read, out=self.lines.append, **kwargs)
 
     def output(self):
         return '\n'.join(self.lines)
@@ -458,6 +515,31 @@ class Sweep(Clones):
                          {p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')})
         self.assertIn('deleted (merged)', (self.root / cleanup.LOG_NAME).read_text(encoding='utf-8'))
 
+    def test_a_closed_issue_with_an_open_pr_is_skipped(self):
+        # r1 m4: an open PR on the branch wins over a closed issue.
+        checkout = self.clone(12)
+        self.issues[12] = 'CLOSED'
+        self.prs['issue-12-fix'] = [{'number': 50, 'state': 'OPEN'}]
+        self.assertEqual(0, self.sweep())
+        self.assertIn(f'skip {checkout}: PR #50 is open', self.output())
+        self.assertTrue(checkout.exists())
+
+    @unittest.skipUnless(os.name == 'nt', 'directory junctions are Windows only')
+    def test_a_leftover_that_is_a_link_is_never_followed(self):
+        # r1 m3
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'precious').write_text('keep', encoding='utf-8')
+        link = self.root / 'repo-issue-5.deleting-1700000000'
+        junction(link, outside)
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.assertEqual(1, self.sweep(dry_run=dry_run))
+                self.assertIn(f'keep {link}: is a link', self.output())
+                self.assertTrue((outside / 'precious').exists())
+                self.assertTrue(link.exists())
+        os.rmdir(link)                                                          # the junction, not its target
+
     def test_without_repo_every_repo_is_swept(self):
         *_, other, _ = self.fixture()
         self.sweep()
@@ -489,7 +571,7 @@ class Sweep(Clones):
     def test_nothing_to_do_is_exit_0(self):
         self.clone(8)
         self.assertEqual(0, self.sweep())
-        self.assertEqual(0, cleanup.sweep(self.base / 'missing', gh=self.gh, tree=lambda: EMPTY_TREE, out=self.lines.append))
+        self.assertEqual(0, cleanup.sweep(self.base / 'missing', gh=self.gh, read_tree=lambda: EMPTY_TREE, out=self.lines.append))
 
 
 if __name__ == '__main__':

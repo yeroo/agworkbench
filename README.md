@@ -438,7 +438,7 @@ merges, unless you opted in for that checkout.
 - **It deletes the checkout** (#41, config `cleanup`, default `merged`). Once the issue session is
   closed, a detached `lib/cleanup.py after-close` waits (up to 10 minutes) until no `#N` session is
   left in the repo's workspace, then deletes the clone, but only when it is safe: nothing
-  uncommitted, untracked or stashed, no linked worktree, no `.git/index.lock`, no launcher or queue
+  uncommitted, untracked or stashed, no linked worktree, no submodule, no `.git/index.lock`, no launcher or queue
   still using it, and every local commit on a remote-tracking ref or inside the merged PR's head.
   Otherwise the checkout stays and the reason is logged. The delete renames the directory to
   `<name>-issue-<N>.deleting-<ts>` first, which Windows refuses while anything holds a file or its
@@ -483,10 +483,10 @@ github-workbench -Cleanup                         # delete the candidates that p
 github-workbench -Cleanup -Repo yeroo/docxy -BuildOnly   # only their build outputs
 ```
 
-A checkout is a candidate when its issue is closed, or its branch has a merged or closed PR and no
-open one. Each candidate gets the same checks as the autonomous delete, and the sweep refuses them
+A checkout is a candidate when its branch has no open PR, and either its issue is closed or the
+branch has a merged or closed PR. Each candidate gets the same checks as the autonomous delete, and the sweep refuses them
 all when the session tree cannot be read (run it inside agwinterm). Leftover `*.deleting-*`
-directories from an interrupted delete are removed. It exits 0, 1 when it kept a candidate for a
+directories from an interrupted delete are removed; one that is a link is kept, never followed. It exits 0, 1 when it kept a candidate for a
 safety reason, and 2 on a usage or GitHub error.
 
 **The queue's disk guard.** Before admitting a member, the conductor checks the free space on the

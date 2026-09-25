@@ -1015,6 +1015,32 @@ class DiskGuard(unittest.TestCase):
         self.assertEqual('queue resumed: disk space is back', self.w.notify.call_args.args[0])
         self.w.status.assert_called_with('active')
 
+    def test_an_orphaned_launch_is_not_respawned_while_paused(self):
+        # r1 m1: a launching member whose launcher died is re-spawned only when there is space.
+        with self.store.transaction() as data:
+            m = data['members'][0]
+            m.update(state='launching', attempt=1, token=str(uuid.uuid4()), result=None, startedAt=self.now,
+                     slotReleased=False)
+        self.free = 5 * q.GIB
+        self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual('launching', self.member(1)['state'])
+        self.free = 25 * q.GIB
+        self.w.tick()
+        self.assertIn(1, [n for n, _, _ in self.launches])
+
+    def test_a_restarted_conductor_announces_the_pause_it_finds(self):
+        # r1 m2: run() sets the status active; the first tick of a new worker must say it is paused.
+        self.free = 5 * q.GIB
+        self.w.tick()
+        fresh = self.worker()
+        fresh.notify, fresh.status = Mock(), Mock()
+        fresh.tick()
+        fresh.notify.assert_called_once_with('queue paused: low disk: 5.0 GB free < 20 GB on X:')
+        fresh.status.assert_called_once_with('blocked')
+        fresh.tick()
+        fresh.notify.assert_called_once()
+
     def test_the_threshold_comes_from_the_queue_config(self):
         self.free = 5 * q.GIB
         for value, admitted in ((0, True), (4.5, True), (6, False)):

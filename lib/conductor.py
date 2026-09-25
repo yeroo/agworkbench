@@ -679,6 +679,7 @@ class Worker:
     def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None, disk_free=None):
         self.store, self.token, self.gh, self.clock = store, token, gh, clock
         self.disk_free = disk_free or free_bytes
+        self.disk_announced = False   # whether this worker has announced a disk pause (#41)
         self.spawn = spawn or self.spawn_launcher
         self.spawn_triage = spawn_triage or self.spawn_triage_run
         self.jobs = {}
@@ -1016,8 +1017,9 @@ class Worker:
         launches = []
         disk = self.disk_pause(self.store.load()['config'])
         with self.store.transaction() as data:
-            # Notified on pause and on resume; the free-space figure in the text is refreshed silently.
-            disk_changed = bool(data.get('diskPaused')) != bool(disk)
+            # Announced on pause and on resume, by this worker (a restarted conductor announces a pause it
+            # finds); the free-space figure in the text is refreshed silently.
+            disk_changed = bool(disk) != self.disk_announced
             if disk:
                 data['diskPaused'] = disk
             else:
@@ -1044,7 +1046,9 @@ class Worker:
                     # checkout lock or fresh durable start intent gives it time to report.
                     if self.clock() - m['startedAt'] >= 600:
                         m.update(state='failed', slotReleased=True, launchResult='timeout', reason='interrupted launcher produced no result; use -Retry')
-                    elif not file_locked(self.store.directory / f'member-{m["number"]}.lock') and not checkout_locked(Path(m['checkout'])):
+                    elif (not disk and not file_locked(self.store.directory / f'member-{m["number"]}.lock')
+                          and not checkout_locked(Path(m['checkout']))):
+                        # Re-spawning an orphaned launch is a launch too: not while the disk is low.
                         launches.append(dict(m))
             settings = dict(data)
         for m in launches:
@@ -1053,6 +1057,7 @@ class Worker:
             except (OSError, ValueError) as err:
                 member_result(self.store.path, m['number'], m['attempt'], m['token'], dict(result='failed', detail=str(err)))
         if disk_changed:
+            self.disk_announced = bool(disk)
             message = f'queue paused: {disk}' if disk else 'queue resumed: disk space is back'
             print(message, flush=True)
             self.notify(message)

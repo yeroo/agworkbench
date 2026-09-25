@@ -8,13 +8,13 @@ one set of safety checks (`check`), one way to delete (`remove`):
   issue session is closed. It waits until no `#N ...` session is left in the repo's workspace, then
   checks and deletes. It runs with its cwd outside the checkout: on Windows nothing can delete a
   directory that is some process's cwd.
-- `sweep` (`github-workbench -Cleanup`): every checkout under checkoutRoot whose issue is closed or
-  whose PR is merged or closed (and none open).
+- `sweep` (`github-workbench -Cleanup`): every checkout under checkoutRoot whose branch has no open PR,
+  and whose issue is closed or whose branch has a merged or closed PR.
 
 A checkout is deleted only when it is provably ours and provably finished with: the directory is
 `<root>/<name>-issue-<N>` with a `.git` whose origin is the repo, no session of the issue is open, no
 launcher holds it, no queue still runs it, nothing is uncommitted or stashed, it has no linked
-worktree, and every local commit is on a remote-tracking ref or inside the merged PR's head. Anything
+worktree or submodule, and every local commit is on a remote-tracking ref or inside the merged PR's head. Anything
 else keeps it, with the reason logged. The delete renames the directory first (`.deleting-<ts>`):
 on Windows the rename fails as a whole while anything holds a file or cwd inside it, so a checkout in
 use is never half deleted, and a half-deleted one never looks like a checkout.
@@ -36,6 +36,7 @@ from typing import Callable
 
 import agw
 import conductor
+import triage
 
 HERE = Path(__file__).resolve().parent
 MODES = ('merged', 'build', 'off')
@@ -227,6 +228,9 @@ def check(checkout: Path, *, repo: str, issue: int | str, root: Path, tree, pr_h
         reasons.append(f'git worktree list failed: {worktrees.stderr.strip()}')
     elif sum(line.startswith('worktree ') for line in worktrees.stdout.splitlines()) > 1:
         reasons.append('it has linked worktrees')
+    # A submodule's own commits live in .git/modules and none of the checks above see them.
+    if (checkout / '.gitmodules').exists() or (checkout / '.git' / 'modules').exists():
+        reasons.append('it has submodules (their unpushed commits are not checked)')
     reasons += unpushed_reasons(checkout, pr_head)
     return reasons
 
@@ -241,14 +245,20 @@ def long_path(path: Path) -> str:
     return text
 
 
-def _writable_retry(func, path, _exc):
-    # git's pack and object files are read-only; clear the bit and try once more.
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
 def rmtree(path: Path) -> None:
-    shutil.rmtree(long_path(path), onexc=_writable_retry)
+    # git's pack and object files are read-only: triage's helper clears the bit, on every Python.
+    triage.remove_tree(long_path(path))
+
+
+def is_link(path: Path) -> bool:
+    """A symlink or a directory junction (Path.is_junction is Python 3.12+; the reparse-point bit is not)."""
+    path = Path(path)
+    if path.is_symlink():
+        return True
+    try:
+        return bool(getattr(os.lstat(path), 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+    except OSError:
+        return False
 
 
 def dir_size(path: Path) -> int:
@@ -270,7 +280,7 @@ def build_outputs(checkout: Path) -> list[Path]:
         keep = []
         for name in subdirs:
             path = Path(directory) / name
-            if name == '.git' or path.is_symlink() or path.is_junction():
+            if name == '.git' or is_link(path):
                 continue
             if name in BUILD_DIRS:
                 tracked = git(checkout, 'ls-files', '--', str(path.relative_to(checkout)).replace(os.sep, '/'))
@@ -349,12 +359,13 @@ def clean(checkout: Path, *, repo: str, issue: int | str, root: Path, mode: str,
         lock.release()
 
 
-def human(size: int) -> str:
+def human(size: float) -> str:
+    unit = 'B'
     for unit in ('B', 'KB', 'MB', 'GB'):
         if size < 1024 or unit == 'GB':
-            return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+            break
         size /= 1024
-    return f'{size:.1f} GB'
+    return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
 
 
 # --- starting the detached after-close -------------------------------------------------------
@@ -419,10 +430,10 @@ def pr_head_of(repo: str, pr: int, gh=conductor.gh_json) -> str | None:
     return data.get('headRefOid') if isinstance(data, dict) and data.get('state') == 'MERGED' else None
 
 
-def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, tree=None, gh=conductor.gh_json,
+def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, read_tree=None, gh=conductor.gh_json,
                 clock: Callable[[], float] = time.monotonic, pause: Callable[[float], None] = time.sleep,
                 echo: Callable[[str], None] | None = None) -> int:
-    tree = tree or agw.tree
+    read_tree = read_tree or agw.tree
     checkout = Path(checkout).resolve()
     root = checkout.parent
     if mode not in ('merged', 'build'):
@@ -432,7 +443,7 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, tr
     deadline = clock() + AFTER_CLOSE_WAIT
     while True:
         try:
-            snapshot = tree()
+            snapshot = read_tree()
             live = live_sessions(repo, issue, snapshot)
         except (agw.CtlError, OSError) as err:
             snapshot, live = None, [f'the session tree could not be read: {err}']
@@ -461,8 +472,8 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, tr
 # --- sweep -----------------------------------------------------------------------------------
 
 def candidacy(repo: str, number: int, branch: str | None, gh) -> tuple[bool, str, str | None]:
-    """(candidate, why, merged PR head): the issue is closed, or the branch has a merged or closed PR
-    and none open."""
+    """(candidate, why, merged PR head): the branch has no open PR, and either the issue is closed or
+    the branch has a merged or closed PR."""
     issue = gh('issue', 'view', str(number), '--repo', repo, '--json', 'state')
     prs = gh('pr', 'list', '--repo', repo, '--head', branch, '--state', 'all', '--json', 'number,state,headRefOid') if branch else []
     open_prs = [pr['number'] for pr in prs if pr.get('state') == 'OPEN']
@@ -479,14 +490,14 @@ def candidacy(repo: str, number: int, branch: str | None, gh) -> tuple[bool, str
 
 
 def sweep(root: Path, *, repo: str | None = None, dry_run: bool = False, build_only: bool = False, gh=conductor.gh_json,
-          tree=None, out: Callable[[str], None] = print) -> int:
+          read_tree=None, out: Callable[[str], None] = print) -> int:
     root = Path(root).resolve()
     if not root.is_dir():
         out(f'no checkout root {root}')
         return 0
-    tree = tree or agw.tree
+    read_tree = read_tree or agw.tree
     try:
-        snapshot = tree()
+        snapshot = read_tree()
     except (agw.CtlError, OSError):
         snapshot = None                  # check() then keeps every checkout: "sessions: unknown"
     mode = 'build' if build_only else 'merged'
@@ -497,6 +508,11 @@ def sweep(root: Path, *, repo: str | None = None, dry_run: bool = False, build_o
         if not path.is_dir():
             continue
         if LEFTOVER_NAME.fullmatch(path.name):
+            if is_link(path):
+                # Deleting through a link would delete its target; never follow one.
+                kept = True
+                out(f'keep {path}: is a link')
+                continue
             if dry_run:
                 out(f'leftover {path} {human(dir_size(path))}')
                 continue
