@@ -1044,11 +1044,13 @@ class Worker:
                 if m['state'] == 'launching' and m['number'] not in self.jobs and not m.get('result') and m['number'] not in admitted:
                     # A predecessor may still be running after its conductor died. The
                     # checkout lock or fresh durable start intent gives it time to report.
-                    if self.clock() - m['startedAt'] >= 600:
+                    if disk:
+                        # Low disk never fails a member (#41): no re-spawn, and its window restarts,
+                        # so it is re-spawned, not timed out, once space returns.
+                        m['startedAt'] = self.clock()
+                    elif self.clock() - m['startedAt'] >= 600:
                         m.update(state='failed', slotReleased=True, launchResult='timeout', reason='interrupted launcher produced no result; use -Retry')
-                    elif (not disk and not file_locked(self.store.directory / f'member-{m["number"]}.lock')
-                          and not checkout_locked(Path(m['checkout']))):
-                        # Re-spawning an orphaned launch is a launch too: not while the disk is low.
+                    elif not file_locked(self.store.directory / f'member-{m["number"]}.lock') and not checkout_locked(Path(m['checkout'])):
                         launches.append(dict(m))
             settings = dict(data)
         for m in launches:

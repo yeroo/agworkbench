@@ -61,11 +61,9 @@ def stamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
-def log(root: Path, checkout: Path | str, text: str, echo: Callable[[str], None] | None = None) -> None:
+def log(root: Path, checkout: Path | str, text: str) -> None:
     """One line per decision in `<checkoutRoot>/.agworkbench-cleanup.log`, which outlives the checkout."""
     line = f"{checkout}: {text}"
-    if echo:
-        echo(line)
     try:
         path = Path(root) / LOG_NAME
         with path.open('a', encoding='utf-8') as handle:
@@ -333,27 +331,27 @@ def lock_path(root: Path, checkout: Path) -> Path:
 
 
 def clean(checkout: Path, *, repo: str, issue: int | str, root: Path, mode: str, tree, pr_head: str | None,
-          echo: Callable[[str], None] | None = None, pause: Callable[[float], None] = time.sleep) -> tuple[bool, list[str], int]:
+          pause: Callable[[float], None] = time.sleep) -> tuple[bool, list[str], int]:
     """Check and delete one checkout under its own lock: (deleted, reasons kept, bytes freed)."""
     lock = conductor.Lock(lock_path(root, checkout), 0)
     try:
         lock.acquire()
     except conductor.QueueError:
         reasons = ['another cleanup is running on it']
-        log(root, checkout, 'kept: ' + '; '.join(reasons), echo)
+        log(root, checkout, 'kept: ' + '; '.join(reasons))
         return False, reasons, 0
     try:
         reasons = check(checkout, repo=repo, issue=issue, root=root, tree=tree, pr_head=pr_head)
         if reasons:
-            log(root, checkout, 'kept: ' + '; '.join(reasons), echo)
+            log(root, checkout, 'kept: ' + '; '.join(reasons))
             return False, reasons, 0
-        log(root, checkout, f'deleting ({mode})', echo)
+        log(root, checkout, f'deleting ({mode})')
         try:
             freed = remove(checkout, mode, pause=pause)
         except CleanupError as err:
-            log(root, checkout, f'kept: {err}', echo)
+            log(root, checkout, f'kept: {err}')
             return False, [str(err)], 0
-        log(root, checkout, f'deleted ({mode}): freed {human(freed)}', echo)
+        log(root, checkout, f'deleted ({mode}): freed {human(freed)}')
         return True, [], freed
     finally:
         lock.release()
@@ -431,15 +429,14 @@ def pr_head_of(repo: str, pr: int, gh=conductor.gh_json) -> str | None:
 
 
 def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, read_tree=None, gh=conductor.gh_json,
-                clock: Callable[[], float] = time.monotonic, pause: Callable[[float], None] = time.sleep,
-                echo: Callable[[str], None] | None = None) -> int:
+                clock: Callable[[], float] = time.monotonic, pause: Callable[[float], None] = time.sleep) -> int:
     read_tree = read_tree or agw.tree
     checkout = Path(checkout).resolve()
     root = checkout.parent
     if mode not in ('merged', 'build'):
-        log(root, checkout, f'nothing to do (cleanup {mode!r})', echo)
+        log(root, checkout, f'nothing to do (cleanup {mode!r})')
         return 0
-    log(root, checkout, f'PR #{pr} merged and the issue session closed; waiting for #{issue} sessions to go', echo)
+    log(root, checkout, f'PR #{pr} merged and the issue session closed; waiting for #{issue} sessions to go')
     deadline = clock() + AFTER_CLOSE_WAIT
     while True:
         try:
@@ -451,7 +448,7 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, re
             break
         if clock() >= deadline:
             reason = f'kept: still open after {AFTER_CLOSE_WAIT:.0f}s: ' + ', '.join(live)
-            log(root, checkout, reason, echo)
+            log(root, checkout, reason)
             close_log(checkout, reason)
             return 1
         pause(AFTER_CLOSE_POLL)
@@ -459,10 +456,10 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int, mode: str, *, re
         head = pr_head_of(repo, pr, gh)
     except (OSError, ValueError, subprocess.SubprocessError) as err:
         # Without the PR head only remote-tracking refs vouch for local commits: the safe direction.
-        log(root, checkout, f'PR head unknown ({err}); checking against remote-tracking refs only', echo)
+        log(root, checkout, f'PR head unknown ({err}); checking against remote-tracking refs only')
         head = None
     deleted, reasons, _ = clean(checkout, repo=repo, issue=issue, root=root, mode=mode, tree=snapshot,
-                                pr_head=head, echo=echo, pause=pause)
+                                pr_head=head, pause=pause)
     if not deleted:
         close_log(checkout, 'kept: ' + '; '.join(reasons))
         return 1

@@ -1029,6 +1029,28 @@ class DiskGuard(unittest.TestCase):
         self.w.tick()
         self.assertIn(1, [n for n, _, _ in self.launches])
 
+    def test_low_disk_never_times_out_an_orphaned_launch(self):
+        # r2 m1: the 600 s window of an orphaned launch restarts while paused, so it is re-spawned after.
+        with self.store.transaction() as data:
+            m = data['members'][0]
+            m.update(state='launching', attempt=1, token=str(uuid.uuid4()), result=None, startedAt=self.now - 700,
+                     slotReleased=False)
+        self.free = 5 * q.GIB
+        self.w.tick()
+        self.assertEqual('launching', self.member(1)['state'])
+        self.assertEqual([], self.launches)
+        self.now += 700                                   # a long pause
+        self.w.tick()
+        self.assertEqual('launching', self.member(1)['state'])
+        self.free = 25 * q.GIB
+        with patch.object(q, 'checkout_locked', return_value=True):
+            self.w.tick()                                 # a predecessor still holds it: left waiting
+        self.assertEqual('launching', self.member(1)['state'])
+        self.assertNotIn(1, [n for n, _, _ in self.launches])
+        self.w.tick()
+        self.assertIn(1, [n for n, _, _ in self.launches])
+        self.assertNotEqual('failed', self.member(1)['state'])
+
     def test_a_restarted_conductor_announces_the_pause_it_finds(self):
         # r1 m2: run() sets the status active; the first tick of a new worker must say it is paused.
         self.free = 5 * q.GIB
