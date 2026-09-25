@@ -11,11 +11,13 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 import uuid
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import agw
+import closer
 
 HERE = Path(__file__).resolve().parent
 STATES = {'pending', 'launching', 'active', 'pr-open', 'blocked', 'failed', 'merged'}
@@ -97,6 +99,10 @@ def repo_name(value):
     if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', value):
         raise UsageError(f'invalid repository: {value!r}')
     return value.lower()
+
+
+CLOSE_BACKSTOP_AFTER = 900.0   # a merged member's close pending this long gets the backstop (#33)
+RELAY_ALIVE = 'the relay is alive but its close has been pending for 15 minutes'
 
 
 def valid_uuid(value):
@@ -570,6 +576,7 @@ class Worker:
         self.alerts = []
         self.last_display = {}
         self.last_skips = {}          # the last rescan's skip reasons, kept in memory only (#28)
+        self.closes = {}              # member -> {'since', 'attempt'}: the close backstop (#33), memory only
 
     def error(self, key, err):
         count = self.errors.get(key, 0) + 1
@@ -678,6 +685,86 @@ class Worker:
             except (OSError, ValueError, KeyError, subprocess.SubprocessError, QueueError, agw.CtlError) as err:
                 self.error('label scan', err)
 
+    # --- the close backstop (#33) -------------------------------------------------------------------
+    # The relay closes a merged member's sessions. When that relay is gone (killed, closed, never
+    # restarted) and its close has been pending for CLOSE_BACKSTOP_AFTER, the conductor runs the same
+    # close (closer.py) one step per tick. While the relay is alive it only flags `closeStuck`: one
+    # closer at a time. Never on a timeout alone.
+
+    def mark(self, number, **fields):
+        with self.store.transaction() as data:
+            member = find_member(data, number)
+            for key, value in fields.items():
+                if value is None:
+                    member.pop(key, None)
+                else:
+                    member[key] = value
+
+    def close_backstop(self):
+        data = self.store.load()
+        for m in data['members']:
+            if m['state'] != 'merged':
+                continue
+            number = m['number']
+            hub_dir = Path(m['checkout']) / '.workbench'
+            try:
+                relay_state = read_json(hub_dir / 'state' / 'relay.json') if (hub_dir / 'state' / 'relay.json').exists() else {}
+            except (OSError, ValueError):
+                relay_state = {}
+            if relay_state.get('close_pending') != number:
+                # Nothing pending: the relay closed (or refused), or autonomy was off. A "relay alive"
+                # flag is resolved by that; a refused backstop close stays flagged for the human.
+                self.closes.pop(number, None)
+                live_flag = str(m.get('closeStuck', '')).startswith(RELAY_ALIVE)
+                if m.get('closePending') or live_flag:
+                    self.mark(number, closePending=None, closeStuck=None if live_flag else m.get('closeStuck'))
+                continue
+            if not m.get('closePending'):
+                self.mark(number, closePending=True)
+            watch = self.closes.setdefault(number, {'since': self.clock(), 'attempt': None})
+            if self.clock() - watch['since'] < CLOSE_BACKSTOP_AFTER:
+                continue
+            try:
+                self.step_close(data, m, hub_dir, watch)
+            except (agw.CtlError, OSError, ValueError, KeyError) as err:
+                self.error(f'close #{number}', err)
+
+    def step_close(self, data, m, hub_dir, watch):
+        number = m['number']
+        if watch['attempt'] is None:
+            if closer.relay_alive(data['repo'], str(number), agw.tree()):
+                if not m.get('closeStuck'):
+                    print(f'#{number}: {RELAY_ALIVE}', flush=True)
+                    self.mark(number, closeStuck=RELAY_ALIVE)
+                return
+            registry = read_json(hub_dir / 'state' / 'agents.json')['agents']
+            peers = [types.SimpleNamespace(box=box, tool=registry[box].get('tool', box), pane=registry[box]['pane'])
+                     for box in ('claude', 'codex')]
+            watch['attempt'] = closer.Closer(hub_dir, data['repo'], f'issue-{number}', peers,
+                                             log=lambda text: print(f'#{number} {text}', flush=True), clock=self.clock)
+            watch['attempt'].log(f'PR #{number} merged and its relay is gone; the conductor runs the close')
+        attempt = watch['attempt']
+        attempt.step_helpers()
+        reasons = attempt.agent_blockers(number)
+        if not reasons:
+            if attempt.autonomous():
+                attempt.close_issue_session()
+            else:
+                attempt.log('NOT closing: autonomy was turned off')
+            self.end_close(m, hub_dir, stuck=None)
+        elif attempt.timed_out():
+            attempt.log(f'NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: ' + '; '.join(reasons))
+            self.notify(f'#{number}: autonomous close stopped: ' + '; '.join(reasons))
+            self.end_close(m, hub_dir, stuck='the backstop close timed out: ' + '; '.join(reasons))
+
+    def end_close(self, m, hub_dir, stuck):
+        path = hub_dir / 'state' / 'relay.json'
+        state = read_json(path)
+        state.pop('close_pending', None)
+        atomic_json(path, state)
+        self.closes.pop(m['number'], None)
+        self.mark(m['number'], closePending=None, closeStuck=stuck)
+
     def tick(self):
         self.poll_jobs()
         with self.store.transaction() as data:
@@ -700,6 +787,7 @@ class Worker:
                         # A partial/unrelated report never turns into an admission signal.
                         self.error(f'loop #{m["number"]}', err)
         self.refresh_remote()
+        self.close_backstop()
         launches = []
         with self.store.transaction() as data:
             count = sum(m['state'] in {'launching', 'active'} and not m['slotReleased'] for m in data['members'])
@@ -801,6 +889,10 @@ def file_locked(path):
 
 
 def finished(data):
+    # A merged member whose close is still pending keeps the conductor up for the backstop (#33),
+    # unless it is flagged stuck (then it is the human's, and never keeps the queue alive forever).
+    if any(m.get('closePending') and not m.get('closeStuck') for m in data['members']):
+        return False
     return not data['watch'] and not any(m['state'] == 'pending' or m['state'] == 'launching' or
                                        (m['state'] == 'active' and not m['slotReleased']) for m in data['members'])
 

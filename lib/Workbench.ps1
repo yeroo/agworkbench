@@ -594,6 +594,19 @@ function Get-RecordedClaudeSessionId([string] $Checkout, [string] $Role) {
     return $null
 }
 
+function Get-ClaudeQuietSettings([string] $Checkout) {
+    <# #33: the settings every Claude the workbench launches starts with. Prompt suggestions draw greyed
+       text in an idle composer; the relay then cannot prove it empty, so it neither rings the agent
+       nor closes its session. Passed to --settings as a FILE path: an inline JSON string loses its
+       quotes on the way to a native program under Windows PowerShell 5.1. #>
+    return Join-Path $Checkout '.workbench\state\claude-settings.json'
+}
+
+function Write-ClaudeQuietSettings([string] $Path) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    [IO.File]::WriteAllText($Path, '{"promptSuggestionEnabled": false}', (New-Object Text.UTF8Encoding $false))
+}
+
 function Read-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Role = 'planner') {
     $path = Get-ClaudeIdentityPath $Checkout $Role
     $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json

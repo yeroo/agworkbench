@@ -10,11 +10,12 @@ import threading
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'lib'))
 import conductor as q
+import closer
 
 
 class QueueCase(unittest.TestCase):
@@ -813,6 +814,99 @@ class QueueBugs(unittest.TestCase):
             worker.refresh_remote()
         self.assertEqual([1, 2, 3, 4], self.members())
         self.assertIn('label scan', worker.errors)
+
+class CloseBackstop(unittest.TestCase):
+    """#33: the conductor closes a merged member's sessions only when its relay is gone; while the
+    relay lives it only flags the member. One closer at a time, never on a timeout alone."""
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                  QueueCase.spawn, QueueCase.worker, QueueCase.member)
+    PLANNER = '11111111-1111-4111-8111-111111111111'
+    IMPLEMENTER = '22222222-2222-4222-8222-222222222222'
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#7')
+        with self.store.transaction() as data:
+            m = data['members'][0]
+            m.update(state='merged', slotReleased=True)
+            self.checkout = Path(m['checkout'])
+        self.state = self.checkout / '.workbench' / 'state'
+        self.state.mkdir(parents=True)
+        for name, value in (('relay.json', {'close_pending': 7}), ('implementer.json', {'autonomous': True}),
+                            ('loop-done.json', {'pr': 7}),
+                            ('agents.json', {'agents': {'claude': {'pane': self.PLANNER, 'tool': 'claude'},
+                                                        'codex': {'pane': self.IMPLEMENTER, 'tool': 'claude'}}})):
+            q.atomic_json(self.state / name, value)
+        sys.path.insert(0, str(ROOT / 'tests'))
+        from frames import CLAUDE_IDLE
+        self.text = {self.PLANNER: CLAUDE_IDLE, self.IMPLEMENTER: CLAUDE_IDLE}
+        self.tree = {'workspaces': [{'name': 'r', 'sessions': [
+            {'id': self.PLANNER, 'name': '#7 fix', 'paneIds': [self.PLANNER, self.IMPLEMENTER]},
+            {'id': 'relay-7', 'name': '#7 relay'}]}]}
+        self.actions = []
+        self.enterContext(patch.object(q.agw, 'tree', side_effect=lambda: self.tree))
+        self.enterContext(patch.object(q.agw, 'pane_text', side_effect=lambda pane: self.text[pane]))
+        self.enterContext(patch.object(q.agw, 'close_session', side_effect=lambda sid: self.actions.append(('close', sid))))
+        self.enterContext(patch.object(q.agw, 'clear_restore', side_effect=lambda pane: self.actions.append(('unpin', pane))))
+        self.w = self.worker()
+        self.w.notify = Mock()
+
+    def run_for(self, seconds, step=10):
+        end = self.now + seconds
+        while self.now < end:
+            self.w.close_backstop()
+            self.now += step
+
+    def relay_gone(self):
+        self.tree['workspaces'][0]['sessions'] = self.tree['workspaces'][0]['sessions'][:1]
+
+    def test_nothing_happens_for_fifteen_minutes(self):
+        self.relay_gone()
+        self.run_for(890)
+        self.assertEqual([], self.actions)
+        self.assertTrue(self.member(7)['closePending'])
+        self.assertFalse(q.finished(self.store.load()))          # the conductor stays up for it
+
+    def test_a_live_relay_is_only_flagged(self):
+        self.run_for(1200)
+        self.assertEqual([], self.actions)
+        self.assertIn('relay is alive', self.member(7)['closeStuck'])
+        self.assertTrue(q.finished(self.store.load()))           # flagged: the human's, not a reason to stay up
+
+    def test_a_gone_relay_gets_the_close(self):
+        self.relay_gone()
+        self.run_for(1000)
+        self.assertEqual([('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER), ('close', self.PLANNER)], self.actions)
+        self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+        self.assertNotIn('closePending', self.member(7))
+        self.assertIn('the conductor runs the close', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_the_relay_finishing_its_own_close_clears_the_flags(self):
+        self.run_for(1000)
+        self.assertIn('closeStuck', self.member(7))
+        q.atomic_json(self.state / 'relay.json', {})
+        self.w.close_backstop()
+        self.assertNotIn('closeStuck', self.member(7))
+        self.assertNotIn('closePending', self.member(7))
+
+    def test_a_close_that_cannot_complete_is_refused_and_flagged_never_forced(self):
+        self.relay_gone()
+        box = self.checkout / '.workbench' / 'inbox' / 'claude'
+        box.mkdir(parents=True)
+        (box / 'h1.md').write_text('---\nid: h1\nfrom: human\nto: claude\nsubject: wait\n---\nx\n', encoding='utf-8')
+        self.run_for(900 + closer.CLOSE_WAIT + 60)
+        self.assertEqual([], [a for a in self.actions if a[0] == 'close'])
+        self.assertIn('the backstop close timed out', self.member(7)['closeStuck'])
+        self.assertIn('the planner has unread mail h1', self.w.notify.call_args.args[0])
+        self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
+
+    def test_an_unreadable_tree_closes_nothing(self):
+        self.w.close_backstop()                                  # starts the 15-minute clock
+        self.now += 1000
+        with patch.object(q.agw, 'tree', side_effect=q.agw.CtlError('no pipe')):
+            self.w.close_backstop()
+        self.assertEqual([], self.actions)
+        self.assertIn('close #7', self.w.errors)
 
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):

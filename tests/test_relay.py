@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import relay  # noqa: E402
+import closer  # noqa: E402
 import agw
 import hub
 import peerchat
@@ -1913,6 +1914,7 @@ class ClaudeImplementer(DeliveryFixture):
         self.tick(0)
         self.assert_unannounced()
         self.assertEqual('half a line', self.r.holds[('codex', 'm1')].ambiguous_text)
+        self.assertIn('"promptSuggestionEnabled": false', self.r.holds[('codex', 'm1')].reason)   # #33
 
 
 LIMIT_FIXTURES = Path(__file__).resolve().parent / 'fixtures' / 'limits'
@@ -2079,6 +2081,7 @@ class AutonomousClose(unittest.TestCase):
         self.r = relay.Relay(self.folder / '.workbench', peers, 'o/repo', 'issue-7-fix', 5, 60)
         self.r.log = lambda text: None
         self.enterContext(patch.object(relay, 'CLOSE_WAIT', 120.0))
+        self.enterContext(patch.object(closer, 'CLOSE_WAIT', 120.0))
         # The wait keeps ringing mail (r18 M1); a ring "reads" nothing unless a test says so.
         self.send = self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
         self.t = 0.0
@@ -2102,6 +2105,14 @@ class AutonomousClose(unittest.TestCase):
         self.notify = self.enterContext(patch.object(agw, 'notify'))
         self.status = self.enterContext(patch.object(agw, 'set_status'))
         self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('unexpected terminal request')))
+        # #33: the finished revmux helper left its completion marker (its rows before the shell's prompt).
+        self.marker(self.REVMUX, ['revmux exit 1 (findings reported).'])
+
+    def marker(self, pane, rows):
+        directory = self.state / 'helpers'
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f'{pane}.done').write_text(json.dumps({'kind': 'revmux', 'round': 1, 'exit': 1, 'pane': pane,
+                                                            'rows': rows}), encoding='utf-8')
 
     def write(self, name, data):
         (self.state / name).write_text(json.dumps(data), encoding='utf-8')
@@ -2125,17 +2136,48 @@ class AutonomousClose(unittest.TestCase):
         self.assertEqual([self.REVMUX, self.PLANNER, self.IMPLEMENTER, self.RELAY], unpinned)
         for action in (('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER)):
             self.assertLess(self.actions.index(action), self.actions.index(('close', self.PLANNER)))
-        self.assertIn('left open: #7 your review (still running)', self.log())
+        self.assertIn('helper #7 your review (a2) stays open: no completion marker', self.log())
+        self.assertIn('closing helper #7 revmux r1 (a1): done and untouched', self.log())
         self.assertIn('closing the relay session', self.log())
-        self.assertIn('left open: #7 your review', self.notify.call_args.args[1])
+        self.assertIn('left open: #7 your review (no completion marker', self.notify.call_args.args[1])
+        self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())     # its marker is gone
         self.assertGreaterEqual(self.t, relay.CLOSE_SETTLE)                            # panes had to settle
 
     def blocked(self):
         self.r.close_after_merge(7)
-        self.assertEqual([], self.closes())
+        # The finished helper may close regardless (#33); the agents' session and the relay may not.
+        self.assertNotIn(self.PLANNER, self.closes())
+        self.assertNotIn(self.RELAY, self.closes())
         self.assertIn('NOT closing', self.log())
         self.status.assert_called_with('blocked', sound=True, blink=True, pane_id=self.PLANNER)
         return self.log()
+
+    def test_helpers_close_even_while_the_agents_block(self):
+        # #33 AC3: one stuck composer must not keep every helper open.
+        (self.state / 'loop-done.json').unlink()
+        self.blocked()
+        self.assertEqual([self.REVMUX], self.closes())
+
+    def test_a_helper_touched_after_it_finished_stays_open(self):
+        # #33 B2: the human typed at the helper's prompt; the marker's rows no longer lead the screen.
+        self.text[self.REVMUX] = 'revmux exit 1 (findings reported).\nPS C:\\repo> git status'
+        self.r.close_after_merge(7)
+        self.assertNotIn(self.REVMUX, self.closes())
+        self.assertIn('stays open: the pane changed after the helper finished', self.log())
+
+    def test_a_helper_ending_at_a_starship_prompt_closes(self):
+        # #33: the docxy helpers ended at the human's own prompt - a path line, then `#`.
+        self.text[self.REVMUX] = 'revmux exit 1 (findings reported).\n~/src/docxy on main\n#'
+        self.r.close_after_merge(7)
+        self.assertIn(self.REVMUX, self.closes())
+
+    def test_a_marker_is_found_through_the_helpers_session(self):
+        # #33 B2: markers are keyed by pane id; the relay maps the session to its single pane.
+        self.tree['workspaces'][0]['sessions'][1]['paneIds'] = ['a1-pane']
+        self.text['a1-pane'] = self.text[self.REVMUX]
+        (self.state / 'helpers' / f'{self.REVMUX}.done').rename(self.state / 'helpers' / 'a1-pane.done')
+        self.r.close_after_merge(7)
+        self.assertIn(self.REVMUX, self.closes())
 
     def test_autonomy_off_closes_nothing(self):
         self.write('implementer.json', {'tool': 'claude', 'autonomous': False})
@@ -2240,16 +2282,17 @@ class AutonomousClose(unittest.TestCase):
 
     def test_autonomy_turned_off_during_the_wait_stops_the_close(self):
         # r18 M2: re-read right before the first close action.
-        real = self.r.close_blockers
+        real = closer.Closer.agent_blockers
 
-        def blockers(number, settled):
-            reasons = real(number, settled)
+        def blockers(close, number):
+            reasons = real(close, number)
             if not reasons:
                 self.write('implementer.json', {'tool': 'claude', 'autonomous': False})
             return reasons
-        self.r.close_blockers = blockers
-        self.r.close_after_merge(7)
-        self.assertEqual([], self.actions)
+        with patch.object(closer.Closer, 'agent_blockers', blockers):
+            self.r.close_after_merge(7)
+        # The finished helper had already closed (#33: helpers go first); the agents and relay did not.
+        self.assertEqual([self.REVMUX], self.closes())
         self.assertIn('NOT closing: autonomy was turned off during the wait', self.log())
 
     def test_unread_mail_to_the_planner_or_from_a_human_blocks(self):
@@ -2297,6 +2340,50 @@ class AutonomousClose(unittest.TestCase):
         message = self.notify.call_args.args[1]
         self.assertTrue(message.startswith('autonomous close stopped:'), message)
         self.assertNotIn('workbench mail for', message)
+
+
+class HelperMarkers(unittest.TestCase):
+    """#33: a helper proves it finished, and the close proves nobody touched its pane since."""
+    DONE = ['revmux exit 1 (findings reported).', 'Report posted to Claude.']
+
+    def test_untouched_means_the_same_rows_plus_only_a_bare_prompt(self):
+        for current, untouched in ((self.DONE, True),
+                                   (self.DONE + ['PS C:\\repo>'], True),
+                                   (self.DONE + ['~/src/docxy on main', '#'], True),
+                                   (self.DONE + ['PS C:\\repo> git status'], False),       # typed, not sent
+                                   (self.DONE + ['#', 'ls', 'a b', '#'], False),             # used since
+                                   (['something else', '#'], False)):
+            with self.subTest(current=current):
+                self.assertEqual(untouched, closer.helper_untouched(self.DONE, current))
+        self.assertFalse(closer.helper_untouched([], ['#']))                               # no rows recorded
+
+    def test_the_window_slides_when_the_prompt_is_added(self):
+        rows = [f'row {i}' for i in range(20)]
+        self.assertTrue(closer.helper_untouched(rows, rows[1:] + ['#']))
+
+    def test_helper_done_writes_the_marker_keyed_by_its_pane(self):
+        import helper_done
+        folder = Path(__file__).resolve().parent.parent / ('test helper done ' + uuid.uuid4().hex)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        with patch.dict(os.environ, {'AGWINTERM_PANE_ID': 'p-1'}), \
+                patch.object(agw, 'pane_text', return_value='report\n\nposted\n'):
+            self.assertEqual(0, helper_done.main(['--hub', str(folder), '--kind', 'revmux', '--round', '2', '--exit', '1']))
+        marker = json.loads((folder / 'state' / 'helpers' / 'p-1.done').read_text(encoding='utf-8'))
+        self.assertEqual(('revmux', 2, 1, 'p-1', ['report', 'posted']),
+                         (marker['kind'], marker['round'], marker['exit'], marker['pane'], marker['rows']))
+
+    def test_an_unreadable_pane_still_marks_done_but_proves_nothing(self):
+        import helper_done
+        folder = Path(__file__).resolve().parent.parent / ('test helper done ' + uuid.uuid4().hex)
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        with patch.dict(os.environ, {'AGWINTERM_PANE_ID': 'p-2'}), \
+                patch.object(agw, 'pane_text', side_effect=agw.CtlError('no pipe')), patch('sys.stderr'):
+            helper_done.main(['--hub', str(folder), '--kind', 'review'])
+        marker = json.loads((folder / 'state' / 'helpers' / 'p-2.done').read_text(encoding='utf-8'))
+        self.assertEqual([], marker['rows'])
+        self.assertFalse(closer.helper_untouched(marker['rows'], ['#']))
 
 
 if __name__ == "__main__":
