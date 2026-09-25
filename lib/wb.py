@@ -7,6 +7,9 @@
   wb.py wait-mail                                                 # background inbox waiter
   wb.py settings                                                  # implementer, revmux profile, auto-merge, failover
   wb.py handover                                                  # open request, branch, git status (#24)
+  wb.py follow-up add --key r2-m1 --title T --severity minor --origin "review r2"   (#27)
+  wb.py follow-up file --source 27 --pr 30                        # file every unfiled follow-up (#27)
+  wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
 
 Why a helper: Claude's shell is Git Bash, where $PWD is a POSIX path (/c/Users/...) that PowerShell
@@ -108,6 +111,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_loop_state(args: argparse.Namespace) -> int:
     # Reports stay in this checkout; the conductor alone owns the global queue.
+    if args.state == 'done':
+        return loop_done(checkout(), args.pr, args.sha)
     from conductor import write_loop_state
     try:
         write_loop_state(checkout(), args.state, args.pr, args.reason)
@@ -130,7 +135,8 @@ def checkout_settings(root: Path) -> dict:
     profile = saved.get("revmuxProfile")
     if not (isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]+", profile)):
         profile = "comprehensive"
-    return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True}
+    return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True,
+            "autonomous": saved.get("autonomous") is True}
 
 
 def failover_setting() -> bool:
@@ -147,6 +153,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
     settings = checkout_settings(checkout())
     print(f"implementer={settings['implementer']} revmuxProfile={settings['revmuxProfile']} "
           f"autoMerge={'true' if settings['autoMerge'] else 'false'} "
+          f"autonomous={'true' if settings['autonomous'] else 'false'} "
           f"failover={'true' if failover_setting() else 'false'}")
     return 0
 
@@ -337,9 +344,154 @@ def check_head(pr: dict, head: str) -> list[str]:
     return []
 
 
+def check_follow_ups(root: Path) -> list[str]:
+    """Autonomous only (#27): every recorded follow-up is filed, and no Major+ finding ended disputed."""
+    if not checkout_settings(root)["autonomous"]:
+        return []
+    failures = []
+    for item in load_follow_ups(root):
+        if item.get("disputed") and item.get("severity") in SEVERE:
+            failures.append(f"review: the {item['severity']} finding '{item['key']}' ended disputed; an autonomous "
+                            "merge stops here and the human decides")
+        if not item.get("url"):
+            failures.append(f"follow-up: '{item['key']}' is not filed yet - run wb.py follow-up file, then check again")
+    return failures
+
+
 def merge_failures(pr: dict, inline: list[dict], head: str, root: Path) -> list[str]:
     return (check_state(pr) + check_reviews(pr) + check_labels_and_title(pr) + check_holds(pr, inline) +
-            check_mail() + check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head))
+            check_mail() + check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head) +
+            check_follow_ups(root))
+
+
+# --- follow-up issues (#27) ----------------------------------------------------------------------
+# One machine-readable list the planner fills as it defers findings or agrees a plan's out-of-scope
+# items; `follow-up file` turns every unfiled item into a GitHub issue and writes the url back.
+
+SEVERITIES = ("blocker", "major", "minor", "immaterial", "plan")
+SEVERE = ("blocker", "major")
+FOLLOW_UP_LABEL = "follow-up"
+NESTED_LABEL = "follow-up-nested"
+
+
+def follow_ups_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "follow-ups.json"
+
+
+def load_follow_ups(root: Path) -> list[dict]:
+    try:
+        items = json.loads(follow_ups_path(root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return []
+    return [item for item in items if isinstance(item, dict) and item.get("key")] if isinstance(items, list) else []
+
+
+def save_follow_ups(root: Path, items: list[dict]) -> None:
+    path = follow_ups_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def cmd_follow_up_add(args: argparse.Namespace) -> int:
+    root = checkout()
+    body = Path(args.body_file).read_text(encoding="utf-8-sig") if args.body_file else ""
+    items = load_follow_ups(root)
+    item = next((existing for existing in items if existing["key"] == args.key), None)
+    if item is None:
+        item = {"key": args.key}
+        items.append(item)
+    elif item.get("url"):
+        print(f"{args.key}: already filed as {item['url']}; not changed")
+        return 0
+    item.update(title=args.title, body=body, severity=args.severity, origin=args.origin, disputed=bool(args.disputed))
+    save_follow_ups(root, items)
+    print(f"{args.key}: recorded ({args.severity}{', disputed' if args.disputed else ''})")
+    return 0
+
+
+def gh_run(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["gh", *args], cwd=str(root), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+def issue_body(item: dict, source: int, pr: int | None) -> str:
+    where = f"Source: #{source}" + (f", PR #{pr}" if pr else "")
+    return (f"{item.get('body', '').rstrip()}\n\n{where}\n"
+            f"Severity: {item.get('severity')}; origin: {item.get('origin')}"
+            f"{'; disputed' if item.get('disputed') else ''}\n\n"
+            f"<!-- agworkbench:follow-up source=#{source} -->\n{PLANNER_MARKER}\n")
+
+
+def cmd_follow_up_file(args: argparse.Namespace) -> int:
+    root = checkout()
+    items = load_follow_ups(root)
+    pending = [item for item in items if not item.get("url")]
+    if not pending:
+        print("no unfiled follow-ups")
+        return 0
+    # One level of chaining at most: a follow-up of a follow-up is filed under another label.
+    source = gh_run(root, "issue", "view", str(args.source), "--json", "labels")
+    if source.returncode != 0:
+        print(f"wb: follow-up: cannot read issue #{args.source}: {source.stderr.strip()}", file=sys.stderr)
+        return 1
+    labels = {label.get("name") for label in json.loads(source.stdout).get("labels", [])}
+    label = NESTED_LABEL if FOLLOW_UP_LABEL in labels else FOLLOW_UP_LABEL
+    created = gh_run(root, "label", "create", label, "--color", "BFD4F2",
+                     "--description", "filed automatically by an agworkbench loop")
+    use_label = created.returncode == 0 or "already exists" in (created.stderr or "")
+    if not use_label:
+        print(f"wb: follow-up: cannot create label '{label}' ({created.stderr.strip()}); filing without it")
+    failed = 0
+    for item in pending:
+        found = gh_run(root, "issue", "list", "--state", "open", "--search", f"{item['title']} in:title",
+                       "--json", "title,url", "--limit", "200")
+        if found.returncode != 0:
+            print(f"wb: follow-up: search failed for '{item['key']}': {found.stderr.strip()}", file=sys.stderr)
+            failed += 1
+            continue
+        same = [issue for issue in json.loads(found.stdout or "[]") if issue.get("title") == item["title"]]
+        if same:
+            item["url"] = same[0]["url"]
+            print(f"{item['key']}: already open as {item['url']}")
+        else:
+            body_file = root / ".workbench" / "state" / f"follow-up-{item['key']}.md"
+            body_file.write_text(issue_body(item, args.source, args.pr), encoding="utf-8")
+            argv = ["issue", "create", "--title", item["title"], "--body-file", str(body_file)]
+            if use_label:
+                argv += ["--label", label]
+            done = gh_run(root, *argv)
+            body_file.unlink(missing_ok=True)
+            url = next((line.strip() for line in (done.stdout or "").splitlines() if "/issues/" in line), None)
+            if done.returncode != 0 or not url:
+                print(f"wb: follow-up: filing '{item['key']}' failed: {(done.stderr or done.stdout).strip()}",
+                      file=sys.stderr)
+                failed += 1
+                continue
+            item["url"] = url
+            print(f"{item['key']}: filed {url}")
+        save_follow_ups(root, items)          # after each one, so a failure never loses a filed url
+    return 1 if failed else 0
+
+
+def loop_done(root: Path, pr: str | None, sha: str | None) -> int:
+    """The planner's last act (#27): the relay closes nothing before this record exists for the PR."""
+    if not pr or not re.fullmatch(r"\d+", str(pr).rsplit("/", 1)[-1]):
+        print("wb: loop-state done needs --pr <number or url>", file=sys.stderr)
+        return 2
+    items = load_follow_ups(root)
+    unfiled = [item["key"] for item in items if not item.get("url")]
+    if unfiled:
+        print(f"wb: loop-state done: follow-ups not filed yet: {', '.join(unfiled)}", file=sys.stderr)
+        return 1
+    record = {"pr": int(str(pr).rsplit("/", 1)[-1]), "sha": sha,
+              "followUps": [item["url"] for item in items], "at": time.time()}
+    path = root / ".workbench" / "state" / "loop-done.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    print(f"loop done: PR #{record['pr']}; {len(items)} follow-up(s)")
+    return 0
 
 
 def gh_json(*args: str):
@@ -433,7 +585,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="wb")
     subs = parser.add_subparsers(dest="command", required=True)
     p = subs.add_parser('loop-state', help='report a queue member phase without terminal access')
-    p.add_argument('state', choices=['pr-open', 'blocked', 'resumed'])
+    p.add_argument('state', choices=['pr-open', 'blocked', 'resumed', 'done'])
+    p.add_argument('--sha', help='done: the merged head SHA')
     p.add_argument('--pr')
     p.add_argument('--reason')
     p.set_defaults(func=cmd_loop_state)
@@ -446,6 +599,20 @@ def main() -> int:
     p.set_defaults(func=cmd_settings)
     p = subs.add_parser("handover", help="facts for a HANDOVER mail to a new implementer (#24)")
     p.set_defaults(func=cmd_handover)
+    p = subs.add_parser("follow-up", help="record and file follow-up issues (#27)")
+    follow = p.add_subparsers(dest="action", required=True)
+    q = follow.add_parser("add", help="record a deferred finding or an out-of-scope plan item")
+    q.add_argument("--key", required=True, help="a stable id, e.g. r2-m1 or plan-queue-switch")
+    q.add_argument("--title", required=True)
+    q.add_argument("--body-file")
+    q.add_argument("--severity", required=True, choices=SEVERITIES)
+    q.add_argument("--origin", required=True, help='"review r<K>" or "plan"')
+    q.add_argument("--disputed", action="store_true")
+    q.set_defaults(func=cmd_follow_up_add)
+    q = follow.add_parser("file", help="file every recorded follow-up that has no issue yet")
+    q.add_argument("--source", required=True, type=int, help="the issue this loop works on")
+    q.add_argument("--pr", type=int)
+    q.set_defaults(func=cmd_follow_up_file)
     p = subs.add_parser("merge-check", help="read-only: exit 0 and print ok only when the PR may be auto-merged")
     p.add_argument("--pr", required=True, help="PR number or URL")
     p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")

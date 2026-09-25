@@ -187,6 +187,9 @@ def _cli_args(payload: dict[str, Any]) -> list[str]:
                 out += ['--' + key, str(value)]
     elif cmd == 'session.restore':
         out += [str(args_in.get('command', ''))]
+    elif cmd == 'session.close':
+        # `session close [target]`: the target is positional here, not --target.
+        return out + ([target] if target else [])
     elif cmd == "session.status":
         out += [str(args_in.get("status", "idle"))]
         if args_in.get("blink"):
@@ -296,6 +299,16 @@ def cursor_column(pane_id: str) -> int:
 def type_into(pane_id: str, text: str) -> None:
     """Type keystrokes into a pane. A newline is Enter; a tab is Tab."""
     request("session.type", target=pane_id, args={"text": text})
+
+
+def close_session(session_id: str) -> None:
+    """Close a whole session (every pane in it). Callers prove the panes may be closed first."""
+    request("session.close", target=session_id)
+
+
+def clear_restore(pane_id: str) -> None:
+    """Remove a pane's pinned restart command, so a closed session is not revived on restart."""
+    request("session.restore", target=pane_id, args={"command": "none"})
 
 
 def notify(pane_id: str, message: str, title: str | None = None) -> None:

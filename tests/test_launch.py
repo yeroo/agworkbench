@@ -1339,6 +1339,14 @@ class QueueEntry(LauncherFixtures):
         with self.store.transaction() as data:
             data['members'][0].update(state='launching', token=self.token, result=None)
 
+    def test_member_autonomous_switch_reaches_its_checkout(self):
+        # #27: the conductor passes a queue's saved autonomy as -Autonomous / -NoAutonomous.
+        result = self.entry('-Autonomous')
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        checkout = Path(self.store.load()['members'][0]['checkout'])
+        record = json.loads((checkout / '.workbench/state/implementer.json').read_text(encoding='utf-8-sig'))
+        self.assertEqual((True, True), (record['autonomous'], record['autoMerge']))
+
     def test_member_auto_merge_switch_reaches_its_checkout(self):
         # #23: the conductor passes a queue's saved choice as -AutoMerge / -NoAutoMerge.
         result = self.entry('-AutoMerge')
@@ -2224,7 +2232,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
         self.assertIn("pane-codex.ps1'", self.typed_right()[0])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
 
     def test_claude_composes_right_pane_relay_mailbox_identity_and_pin(self):
@@ -2238,7 +2246,7 @@ class ClaudeImplementer(LauncherFixtures):
         agents = self.state('agents.json')['agents']
         self.assertEqual(('claude', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
         self.assertEqual('claude', agents['claude']['tool'])
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
         implementer = self.state('implementer-claude.json')
         planner = self.state('claude.json')
         self.assertEqual((RIGHT_ID, 'fresh', 'o/repo#7'), (implementer['pane'], implementer['origin'], implementer['issue']))
@@ -2253,7 +2261,7 @@ class ClaudeImplementer(LauncherFixtures):
     def test_config_selects_claude_and_revmux_profile_is_configurable(self):
         result = self.body(config={'implementer': 'claude', 'revmuxProfile': 'codex-final'})
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
 
     def test_invalid_config_and_switch_values_are_refused(self):
@@ -2314,7 +2322,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertIn('-Resume', self.typed_right()[-1])
         self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
         # B2: the relay was asked to stop and was restarted without the Claude profile.
         self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
         relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
@@ -2930,6 +2938,77 @@ class AgentRoots(LauncherFixtures):
                  dict(ProcessId=22, ParentProcessId=1, Name='claude.exe', CommandLine='claude.exe --session-id 88888888-8888-4888-8888-888888888888')]
         self.assertEqual([21], self.roots('claude', table, identity=sid))
         self.assertEqual([], self.roots('claude', table[:1] + table[2:], identity=sid))
+
+
+class AutonomyLaunch(LauncherFixtures):
+    """#27: autonomy is per-checkout policy like auto-merge, and it implies auto-merge."""
+    body = ClaudeImplementer.body
+    state = ClaudeImplementer.state
+    reuse_scenario = ClaudeImplementer.reuse_scenario
+
+    def record(self):
+        data = self.state('implementer.json')
+        return data['autonomous'], data['autoMerge']
+
+    def test_default_is_off(self):
+        result = self.body()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual((False, False), self.record())
+        self.assertIn('autonomous off', result.stdout)
+
+    def test_on_implies_auto_merge_and_sticks(self):
+        on = self.body(extra=' -Autonomous $true')
+        self.assertEqual(0, on.returncode, on.stdout + on.stderr)
+        self.assertEqual((True, True), self.record())
+        self.reuse_scenario('esc to interrupt')
+        again = self.body()
+        self.assertEqual(0, again.returncode, again.stdout + again.stderr)
+        self.assertEqual((True, True), self.record())
+
+    def test_no_auto_merge_on_an_autonomous_checkout_is_refused(self):
+        self.assertEqual(0, self.body(extra=' -Autonomous $true').returncode)
+        self.reuse_scenario('esc to interrupt')
+        refused = self.body(extra=' -AutoMerge $false')
+        self.assertEqual(1, refused.returncode)
+        self.assertIn('EXIT=2', refused.stdout)
+        self.assertIn('autonomy implies auto-merge', refused.stdout)
+        self.assertEqual((True, True), self.record())
+
+    def test_no_autonomous_alone_leaves_auto_merge_as_saved(self):
+        self.assertEqual(0, self.body(extra=' -Autonomous $true').returncode)
+        self.reuse_scenario('esc to interrupt')
+        off = self.body(extra=' -Autonomous $false')
+        self.assertEqual(0, off.returncode, off.stdout + off.stderr)
+        self.assertEqual((False, True), self.record())
+
+    def test_config_default_and_strict_boolean(self):
+        on = self.body(config={'autonomous': True})
+        self.assertEqual(0, on.returncode, on.stdout + on.stderr)
+        self.assertEqual((True, True), self.record())
+        self.config_path.write_text(json.dumps({'autonomous': 'yes'}), encoding='utf-8')
+        bad = ps('. ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null', env=self.env)
+        self.assertNotEqual(0, bad.returncode)
+        self.assertIn('autonomous', bad.stderr + bad.stdout)
+
+    def test_entry_refuses_contradictory_switches(self):
+        for extra, message in ((['-Autonomous', '-NoAutonomous'], '-Autonomous and -NoAutonomous cannot be combined'),
+                               (['-Autonomous', '-NoAutoMerge'], '-Autonomous implies auto-merge')):
+            with self.subTest(extra=extra):
+                result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7', *extra],
+                                        env=self.env, cwd=ROOT, capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace', timeout=20)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertFalse(self.calls())
+
+    def test_dry_run_prints_autonomy(self):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-NewSession', '-DryRun', '-Autonomous'], env=self.env, cwd=ROOT, capture_output=True,
+                                text=True, encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('auto-merge on; autonomous on', result.stdout)
+        self.assertFalse((self.checkout / '.workbench').exists())
 
 
 if __name__ == "__main__":

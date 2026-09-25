@@ -2058,5 +2058,137 @@ class UsageLimits(DeliveryFixture):
         self.assertEqual(12.0, args.limit_interval)
 
 
+class AutonomousClose(unittest.TestCase):
+    """#27: after a merged PR on an autonomous checkout the relay closes the sessions - only when
+    the loop is provably over, only helpers back at a shell, only this repo's, and never on a timeout."""
+    PLANNER = '11111111-1111-4111-8111-111111111111'
+    IMPLEMENTER = '22222222-2222-4222-8222-222222222222'
+    RELAY = '33333333-3333-4333-8333-333333333333'
+    REVMUX, REVIEW, OTHER = 'a1', 'a2', 'a3'
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test relay close ' + uuid.uuid4().hex)
+        self.state = self.folder / '.workbench' / 'state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ))
+        self.write('implementer.json', {'tool': 'claude', 'autonomous': True})
+        self.write('loop-done.json', {'pr': 7, 'sha': 'abc', 'followUps': []})
+        peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
+        self.r = relay.Relay(self.folder / '.workbench', peers, 'o/repo', 'issue-7-fix', 5, 60, close_wait=120)
+        self.r.log = lambda text: None
+        self.t = 0.0
+        self.enterContext(patch.object(relay, 'now', lambda: self.t))
+        self.enterContext(patch.object(relay, 'pause', self.advance))
+        self.text = {self.PLANNER: CLAUDE_IDLE, self.IMPLEMENTER: CLAUDE_IDLE,
+                     self.REVMUX: 'revmux exit 1 (findings reported).\nPS C:\\repo> ', self.REVIEW: 'revdiff: 3 annotations',
+                     self.OTHER: 'PS C:\\other> ', self.RELAY: 'relay up:'}
+        self.tree = {'workspaces': [
+            {'name': 'repo', 'sessions': [{'id': self.PLANNER, 'name': '#7 fix', 'paneIds': [self.PLANNER, self.IMPLEMENTER]},
+                                          {'id': self.REVMUX, 'name': '#7 revmux r1'},
+                                          {'id': self.REVIEW, 'name': '#7 your review'},
+                                          {'id': self.RELAY, 'name': '#7 relay'}]},
+            {'name': 'other', 'sessions': [{'id': self.OTHER, 'name': '#7 revmux r1'}]}]}
+        self.actions = []
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=lambda pane: self.text[pane]))
+        self.enterContext(patch.object(agw, 'tree', side_effect=lambda: self.tree))
+        self.enterContext(patch.object(agw, 'my_pane', return_value=self.RELAY))
+        self.enterContext(patch.object(agw, 'close_session', side_effect=lambda sid: self.actions.append(('close', sid))))
+        self.enterContext(patch.object(agw, 'clear_restore', side_effect=lambda pane: self.actions.append(('unpin', pane))))
+        self.notify = self.enterContext(patch.object(agw, 'notify'))
+        self.status = self.enterContext(patch.object(agw, 'set_status'))
+        self.enterContext(patch.object(agw, 'request', side_effect=AssertionError('unexpected terminal request')))
+
+    def write(self, name, data):
+        (self.state / name).write_text(json.dumps(data), encoding='utf-8')
+
+    def advance(self, seconds):
+        self.t += max(seconds, 1)
+
+    def closes(self):
+        return [target for action, target in self.actions if action == 'close']
+
+    def log(self):
+        path = self.state / 'relay-close.log'
+        return path.read_text(encoding='utf-8') if path.exists() else ''
+
+    def test_the_close_order_and_what_is_left_open(self):
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())      # helper, issue, own
+        self.assertNotIn(self.OTHER, [t for _, t in self.actions])                    # another repo's #7
+        self.assertNotIn(self.REVIEW, [t for _, t in self.actions])                   # revdiff still running
+        unpinned = [t for a, t in self.actions if a == 'unpin']
+        self.assertEqual([self.REVMUX, self.PLANNER, self.IMPLEMENTER, self.RELAY], unpinned)
+        for action in (('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER)):
+            self.assertLess(self.actions.index(action), self.actions.index(('close', self.PLANNER)))
+        self.assertIn('left open: #7 your review (still running)', self.log())
+        self.assertIn('closing the relay session', self.log())
+        self.assertIn('left open: #7 your review', self.notify.call_args.args[1])
+        self.assertGreaterEqual(self.t, relay.CLOSE_SETTLE)                            # panes had to settle
+
+    def blocked(self):
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.closes())
+        self.assertIn('NOT closing', self.log())
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id=self.PLANNER)
+        return self.log()
+
+    def test_autonomy_off_closes_nothing(self):
+        self.write('implementer.json', {'tool': 'claude', 'autonomous': False})
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.actions)
+        self.assertEqual('', self.log())
+
+    def test_no_loop_done_record_for_this_pr(self):
+        (self.state / 'loop-done.json').unlink()
+        self.assertIn('the planner has not recorded `wb.py loop-state done --pr 7`', self.blocked())
+        self.write('loop-done.json', {'pr': 6})
+        self.actions.clear()
+        self.assertIn('loop-state done --pr 7', self.blocked())
+
+    def test_the_implementer_has_not_read_its_last_mail(self):
+        box = self.folder / '.workbench' / 'inbox' / 'codex'
+        box.mkdir(parents=True)
+        (box / 'm1.md').write_text('---\nid: m1\nfrom: claude\nto: codex\nsubject: loop complete\n---\nbye\n', encoding='utf-8')
+        self.assertIn('the implementer has not read m1', self.blocked())
+
+    def test_a_pane_that_keeps_changing(self):
+        texts = iter(f'{CLAUDE_IDLE}\n{i}' for i in range(10000))
+        self.text[self.IMPLEMENTER] = None
+        agw.pane_text.side_effect = lambda pane: next(texts) if pane == self.IMPLEMENTER else self.text[pane]
+        self.assertIn('codex pane changed', self.blocked())
+
+    def test_a_draft_a_running_turn_or_a_git_lock(self):
+        for case, text, reason in (('draft', CLAUDE_IDLE.replace('\n>\n', '\n> half a thought\n'), 'composer is not provably empty'),
+                                   ('busy', CLAUDE_RUNNING, 'is running a turn'), ('lock', None, '.git/index.lock exists')):
+            with self.subTest(case=case):
+                self.actions.clear()
+                (self.state / 'relay-close.log').unlink(missing_ok=True)
+                self.text[self.IMPLEMENTER] = CLAUDE_IDLE if text is None else text
+                lock = self.folder / '.git' / 'index.lock'
+                if case == 'lock':
+                    lock.parent.mkdir(exist_ok=True)
+                    lock.write_text('', encoding='utf-8')
+                self.assertIn(reason, self.blocked())
+                lock.unlink(missing_ok=True)
+
+    def test_dry_run_closes_nothing(self):
+        self.r.dry_run = True
+        self.r.close_after_merge(7)
+        self.assertEqual([], self.actions)
+
+    def test_a_restart_after_the_drain_still_closes(self):
+        self.write('relay.json', {'branch': 'issue-7-fix', 'pr': {'number': 7, 'state': 'MERGED', 'headRefName': 'issue-7-fix'},
+                                  'announced': [], 'watch_since': '2026-09-24T16:00:00+00:00'})
+        restarted = relay.Relay(self.folder / '.workbench', self.r.peers, 'o/repo', 'issue-7-fix', 5, 60)
+        self.assertEqual((7, 'MERGED'), restarted.retired_on_start)
+        restarted.log = lambda text: None
+        restarted.close_after_merge = Mock()
+        restarted.stop_file = SimpleNamespace(exists=lambda: True)
+        self.assertEqual(0, restarted.run())
+        restarted.close_after_merge.assert_called_once_with(7)
+
+
 if __name__ == "__main__":
     unittest.main()

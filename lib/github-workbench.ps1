@@ -26,6 +26,7 @@
   github-workbench 7 -Implementer claude  # Claude, not Codex, in the right pane (e.g. Codex out of quota)
   github-workbench 7 -AutoMerge           # the planner merges its own PR when every condition holds
   github-workbench 7 -Failover            # the planner, on a usage-limit mail: switch the implementer tool
+  github-workbench 7 -Autonomous          # merge, file follow-ups and close the sessions without the human
 .EXAMPLE
   github-workbench -Queue 'yeroo/agworkbench#7,10' -Parallel 2
 .EXAMPLE
@@ -50,6 +51,8 @@ param(
     [switch] $AutoMerge,
     [switch] $NoAutoMerge,
     [switch] $Failover,
+    [switch] $Autonomous,
+    [switch] $NoAutonomous,
     [switch] $Version
 )
 
@@ -75,6 +78,18 @@ if ($Failover -and ($Implementer -or $PSBoundParameters.ContainsKey('Queue') -or
     Write-Host '-Failover picks the other tool itself; it cannot be combined with -Implementer, -Queue, -NewSession or a queue member.' -ForegroundColor Yellow
     exit 2
 }
+if ($Autonomous -and $NoAutonomous) {
+    Write-Host '-Autonomous and -NoAutonomous cannot be combined.' -ForegroundColor Yellow
+    exit 2
+}
+if ($Autonomous -and $NoAutoMerge) {
+    Write-Host '-Autonomous implies auto-merge; it cannot be combined with -NoAutoMerge.' -ForegroundColor Yellow
+    exit 2
+}
+# $null leaves the checkout's saved autonomy (or the config default) alone.
+$autonomousChoice = $null
+if ($Autonomous) { $autonomousChoice = $true }
+if ($NoAutonomous) { $autonomousChoice = $false }
 if ($AutoMerge -and $NoAutoMerge) {
     Write-Host '-AutoMerge and -NoAutoMerge cannot be combined.' -ForegroundColor Yellow
     exit 2
@@ -100,6 +115,8 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     if ($Implementer) { $queueArgs += @('--implementer', $Implementer) }
     if ($AutoMerge) { $queueArgs += '--auto-merge' }
     if ($NoAutoMerge) { $queueArgs += '--no-auto-merge' }
+    if ($Autonomous) { $queueArgs += '--autonomous' }
+    if ($NoAutonomous) { $queueArgs += '--no-autonomous' }
     & python @queueArgs
     exit $LASTEXITCODE
 }
@@ -110,7 +127,7 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Failover]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
@@ -145,7 +162,8 @@ if ($QueueMember) {
         }
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
-            Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice
+            Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice `
+                -Autonomous $autonomousChoice
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -169,7 +187,7 @@ if ($QueueMember) {
 if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
-        -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover
+        -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover -Autonomous $autonomousChoice
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef
