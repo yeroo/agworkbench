@@ -51,6 +51,8 @@ foreach ($argument in $claudeArgs) {
 $denied = @('Bash(git push:*)', 'Bash(gh:*)', 'PowerShell(git push:*)', 'PowerShell(gh:*)')
 if (-not $config.allowNetwork) { $denied += @('WebFetch', 'WebSearch') }
 $policy = @('--disallowedTools') + $denied
+$quietSettings = Get-ClaudeQuietSettings $Checkout
+$quiet = @('--settings', $quietSettings)          # #33: no greyed prompt suggestions (see Workbench.ps1)
 
 $transcript = Get-ClaudeTranscript $identity.sessionId
 if ($transcript) {
@@ -64,13 +66,16 @@ workbench mail, and continue the step you were in (implementing, or fixing revie
 else { $modeArgs = @('--session-id', $identity.sessionId, "/workbench-implementer $Issue") }
 if ($WhatIfOnly) {
     Write-Host "would cd: $($identity.cwd)"
-    Write-Host ('would run: claude ' + (($policy + $claudeArgs + $modeArgs | ForEach-Object { Quote ([string]$_) }) -join ' '))
+    Write-Host 'would set: CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false'
+    Write-Host ('would run: claude ' + (($policy + $claudeArgs + $quiet + $modeArgs | ForEach-Object { Quote ([string]$_) }) -join ' '))
     return
 }
 
 $env:AGWORKBENCH = $script:Root
 $env:AI_HUB = Join-Path $Checkout '.workbench'
 $env:AI_BOX = 'codex'
+$env:CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = 'false'
+Write-ClaudeQuietSettings $quietSettings
 Set-Location -LiteralPath $identity.cwd
 
 $registry = Join-Path $env:AI_HUB 'state\agents.json'
@@ -78,4 +83,4 @@ $deadline = (Get-Date).AddSeconds(60)
 while (-not (Test-Path -LiteralPath $registry) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
 
 Write-Host "agworkbench: Claude implementer for $Issue in $Checkout - denied: $($denied -join ', ')" -ForegroundColor DarkGray
-& claude @policy @claudeArgs @modeArgs
+& claude @policy @claudeArgs @quiet @modeArgs

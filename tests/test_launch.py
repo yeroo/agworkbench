@@ -978,11 +978,12 @@ class RestartPanes(LauncherFixtures):
                 self.assertEqual(str(ROOT), capture['Root'])
                 if role == 'claude':
                     self.assertEqual(str(original), capture['Cwd'])
-                    self.assertEqual(['--resume', OTHER_ID], capture['Args'][:2])
-                    self.assertEqual(3, len(capture['Args']))
-                    self.assertIn('resumed after an agwinterm restart', capture['Args'][2])
-                    self.assertIn('one background wb.py wait-mail waiter', capture['Args'][2])
-                    self.assertIn('continue the phase you were in', capture['Args'][2])
+                    settings = str(self.checkout / '.workbench/state/claude-settings.json')
+                    self.assertEqual(['--settings', settings, '--resume', OTHER_ID], capture['Args'][:4])   # #33
+                    self.assertEqual(5, len(capture['Args']))
+                    self.assertIn('resumed after an agwinterm restart', capture['Args'][4])
+                    self.assertIn('one background wb.py wait-mail waiter', capture['Args'][4])
+                    self.assertIn('continue the phase you were in', capture['Args'][4])
                 else:
                     args = capture['Args']
                     self.assertEqual(str(self.checkout), capture['Cwd'])
@@ -1314,7 +1315,7 @@ class QueueEntry(LauncherFixtures):
                               parallel=1, watch=False, yes=False, label=None, owner=None, members=[member]))
         self.entry_lib = self.temp / 'queue entry'
         self.entry_lib.mkdir()
-        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py']:
+        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py']:
             shutil.copyfile(LIB / name, self.entry_lib / name)
         self.overrides = (
             "\nfunction Get-IssueInfo { return @{title='fix-x';state='OPEN'} }\n"
@@ -2475,9 +2476,9 @@ class ClaudeImplementer(LauncherFixtures):
         run = line[line.index('would run: claude '):]
         self.assertTrue(run.startswith("would run: claude '--disallowedTools' 'Bash(git push:*)' 'Bash(gh:*)' "
                                        "'PowerShell(git push:*)' 'PowerShell(gh:*)' "
-                                       "'WebFetch' 'WebSearch' '--dangerously-skip-permissions' '--session-id'"), run)
+                                       "'WebFetch' 'WebSearch' '--dangerously-skip-permissions' '--settings'"), run)
         opened = self.pane({'allowNetwork': True}).stdout
-        self.assertIn("'PowerShell(gh:*)' '--session-id'", opened)
+        self.assertIn("'PowerShell(gh:*)' '--settings'", opened)
         self.assertNotIn('WebFetch', opened)
 
     def test_pane_refuses_policy_and_identity_arguments(self):
@@ -2506,6 +2507,7 @@ class ClaudeImplementer(LauncherFixtures):
                          (capture['Box'], capture['Hub'], capture['Cwd'], capture['Root']))
         self.assertEqual(['--disallowedTools', 'Bash(git push:*)', 'Bash(gh:*)', 'PowerShell(git push:*)',
                           'PowerShell(gh:*)', 'WebFetch', 'WebSearch',
+                          '--settings', str(self.checkout / '.workbench/state/claude-settings.json'),
                           '--session-id', OTHER_ID, '/workbench-implementer o/repo#7'], capture['Args'])
 
     def test_repair_text_offers_no_launch_for_an_unidentified_implementer(self):
@@ -2517,6 +2519,65 @@ class ClaudeImplementer(LauncherFixtures):
                 self.assertEqual(0, result.returncode, result.stdout + result.stderr)
                 self.assertEqual(offered, 'In the Claude implementer pane, once it is at an empty shell prompt: THE-LINE'
                                  in result.stdout)
+
+    def test_launched_claude_has_prompt_suggestions_off_through_a_native_argv(self):
+        # #33 B1: a PowerShell function never goes through native quoting; a .cmd running python does.
+        # The settings are a FILE path, so 5.1 cannot strip quotes out of an inline JSON string.
+        self.identity()
+        self.registry_path.write_text('{}', encoding='utf-8')
+        dump = self.temp / 'claude-argv.json'
+        (self.temp / 'claude_dump.py').write_text(
+            'import json, os, sys\n'
+            f'json.dump({{"args": sys.argv[1:], "env": os.environ.get("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION")}}, '
+            f'open(r"{dump}", "w", encoding="utf-8"))\n', encoding='utf-8')
+        self.cmd('claude', f'"{sys.executable}" "{self.temp / "claude_dump.py"}" %*')
+        settings = self.checkout / '.workbench/state/claude-settings.json'
+        for script in ('pane-implementer-claude.ps1', 'pane-claude.ps1'):
+            for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+                with self.subTest(script=script, shell=shell):
+                    if script == 'pane-claude.ps1':
+                        self.identity(role='planner', pane=MAIN_ID, sessionId=RELAY_ID)
+                    dump.unlink(missing_ok=True)
+                    result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(LIB / script),
+                                             '-Checkout', str(self.checkout), '-Issue', 'o/repo#7'],
+                                            env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    seen = json.loads(dump.read_text(encoding='utf-8'))
+                    args = seen['args']
+                    self.assertEqual(str(settings), args[args.index('--settings') + 1])
+                    self.assertEqual('false', seen['env'])
+                    self.assertEqual({'promptSuggestionEnabled': False}, json.loads(settings.read_text(encoding='utf-8')))
+
+    def test_the_quiet_settings_file_is_written_atomically_and_only_when_needed(self):
+        # #33 r20 m1: both panes start at once; a writer never leaves it half written or fails the other.
+        path = self.temp / 'state' / 'claude-settings.json'
+        code = ('. ./lib/Workbench.ps1; $p = ' + ps_quote(path) + '; '
+                'Write-ClaudeQuietSettings $p; $first = (Get-Item -LiteralPath $p).LastWriteTimeUtc; '
+                'Start-Sleep -Milliseconds 50; Write-ClaudeQuietSettings $p; '
+                'if ((Get-Item -LiteralPath $p).LastWriteTimeUtc -ne $first) { throw "rewritten though unchanged" }; '
+                '[IO.File]::WriteAllText($p, "{}"); Write-ClaudeQuietSettings $p; '
+                '$jobs = 1..6 | ForEach-Object { Start-Job -ScriptBlock { param($root, $file) Set-Location $root; '
+                '. ./lib/Workbench.ps1; 1..20 | ForEach-Object { try { [IO.File]::Delete($file) } catch { }; '
+                'Write-ClaudeQuietSettings $file } } -ArgumentList (Get-Location).Path, $p }; '
+                '$jobs | Wait-Job | Receive-Job -ErrorAction Stop; '
+                "Get-ChildItem -LiteralPath (Split-Path $p) -Filter '*.tmp' | ForEach-Object { throw ('temp left: ' + $_.Name) }")
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                shutil.rmtree(path.parent, ignore_errors=True)
+                result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', code],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=180)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual('{"promptSuggestionEnabled": false}', path.read_bytes().decode('utf-8'))
+
+    def test_settings_in_claude_args_are_refused_for_the_planner_too(self):
+        self.identity(role='planner', pane=MAIN_ID)
+        for flag in ('--settings', '--settings=x.json'):
+            with self.subTest(flag=flag):
+                self.config_path.write_text(json.dumps({'claudeArgs': [flag]}), encoding='utf-8')
+                result = ps('& ./lib/pane-claude.ps1 -Checkout ' + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly",
+                            env=self.env)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("replace the workbench's own --settings", result.stderr)
 
     def test_codex_is_not_required(self):
         self.assertIsNone(shutil.which('codex', path=self.env['PATH']))

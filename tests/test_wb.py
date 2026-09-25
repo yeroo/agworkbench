@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
@@ -97,6 +98,7 @@ class HelperWorkspace(unittest.TestCase):
             self.assertEqual(name, args['name'])
             self.assertEqual('checkout', args['cwd'])
             self.assertEqual('command', args['command'])
+            self.assertEqual('direct', args['command-mode'])     # no shell: the ended pane takes no input (#33)
             self.assertEqual(not select, args.get('no-select', False))
         self.assertEqual('', self.stderr.getvalue())
 
@@ -115,6 +117,32 @@ class HelperWorkspace(unittest.TestCase):
             self.assertNotIn('workspace', self.request.call_args.kwargs['args'])
             self.assertEqual(1, len(self.stderr.getvalue().splitlines()))
             self.assertIn('workspace', self.stderr.getvalue())
+
+
+class HelperCommand(unittest.TestCase):
+    """#33: helpers run in agwinterm's direct mode, so their command line is Windows-quoted."""
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Windows quoting')
+    def test_helper_command_line_survives_windows_quoting_and_runs_the_script(self):
+        import ctypes
+        from ctypes import wintypes
+        parse = ctypes.windll.shell32.CommandLineToArgvW
+        parse.argtypes, parse.restype = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)], ctypes.POINTER(wintypes.LPWSTR)
+        values = {'Checkout': 'C:\\dir with space\\','Base': 'it\'s "quoted"', 'Round': '2'}
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'dump args.ps1'
+            script.write_text('param($Checkout, $Base, $Round)\n'
+                              '[Console]::Out.Write((ConvertTo-Json -Compress @($Checkout, $Base, $Round)))\n',
+                              encoding='utf-8')
+            command = wb.pane_command(str(script), **values)
+            count = ctypes.c_int()
+            argv = parse(command, ctypes.byref(count))
+            parsed = [argv[i] for i in range(count.value)]
+            ctypes.windll.kernel32.LocalFree(argv)
+            self.assertEqual(['-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', str(script),
+                              '-Checkout', values['Checkout'], '-Base', values['Base'], '-Round', '2'], parsed[1:])
+            out = subprocess.run(command, capture_output=True, text=True, timeout=60).stdout
+            self.assertEqual([values['Checkout'], values['Base'], '2'], json.loads(out.splitlines()[-1]))  # after any profile output
 
 
 class WaitMail(unittest.TestCase):
@@ -365,21 +393,21 @@ class RevmuxProfile(unittest.TestCase):
         (self.folder / '.workbench/state/implementer.json').write_text(text, encoding='utf-8')
 
     def test_no_saved_implementer_keeps_comprehensive(self):
-        self.assertIn("-Profile 'comprehensive'", self.run_round())
+        self.assertIn("-Profile comprehensive", self.run_round())
 
     def test_claude_implementer_uses_the_saved_claude_only_profile(self):
         self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
-        self.assertIn("-Profile 'claude-only'", self.run_round())
+        self.assertIn("-Profile claude-only", self.run_round())
 
     def test_explicit_profile_wins(self):
         self.save('{"tool": "claude", "revmuxProfile": "claude-only"}')
-        self.assertIn("-Profile 'codex-final'", self.run_round('--profile', 'codex-final'))
+        self.assertIn("-Profile codex-final", self.run_round('--profile', 'codex-final'))
 
     def test_unreadable_or_unsafe_saved_profile_falls_back(self):
         for text in ('not json', '{"revmuxProfile": "x\' ; calc"}', '[]'):
             with self.subTest(text=text):
                 self.save(text)
-                self.assertIn("-Profile 'comprehensive'", self.run_round())
+                self.assertIn("-Profile comprehensive", self.run_round())
 
 
 HEAD = 'a' * 40

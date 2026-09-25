@@ -29,6 +29,7 @@ if (-not (Get-Command revdiff -ErrorAction SilentlyContinue)) {
     throw "revdiff is not installed - run install.ps1 from the agworkbench checkout"
 }
 Write-Host "Your review of $Base..HEAD. Annotate, then press q; the notes go to Claude." -ForegroundColor Cyan
+try {
 & revdiff $Base --output $out
 $annotated = (Test-Path -LiteralPath $out) -and ((Get-Content -Raw -LiteralPath $out).Trim().Length -gt 0)
 
@@ -41,3 +42,7 @@ if ($annotated) {
         --text "The human reviewed $Base..HEAD in revdiff and left no annotations." | Out-Host
 }
 Write-Host "Posted to Claude. You can close this session." -ForegroundColor Yellow
+} finally {
+    # The last act (#33): mark this helper done for the autonomous close (see run-revmux.ps1).
+    & python (Join-Path $script:Lib 'helper_done.py') --hub $hubDir --kind review
+}

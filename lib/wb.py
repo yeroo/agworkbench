@@ -51,20 +51,19 @@ def issue_number(root: Path) -> str:
     return match.group(1) if match else "?"
 
 
-def ps_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 def pane_command(script: str, **params: str) -> str:
-    shell = "pwsh" if shutil.which("pwsh") else "powershell.exe"
-    parts = [shell, "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", ps_quote(str(HERE / script))]
+    """A helper's command line for agwinterm's direct mode: Windows quoting, no shell around it (#33).
+    When the helper ends, its pane stays on screen with its input closed, so the close can prove it
+    untouched (closer.py)."""
+    shell = shutil.which("pwsh") or shutil.which("powershell.exe") or "powershell.exe"
+    parts = [shell, "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", str(HERE / script)]
     for key, value in params.items():
-        parts += [f"-{key}", ps_quote(value)]
-    return " ".join(parts)
+        parts += [f"-{key}", value]
+    return subprocess.list2cmdline(parts)
 
 
 def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
-    args = {"name": name, "cwd": str(cwd), "command": command}
+    args = {"name": name, "cwd": str(cwd), "command": command, "command-mode": "direct"}
     pane = agw.my_pane()
     found = agw.find_pane(pane, agw.tree()) if pane else None
     workspace = found[0].get('id') if found else None

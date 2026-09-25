@@ -594,6 +594,59 @@ function Get-RecordedClaudeSessionId([string] $Checkout, [string] $Role) {
     return $null
 }
 
+function Get-ClaudeQuietSettings([string] $Checkout) {
+    <# #33: the settings every Claude the workbench launches starts with. Prompt suggestions draw greyed
+       text in an idle composer; the relay then cannot prove it empty, so it neither rings the agent
+       nor closes its session. Passed to --settings as a FILE path: an inline JSON string loses its
+       quotes on the way to a native program under Windows PowerShell 5.1. #>
+    return Join-Path $Checkout '.workbench\state\claude-settings.json'
+}
+
+function Write-ClaudeQuietSettings([string] $Path) {
+    # Both agent panes start at once and write the same file: write only when it is missing or
+    # different, through a temp file and a rename, so a reader never sees it half written (#33).
+    $content = '{"promptSuggestionEnabled": false}'
+    try {
+        if ([IO.File]::ReadAllText($Path) -ceq $content) { return }
+    } catch {
+        # missing or unreadable: (re)write it below
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    $temp = "$Path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    $overwritingMove = [bool][IO.File].GetMethod('Move', [type[]]@([string], [string], [bool]))
+    try {
+        [IO.File]::WriteAllText($temp, $content, (New-Object Text.UTF8Encoding $false))
+        $failure = $null
+        for ($try = 1; $try -le 5; $try++) {
+            try {
+                if ($overwritingMove) {
+                    [IO.File]::Move($temp, $Path, $true)
+                } elseif (Test-Path -LiteralPath $Path) {
+                    # Windows PowerShell 5.1: no overwriting Move. Replace needs the file to exist; if a
+                    # concurrent writer removed it meanwhile, this throws and the next try Moves instead.
+                    [IO.File]::Replace($temp, $Path, [NullString]::Value)
+                } else {
+                    # Throws if a concurrent writer created it meanwhile; the next try Replaces it.
+                    [IO.File]::Move($temp, $Path)
+                }
+                $failure = $null
+                break
+            } catch {
+                $failure = $_
+            }
+        }
+        if ($failure) {
+            # A concurrent writer (the other pane) holds the file; what it wrote is the same content.
+            # Anything else - the file still missing or different - is a real failure.
+            $ok = $false
+            try { $ok = [IO.File]::ReadAllText($Path) -ceq $content } catch { }
+            if (-not $ok) { throw $failure }
+        }
+    } finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Read-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Role = 'planner') {
     $path = Get-ClaudeIdentityPath $Checkout $Role
     $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json

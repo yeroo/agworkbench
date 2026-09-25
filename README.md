@@ -307,13 +307,36 @@ merges, unless you opted in for that checkout.
 - **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
   waits for you, whether it was deferred or ended disputed. Minor and Immaterial ones may be
   deferred as follow-ups. The merge comment lists them all with their severity and issue links.
-- **It closes the sessions.** After a MERGED PR, never a closed one, the relay closes nothing until
-  the planner has recorded `wb.py loop-state done`, the implementer has read its last mail, and
-  both panes are unchanged for 30 s with empty composers and no `.git/index.lock`. Then it closes
-  the issue's revmux and review sessions that are back at a shell (a running revdiff stays open and
-  is named), then the issue session, then itself. It only ever touches this repository's
-  workspace. Every step goes to `.workbench/state/relay-close.log`. It never closes on a timeout: it
-  alerts you instead. The checkout stays on disk.
+- **It closes the sessions.** After a MERGED PR, never a closed one, the relay first closes the
+  issue's revmux and review sessions that have finished, each on its own evidence (below), whatever
+  the agents are doing; a running revdiff stays open and is named. The issue session and the relay
+  itself close only once the planner has recorded `wb.py loop-state done`, the implementer has
+  read its last mail, and both panes are unchanged for 30 s with empty composers and no
+  `.git/index.lock`. It only ever touches this repository's workspace. Every step goes to
+  `.workbench/state/relay-close.log`. It never closes on a timeout: it alerts you instead. The
+  checkout stays on disk.
+
+How the close proves each thing (#33):
+- **Agents:** every Claude the workbench launches (planner and implementer) starts with prompt
+  suggestions off (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, plus `--settings` pointing at
+  `.workbench/state/claude-settings.json`). Otherwise the greyed suggestion in an idle composer
+  makes it impossible to prove the composer empty: the relay would neither ring the agent nor
+  close its session. `claudeArgs` may not pass its own `--settings`; put your settings in
+  `~/.claude/settings.json`. An adopted Claude (your own session) needs
+  `"promptSuggestionEnabled": false` there too, and the relay's hold and close logs say so.
+- **Helpers:** `wb.py revmux` and `wb.py human-review` start their sessions in agwinterm's direct
+  command mode: the helper runs with no shell around it, and when it ends its pane stays on screen
+  with its input closed, so nothing can be typed there and nothing more is printed. As its last act
+  the helper writes a completion marker (`.workbench/state/helpers/<pane>.done`, holding what the
+  pane showed). A helper closes when its marker exists, no shell is live in its pane, the pane shows
+  exactly the marker's rows, and it has been unchanged for 30 s. Helpers close first, even while the
+  agents are still busy. A helper session opened the old way, inside a shell, is left for you.
+- **A relay that died:** the queue's conductor runs the same close for a merged member whose close
+  has been pending for 15 minutes and whose `#N relay` session is gone. While that relay is still
+  alive, the member is only flagged `closeStuck` in the queue file, because one closer at a time.
+  A close that cannot complete is refused and flagged, never forced.
+- **Members launched before this fix** still have suggestions on, so their relays keep holding the
+  doorbell. Once such a loop has recorded `wb.py loop-state done`, close its sessions by hand.
 
 It does not decide plan disagreements for you, delete checkouts, or queue its own follow-ups. To
 stop it, use `-NoAutonomous` on the checkout (read again at close time) or on the queue, a hold
@@ -410,6 +433,8 @@ lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer p
 lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/workbench-implementer <issue>"
 lib/relay.py                mail doorbell and PR watcher; spots usage limits in the agent panes
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
+lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
+lib/helper_done.py          a helper session's completion marker (#33)
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude
 lib/wb.py                   opens those sessions for Claude with correct Windows paths
