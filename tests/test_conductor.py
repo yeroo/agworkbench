@@ -31,6 +31,9 @@ class QueueCase(unittest.TestCase):
         self.enterContext(patch.object(q.agw, 'request', self.terminal))
         self.enterContext(patch.object(q.agw, 'notify'))
         self.enterContext(patch.object(q.agw, 'set_status'))
+        # The in-hand lookups (#28) call gh and the terminal; queue mechanics tests assume none in hand.
+        self.real_in_hand = q.in_hand
+        self.in_hand = self.enterContext(patch.object(q, 'in_hand', return_value={}))
         self.now = 1000
         self.store = q.Store(self.root / 'queues/o/r.json')
         self.launches = []
@@ -600,6 +603,186 @@ class QueueCase(unittest.TestCase):
                 self.store.path.write_text(json.dumps(data))
                 with self.assertRaises(q.StateError):
                     self.store.load()
+
+def hold_exclusively(path):
+    """Open a file the way the launcher's Invoke-WithCheckoutLock does: no sharing at all."""
+    import ctypes
+    from ctypes import wintypes
+    create = ctypes.windll.kernel32.CreateFileW
+    create.restype = wintypes.HANDLE
+    handle = create(str(path), 0xC0000000, 0, None, 4, 0x80, None)     # GENERIC_READ|WRITE, share none, OPEN_ALWAYS
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError('could not hold the lock file')
+    return handle
+
+
+class QueueBugs(unittest.TestCase):
+    """#28: -Queue bugs queues every open bug nobody is handling, appending to the repo's queue."""
+    # QueueCase's fixture and helpers, without re-running its tests.
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                  QueueCase.spawn, QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.in_hand.side_effect = self.fake_in_hand
+        self.prs = {}
+        self.tree = {'workspaces': []}
+        self.pulls = []
+        self.closing = {}
+
+    def fake_in_hand(self, repo, numbers, root, queue_path, gh=None, tree=None):
+        return self.real_in_hand(repo, numbers, root, queue_path, gh or self.fake_gh, self.tree)
+
+    def fake_gh(self, *args):
+        if args[:2] == ('repo', 'view'):
+            return {'nameWithOwner': 'o/r'}
+        if args[0] == 'api' and args[1].startswith('repos/o/r/issues?labels='):
+            self.label_seen = args[1]
+            return [[{'number': n, 'created_at': f'2026-09-{n:02d}'} for n in (1, 2, 3, 4, 5)]]
+        if args[0] == 'api' and args[1].startswith('repos/o/r/pulls'):
+            return [self.pulls]
+        if args[:2] == ('api', 'graphql'):
+            data = {f'i{n}': {'closedByPullRequestsReferences': {'nodes': nodes}} for n, nodes in self.closing.items()}
+            return {'data': {'repository': data}}
+        raise AssertionError(args)
+
+    def start_bugs(self, spec='bugs', **kwargs):
+        with patch.object(q, 'gh_json', self.fake_gh):
+            return q.start_queue(spec, repo='o/r', root=self.root / 'queues', gh=self.fake_gh, tree=self.tree, **kwargs)
+
+    def members(self):
+        return [m['number'] for m in self.store.load()['members']]
+
+    def output(self):
+        return sys.stdout.getvalue()
+
+    def test_bugs_is_the_configured_label(self):
+        self.start_bugs('BUGS')
+        self.assertIn('labels=bug&', self.label_seen)
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'bugLabel': 'kind: bug'}))
+        self.start_bugs()
+        self.assertIn('labels=kind%3A%20bug&', self.label_seen)
+        for bad in ('', 'a,b', 3):
+            with self.subTest(label=bad):
+                self.config.write_text(json.dumps({'bugLabel': bad}))
+                with self.assertRaises(q.UsageError):
+                    self.start_bugs()
+
+    def test_each_in_hand_reason_is_skipped_and_reported(self):
+        clones = self.root / 'clones'
+        self.pulls = [{'number': 40, 'head': {'ref': 'issue-1-fix', 'repo': {'full_name': 'o/r'}}},
+                      {'number': 41, 'head': {'ref': 'issue-5-fork', 'repo': {'full_name': 'someone/r'}}}]
+        self.closing = {2: [{'number': 42, 'state': 'OPEN'}], 5: [{'number': 43, 'state': 'CLOSED'}]}
+        self.tree = {'workspaces': [{'name': 'r', 'sessions': [{'id': 's3', 'name': '#3 fix the thing'},
+                                                               {'id': 'h5', 'name': '#5 revmux r1'}]},
+                                    {'name': 'other', 'sessions': [{'id': 'x', 'name': '#5 elsewhere'}]}]}
+        foreign = clones / 'r-issue-4' / '.workbench' / 'state'
+        foreign.mkdir(parents=True)
+        self.start_bugs()
+        self.assertEqual([5], self.members())            # a fork's PR, a closed PR, a helper, another repo: not in hand
+        out = self.output()
+        self.assertIn('#1 skipped: pr: open PR #40 on issue-1-fix', out)
+        self.assertIn('#2 skipped: pr: open PR #42 will close it', out)
+        self.assertIn('#3 skipped: session: a live workbench session is open for it', out)
+        self.assertIn('#4 skipped: checkout exists from an earlier loop', out)
+
+    @unittest.skipUnless(os.name == 'nt', 'the launcher lock is a Windows share-mode lock')
+    def test_a_held_launch_lock_is_skipped_but_a_stale_lock_file_is_not(self):
+        import ctypes
+        lock = self.root / 'clones' / 'r-issue-2' / '.workbench' / 'state' / 'launch.lock'
+        lock.parent.mkdir(parents=True)
+        lock.write_text('')
+        membership = lock.parent / 'queue-member.json'
+        q.atomic_json(membership, dict(queue=str(self.store.path), repo='o/r', number=2))
+        handle = hold_exclusively(lock)
+        try:
+            reasons = q.skip_reasons([2], 'o/r', self.root / 'clones', self.store.path, {}, set())
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        self.assertEqual({2: 'checkout-lock: a launcher holds its checkout'}, reasons)
+        self.assertEqual({}, q.skip_reasons([2], 'o/r', self.root / 'clones', self.store.path, {}, set()))
+
+    def test_append_to_a_running_queue_skips_members_and_reports_settings(self):
+        self.start('o/r#1,2')
+        self.start_bugs(autonomous=True)
+        self.assertEqual([1, 2, 3, 4, 5], self.members())
+        out = self.output()
+        self.assertIn('#1 skipped: queued (pending)', out)
+        self.assertIn('settings: autonomous null -> true (for every member launched from now on)', out)
+
+    def test_a_pr_closed_unmerged_makes_the_issue_eligible_on_the_next_rescan(self):
+        self.pulls = [{'number': 40, 'head': {'ref': 'issue-1-fix', 'repo': {'full_name': 'o/r'}}}]
+        self.start_bugs(watch=True)
+        self.assertEqual([2, 3, 4, 5], self.members())
+        worker = self.worker()
+        worker.gh = self.fake_gh
+        self.pulls = []                                  # the PR was closed without merging
+        with patch.object(q.agw, 'tree', return_value=self.tree):
+            worker.refresh_remote()
+        self.assertEqual([2, 3, 4, 5, 1], self.members())
+
+    def test_rescan_logs_a_skip_only_when_its_reason_changes(self):
+        self.pulls = [{'number': 40, 'head': {'ref': 'issue-1-fix', 'repo': {'full_name': 'o/r'}}}]
+        self.start_bugs(watch=True)
+        worker = self.worker()
+        worker.gh = self.fake_gh
+        before = self.output().count('#1 skipped')
+        with patch.object(q.agw, 'tree', return_value=self.tree):
+            for _ in range(3):
+                worker.refresh_remote()
+                self.now += 300
+        self.assertEqual(before + 1, self.output().count('#1 skipped'))
+
+    def test_a_failed_lookup_fails_the_start_and_writes_nothing(self):
+        def broken(*args):
+            if args[0] == 'api' and args[1].startswith('repos/o/r/pulls'):
+                raise q.QueueError('HTTP 502')
+            return self.fake_gh(*args)
+        with self.assertRaises(q.QueueError):
+            with patch.object(q, 'gh_json', broken):
+                q.start_queue('bugs', repo='o/r', root=self.root / 'queues', gh=broken, tree=self.tree)
+        self.assertFalse(self.store.path.exists())
+
+    def test_a_failed_lookup_on_a_rescan_adds_nothing(self):
+        self.start_bugs(watch=True)
+        worker = self.worker()
+        worker.gh = lambda *args: (_ for _ in ()).throw(q.QueueError('HTTP 502')) if args[0] == 'api' and \
+            args[1].startswith('repos/o/r/pulls') else self.fake_gh(*args)
+        before = self.members()
+        with self.store.transaction() as data:
+            data['members'] = [m for m in data['members'] if m['number'] != 5]
+        with patch.object(q.agw, 'tree', return_value=self.tree):
+            worker.refresh_remote()
+        self.assertEqual([n for n in before if n != 5], self.members())
+        self.assertIn('label scan', worker.errors)
+
+    def test_an_explicit_list_is_not_filtered(self):
+        self.pulls = [{'number': 40, 'head': {'ref': 'issue-1-fix', 'repo': {'full_name': 'o/r'}}}]
+        self.start_bugs('o/r#1,2')
+        self.assertEqual([1, 2], self.members())
+        self.in_hand.assert_not_called()
+
+    def test_watch_onto_an_unwatched_queue_turns_watching_on(self):
+        self.start('o/r#1')
+        self.start_bugs(watch=True)
+        data = self.store.load()
+        self.assertEqual((True, 'bug'), (data['watch'], data['label']))
+        self.assertIn('settings: watch false -> true', self.output())
+        with self.assertRaises(q.UsageError):
+            self.start_bugs('label:other', watch=True)
+
+    def test_dry_run_prints_the_plan_and_writes_nothing(self):
+        self.start('o/r#1')
+        before = self.store.path.read_text()
+        self.pulls = [{'number': 40, 'head': {'ref': 'issue-2-fix', 'repo': {'full_name': 'o/r'}}}]
+        self.start_bugs(dry_run=True, autonomous=True)
+        result = json.loads(self.output().strip().splitlines()[-1])
+        self.assertEqual([3, 4, 5], result['members'])
+        self.assertEqual([{'number': 1, 'reason': 'queued (pending)'},
+                          {'number': 2, 'reason': 'pr: open PR #40 on issue-2-fix'}], result['skipped'])
+        self.assertEqual({'autonomous': [None, True]}, result['settings'])
+        self.assertIn(result['mode'], ('append to a running queue', 'append to a stopped queue'))
+        self.assertEqual(before, self.store.path.read_text())
 
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):

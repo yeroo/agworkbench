@@ -1339,6 +1339,18 @@ class QueueEntry(LauncherFixtures):
         with self.store.transaction() as data:
             data['members'][0].update(state='launching', token=self.token, result=None)
 
+    def test_queue_bugs_reaches_the_conductor_unchanged(self):
+        # #28: `bugs` is resolved by the conductor, so the launcher passes it through as a spec.
+        args_file = self.temp / 'conductor-args.txt'
+        self.cmd('python', f'echo %* > "{args_file}"')
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'),
+                                 '-Queue', 'bugs', '-Repo', 'o/repo', '-Watch', '-Autonomous'],
+                                env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        args = args_file.read_text(encoding='utf-8', errors='replace')
+        self.assertIn('start --spec bugs --repo o/repo --watch', args)
+        self.assertIn('--autonomous', args)
+
     def test_member_autonomous_switch_reaches_its_checkout(self):
         # #27: the conductor passes a queue's saved autonomy as -Autonomous / -NoAutonomous.
         result = self.entry('-Autonomous')

@@ -164,6 +164,100 @@ def resolve_spec(spec, hint=None, gh=gh_json):
     return repo, list(dict.fromkeys(items)), label
 
 
+def bug_label(config):
+    """`bugLabel` from the config (#28): the label `-Queue bugs` stands for. Default `bug`."""
+    settings = read_json(config) if Path(config).exists() else {}
+    label = settings.get('bugLabel', 'bug')
+    if not isinstance(label, str) or not label.strip() or ',' in label:
+        raise UsageError(f'bugLabel in {config} must be a non-empty label name without a comma (got {label!r})')
+    return label.strip()
+
+
+def expand_spec(spec, config):
+    return 'label:' + bug_label(config) if spec.strip().lower() == 'bugs' else spec
+
+
+# --- issues already in hand (#28) ---------------------------------------------------------------
+# A label spec queues only what nobody is handling yet. The lookups are separate from the decision so
+# every rule is tested with fakes; a failed lookup is an error, never "nothing in hand".
+
+HELPER_SESSION = re.compile(r'#\d+ (relay|revmux r\d+|your review)')
+
+
+def pr_reasons(repo, numbers, gh=gh_json):
+    """{number: reason} for issues with an OPEN pull request: one that will close it (GitHub's
+    closing references), or one on the workbench's own `issue-<N>-*` branch in this repo."""
+    reasons = {}
+    pages = gh('api', f'repos/{repo}/pulls?state=open&per_page=100', '--paginate', '--slurp')
+    wanted = set(numbers)
+    for pr in (pr for page in pages for pr in page):
+        head = pr.get('head') or {}
+        match = re.match(r'issue-(\d+)-', head.get('ref') or '')
+        if match and int(match[1]) in wanted and (head.get('repo') or {}).get('full_name') == repo:
+            reasons.setdefault(int(match[1]), f"pr: open PR #{pr['number']} on {head['ref']}")
+    owner, name = repo.split('/')
+    for start in range(0, len(numbers), 100):
+        chunk = numbers[start:start + 100]
+        fields = ' '.join(f'i{n}: issue(number: {n}) {{ closedByPullRequestsReferences(first: 10, '
+                          f'includeClosedPrs: false) {{ nodes {{ number state }} }} }}' for n in chunk)
+        query = f'query {{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
+        result = gh('api', 'graphql', '-f', f'query={query}')
+        issues = ((result or {}).get('data') or {}).get('repository')
+        if not isinstance(issues, dict):
+            raise QueueError(f'closing-PR lookup failed for {repo}: {result!r}'[:300])
+        for n in chunk:
+            nodes = (((issues.get(f'i{n}') or {}).get('closedByPullRequestsReferences')) or {}).get('nodes') or []
+            open_prs = [node['number'] for node in nodes if node.get('state') == 'OPEN']
+            if open_prs:
+                reasons.setdefault(n, f'pr: open PR #{open_prs[0]} will close it')
+    return reasons
+
+
+def session_numbers(repo, tree):
+    """Issue numbers with a live issue session in the repo's workspace (Find-IssueSession's rule)."""
+    workspace_name = repo.split('/')[1]
+    numbers = set()
+    for workspace in (tree or {}).get('workspaces', []):
+        if workspace.get('name') != workspace_name:
+            continue
+        for session in workspace.get('sessions', []):
+            match = re.match(r'#(\d+) ', session.get('name') or '')
+            if match and not HELPER_SESSION.fullmatch(session.get('name') or ''):
+                numbers.add(int(match[1]))
+    return numbers
+
+
+def skip_reasons(numbers, repo, root, queue_path, prs, sessions):
+    """{number: reason} for issues someone is already handling. Pure over its inputs."""
+    reasons = {}
+    for n in numbers:
+        checkout = Path(root) / f'{repo.split("/")[1]}-issue-{n}'
+        state = checkout / '.workbench' / 'state'
+        membership = state / 'queue-member.json'
+        if n in prs:
+            reasons[n] = prs[n]
+        elif n in sessions:
+            reasons[n] = 'session: a live workbench session is open for it'
+        elif checkout_locked(checkout):
+            reasons[n] = 'checkout-lock: a launcher holds its checkout'
+        elif state.is_dir():
+            try:
+                owner = read_json(membership).get('queue') if membership.exists() else None
+            except (OSError, ValueError):
+                owner = None
+            if owner is None or Path(owner).resolve() != Path(queue_path).resolve():
+                reasons[n] = (f'checkout exists from an earlier loop ({checkout}); resume with '
+                              f'github-workbench {repo}#{n} or delete it')
+    return reasons
+
+
+def in_hand(repo, numbers, root, queue_path, gh=gh_json, tree=None):
+    if not numbers:
+        return {}
+    snapshot = tree if tree is not None else agw.tree()
+    return skip_reasons(numbers, repo, root, queue_path, pr_reasons(repo, numbers, gh), session_numbers(repo, snapshot))
+
+
 def config_path():
     return Path(os.environ.get('AGWORKBENCH_CONFIG', Path.home() / '.agworkbench.json')).resolve()
 
@@ -260,9 +354,20 @@ def pin_conductor(store, owner):
             data['owner']['pinned'] = True
 
 
+def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label):
+    """What this start or append changes in a queue's saved settings (#28): {key: [old, new]}."""
+    current = data or {}
+    wanted = {'parallel': parallel, 'yes': True if yes else None, 'implementer': implementer,
+              'autoMerge': auto_merge, 'autonomous': autonomous}
+    if watch:
+        wanted.update(watch=True, label=label)
+    return {key: [current.get(key), value] for key, value in wanted.items()
+            if value is not None and data is not None and current.get(key) != value}
+
+
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
-                implementer=None, auto_merge=None, autonomous=None):
-    repo, numbers, label = resolve_spec(spec, repo)
+                implementer=None, auto_merge=None, autonomous=None, gh=gh_json, tree=None):
+    repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
     if watch and not label:
         raise UsageError('-Watch requires a label spec')
     root = Path(root or os.environ.get('AGWORKBENCH_QUEUE_ROOT', Path.home() / '.agworkbench/queues')).resolve()
@@ -271,12 +376,28 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         raise UsageError('-Parallel must be between 1 and 8')
     if implementer not in (None, 'codex', 'claude'):
         raise UsageError('-Implementer must be codex or claude')
+    existing = store._load() if store.path.exists() else None
+    validate_append(existing, watch, label)
+    known = {m['number']: m['state'] for m in existing['members']} if existing else {}
+    skipped = {n: f'queued ({known[n]})' for n in numbers if n in known}
+    fresh = [n for n in numbers if n not in known]
+    if label:
+        # Only a label spec is filtered: an explicit list is what the human named. Before any write.
+        skipped.update(in_hand(repo, fresh, checkout_root((existing or {}).get('config') or config_path()),
+                               store.path, gh, tree))
+    numbers = [n for n in numbers if n not in skipped]
+    changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label)
+    live = store.running() if store.worker_lock.exists() else False
     if dry_run:
-        data = store._load() if store.path.exists() else None
-        validate_append(data, watch, label)
-        live = store.running() if store.worker_lock.exists() else False
-        print(json.dumps(dict(repo=repo, members=numbers, running=live, owner=data.get('owner') if data else None)))
+        mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
+        print(json.dumps(dict(repo=repo, members=numbers, running=live, mode=mode,
+                              skipped=[dict(number=n, reason=r) for n, r in sorted(skipped.items())],
+                              settings=changes, owner=existing.get('owner') if existing else None)))
         return 0
+    for n, reason in sorted(skipped.items()):
+        print(f'#{n} skipped: {reason}')
+    for key, (old, new) in changes.items():
+        print(f'settings: {key} {json.dumps(old)} -> {json.dumps(new)} (for every member launched from now on)')
     token = None
     with Lock(store.state_lock):
         if store.path.exists():
@@ -287,6 +408,9 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
             data = dict(version=1, repo=repo, parallel=parallel or 1, watch=watch, label=label if watch else None,
                         yes=yes, config=str(config_path()), members=[], owner=None)
         validate_append(data, watch, label)
+        if watch and not data['watch']:
+            # -Watch onto a queue started from a list turns watching on (#28).
+            data.update(watch=True, label=label)
         if parallel is not None:
             data['parallel'] = parallel
         if yes:
@@ -335,7 +459,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
 
 
 def validate_append(data, watch, label):
-    if data and watch and (not data['watch'] or data['label'] != label):
+    # One watched label per queue. An unwatched queue may start watching (#28); a watched one keeps its label.
+    if data and watch and data['watch'] and data['label'] != label:
         raise UsageError('one watched label per queue; cannot change saved watch semantics')
 
 
@@ -452,6 +577,7 @@ class Worker:
         self.errors = {}
         self.alerts = []
         self.last_display = {}
+        self.last_skips = {}          # the last rescan's skip reasons, kept in memory only (#28)
 
     def error(self, key, err):
         count = self.errors.get(key, 0) + 1
@@ -545,11 +671,19 @@ class Worker:
             self.next_scan = self.clock() + 300
             try:
                 _, numbers, _ = resolve_spec('label:' + data['label'], data['repo'], self.gh)
+                known = {m['number'] for m in data['members']}
+                fresh = [n for n in numbers if n not in known]
+                skipped = in_hand(data['repo'], fresh, checkout_root(data['config']), self.store.path, self.gh)
+                for n, reason in sorted(skipped.items()):
+                    if self.last_skips.get(n) != reason:
+                        print(f'#{n} skipped: {reason}', flush=True)
+                self.last_skips = skipped
                 with self.store.transaction() as current:
                     known = {m['number'] for m in current['members']}
-                    current['members'].extend(new_member(n, data['repo'], checkout_root(data['config'])) for n in numbers if n not in known)
+                    current['members'].extend(new_member(n, data['repo'], checkout_root(data['config']))
+                                              for n in fresh if n not in known and n not in skipped)
                 self.errors.pop('label scan', None)
-            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as err:
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError, QueueError, agw.CtlError) as err:
                 self.error('label scan', err)
 
     def tick(self):
