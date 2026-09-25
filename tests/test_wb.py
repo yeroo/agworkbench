@@ -690,6 +690,18 @@ class Handover(unittest.TestCase):
         self.assertIn('open request: 20260925T080000Z-claude-0001 "FIX r1" (no reply yet)', text)
         self.assertIn('   M lib/wb.py', text)
 
+    def test_a_git_failure_is_an_error_not_a_clean_tree(self):
+        # r17 i1
+        self.mail('codex', '20260925T080000Z-claude-0001', 'claude', 'FIX r1')
+        failed = subprocess.CompletedProcess(['git', '-C', 'x', 'status', '--short'], 128, '', 'fatal: not a git repository')
+        ok = subprocess.CompletedProcess(['git', '-C', 'x', 'branch', '--show-current'], 0, 'issue-24-x\n', '')
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(wb.subprocess, 'run', side_effect=[ok, failed]), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err), patch.object(sys, 'argv', ['wb.py', 'handover']):
+            self.assertEqual(1, wb.main())
+        self.assertNotIn('(clean)', out.getvalue())
+        self.assertIn('git status --short failed: fatal: not a git repository', err.getvalue())
+
 
 class AutoMergeProse(unittest.TestCase):
     """#23: the planner's conditions and the implementer's exclusion are in the prose."""
@@ -735,9 +747,10 @@ class UsageLimitProse(unittest.TestCase):
         text = self.text('claude/commands/start-github-issue.md')
         section = text.split("## Usage limits")[1].split('## Adopted session')[0]
         for needle in ['usage limit: <box> (<tool>) <kind>', 'failover=true', "the agent's own limit message",
-                       'github-workbench <owner/repo#N> -Failover', 'timeout: 600000', 'wb.py" handover',
+                       'github-workbench.cmd <owner/repo#N> -Failover', 'timeout: 600000', '(exit 3, `Failover incomplete',
+                       'Exit 2 means nothing was stopped', 'wb.py" handover',
                        'subject `HANDOVER`', 'uncommitted changes are the previous implementer',
-                       'refused** (exit 2)', 'status blocked --sound', '-Implementer <tool>',
+                       'refused** (exit 2, ', 'status blocked --sound', '-Implementer <tool>',
                        'never answer it', 'failover=false', 'only a record', 'never types into the limited agent']:
             self.assertIn(needle, section)
 

@@ -58,10 +58,11 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
   1. Check the frame in the mail. The matched line must be the agent's own limit message at the end
      of its pane, not text it printed from a file, a diff or a test.
   2. Fail over. The command may take up to two minutes while it checks that the pane is idle, so
-     run it through Bash with `timeout: 600000`:
+     run it through Bash with `timeout: 600000`. Your shell is Git Bash, which only finds the
+     launcher by its full name, `github-workbench.cmd`:
 
      ```bash
-     github-workbench <owner/repo#N> -Failover
+     github-workbench.cmd <owner/repo#N> -Failover
      ```
 
      If the agent already exited, it switches straight away. If it is still running, the launcher
@@ -76,10 +77,13 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
      - "run git status: uncommitted changes are the previous implementer's work - review, finish
        and commit them".
   4. Tell the human in one line which tool was stopped and which took over.
-- **`-Failover` refused** (exit 2): tell the human the refusal line and set `wb.py status blocked
-  --sound`. A refusal changed nothing. A tool with a recorded limit is never switched back to
-  automatically: the human clears it with `github-workbench <issue> -Implementer <tool>` once its
-  limit has reset.
+- **`-Failover` refused** (exit 2, `Implementer switch refused: failover refused: ...`): tell the
+  human the refusal line and set `wb.py status blocked --sound`. Exit 2 means nothing was stopped
+  and nothing changed. A tool with a recorded limit is never switched back to automatically: the
+  human clears it with `github-workbench <issue> -Implementer <tool>` once its limit has reset.
+- **`-Failover` stopped the agent but did not switch** (exit 3, `Failover incomplete: ...`): the
+  limited agent may be gone, and its limit is recorded. Tell the human the line and set blocked. They
+  relaunch with `github-workbench <issue> -Implementer <other tool>` once the pane is a clean shell.
 - **`warning`** (Codex's "Approaching rate limits" chooser): never answer it. Tell the human in one
   line and set blocked.
 - **`failover=false`**: tell the human and set blocked.

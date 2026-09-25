@@ -39,6 +39,10 @@ EXPECTED = {
     "claude-quoted": ("claude", None, False),
     "claude-scrolled": ("claude", None, False),
     "codex-text-above-fresh-claude": ("claude", None, False),
+    # r17 M1: the agent's own reply glyph never carries a limit
+    "claude-reply-starts-with-phrase": ("claude", None, False),
+    "claude-reply-second-line-phrase": ("claude", None, False),
+    "codex-message-starts-with-phrase": ("codex", None, False),
 }
 
 

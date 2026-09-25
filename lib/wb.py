@@ -182,10 +182,16 @@ def cmd_handover(args: argparse.Namespace) -> int:
     root = checkout()
     hub.reload_paths()
     pending, recent = open_request()
-    branch = subprocess.run(["git", "-C", str(root), "branch", "--show-current"],
-                            capture_output=True, text=True).stdout.strip()
-    status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True, text=True).stdout
-    print(f"branch: {branch or '?'}")
+    runs = [subprocess.run(["git", "-C", str(root), *argv], capture_output=True, text=True)
+            for argv in (["branch", "--show-current"], ["status", "--short"])]
+    for done in runs:
+        if done.returncode != 0:
+            # A HANDOVER built on a failed git call would call a dirty tree clean.
+            print(f"wb: handover: git {' '.join(done.args[3:])} failed: {(done.stderr or done.stdout).strip()}",
+                  file=sys.stderr)
+            return 1
+    branch, status = runs[0].stdout.strip(), runs[1].stdout
+    print(f"branch: {branch or '(detached HEAD)'}")
     if pending:
         print(f"open request: {pending.get('id')} \"{pending.get('subject', '')}\" (no reply yet)")
     else:

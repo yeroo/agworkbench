@@ -1993,6 +1993,16 @@ class UsageLimits(DeliveryFixture):
         self.send.assert_not_called()
         self.assertEqual('usage limit', self.r.holds[('codex', 'm1')].reason)
 
+    def test_the_final_notices_are_not_held_for_a_limit_once_the_pr_is_finished(self):
+        # r17 m2: limit checks stop during the drain, so a limit must not hold its mail either.
+        self.check(times=2)
+        self.r.draining = True
+        self.tick(0)
+        self.send.assert_called_once()
+        self.r.state['pr'] = {'number': 7, 'state': 'MERGED'}
+        self.r.retire(7)
+        self.assertNotIn('limits', self.r.state)
+
     def test_a_warning_is_announced_but_mail_is_not_held_for_it(self):
         self.check('codex-warning-chooser', times=2)
         self.assertEqual('usage limit: codex (codex) warning', self.mails()[0]['subject'])

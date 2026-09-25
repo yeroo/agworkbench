@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Two jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Three jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -16,8 +16,15 @@ Two jobs, one loop, one process per issue, running in its own visible agwinterm 
    after the saved server-time watch boundary. Older PRs first seen finished are ignored;
    observation survives restarts, and a fully drained PR is retired so a later run can continue.
 
+3. **Usage limits (#24).** Every `--limit-interval` seconds it reads both agent panes and asks
+   `limits.classify` whether the agent there has hit its usage limit. An episode seen on two
+   consecutive reads is mailed to the planner once (sender `relay`), with a blocked status and a
+   notification; mail to a limited implementer is held until the planner fails it over. Checks
+   stop once the PR is finished.
+
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
-relay itself polls the mailbox directory and the GitHub API, which cannot push to it.
+relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
+none of which can push to it.
 
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
@@ -279,6 +286,8 @@ class Relay:
         # Limit rows already on screen when this relay started (e.g. the old tool's message above
         # the agent that replaced it): ignored until they leave the pane's tail.
         self.limit_baseline: dict[str, set[str]] = {}
+        # True once the PR is finished: limit checks stop, so no limit may hold the final notices.
+        self.draining = False
         self.dry_run = dry_run
         self.state_file = hub_dir / "state" / "relay.json"
         self.stop_file = hub_dir / "state" / "relay.stop"
@@ -478,7 +487,7 @@ class Relay:
             step = ("The implementer has hit its usage limit"
                     + (" and exited to a shell" if episode.get('exited') else "")
                     + ". Follow start-github-issue.md, Usage limits: check the frame below, then fail "
-                    "over with `github-workbench <issue> -Failover` (Bash timeout 600000).")
+                    "over with `github-workbench.cmd <issue> -Failover` (Bash timeout 600000).")
         body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
                            f"First seen: {episode['firstSeen']}", "", "Next step: " + step, "",
                            "Last rows of the pane:", "", "```", *rows, "```"])
@@ -519,7 +528,8 @@ class Relay:
                                        self.holds[(peer.box, mid)].clear_pending):
                     continue
                 episode = self.state.get('limits', {}).get(peer.box)
-                if episode and episode.get('kind') == 'limited' and episode.get('announced'):
+                if (episode and episode.get('kind') == 'limited' and episode.get('announced')
+                        and not self.draining):
                     self.hold(peer, mid, 'usage limit')
                     continue
                 try:
@@ -566,6 +576,7 @@ class Relay:
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
+        self.state.pop('limits', None)      # the loop is over; nobody fails over any more
         self.log(f'retired finished PR #{number}; a restart can watch the next PR')
         if not self.dry_run:
             self._save()
@@ -783,6 +794,7 @@ class Relay:
         # Replayed mail might already be read. Still finish this saved watch without polling
         # GitHub again; the drain will immediately retire it if no delivery or reset remains.
         drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT if saved_terminal else None
+        self.draining = drain_deadline is not None
         if drain_deadline is not None:
             if self.dry_run:
                 self.log('[dry-run] saved PR is finished; no final mail filed')
@@ -825,6 +837,7 @@ class Relay:
                         self.log('[dry-run] PR is finished; no final mail filed')
                         return 0
                     drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT
+                    self.draining = True
                     self.log('PR is finished; draining final notices before exit')
                     if not self.state.get('outbox'):
                         continue

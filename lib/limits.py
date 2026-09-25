@@ -16,9 +16,11 @@ greps, test output and fixture dumps - so a phrase counts only by POSITION, neve
 - Either tool exited: the last row is a shell prompt and the phrase starts one of the rows just
   above it, in the output since the previous prompt.
 
-A row starts with the phrase after optional indentation and at most one status glyph. A quote,
-backtick, `+`, `-`, `>`, `#`, `|`, or a `path:` prefix in front of it (diffs, code, greps) never
-counts.
+A limit row starts with the phrase right after the ONE glyph that tool draws its own notices
+with: `⎿` for Claude (a result row, whose parent is checked), `■` for a Codex error cell. An
+agent's own reply (`●` for Claude, `•` for Codex) that happens to begin with the phrase never
+counts, nor does any other prefix (quotes, diffs, code, greps). Codex's warning rows carry `⚠`
+or no glyph, and count only with the chooser on screen.
 
   python lib/limits.py classify --tool codex < frame.txt     # prints JSON
 """
@@ -35,9 +37,9 @@ from dataclasses import dataclass
 WINDOW = 20      # rows considered: the last 20 non-empty rows of the frame
 
 APOSTROPHES = re.compile("[\u2018\u2019\u02bc]")
-# One leading status glyph: any single non-alphanumeric, non-space character except the ones that
-# mark quoted or diffed text, followed by whitespace.
-GLYPH = r"(?:[^\w\s\"'`+\->#|:]\s+)?"
+# The glyph each tool draws its own limit notice with (r17: an agent's reply glyph never counts).
+LIMIT_GLYPH = {"claude": r"⎿\s+", "codex": r"■\s+"}
+WARNING_GLYPH = r"(?:⚠\s+)?"
 FORBIDDEN_TOOL_OUTPUT = ("└", "│", "├")
 # Claude Code starts an item (a message, a tool call, a tool result, a notice) with one of these;
 # any other row is a continuation of the item above it.
@@ -85,9 +87,9 @@ def _normal(row: str) -> str:
     return APOSTROPHES.sub("'", row)
 
 
-def _starts_with(row: str, patterns: list[str]) -> bool:
+def _starts_with(row: str, patterns: list[str], glyph: str) -> bool:
     text = _normal(row).strip()
-    return any(re.match(GLYPH + pattern, text, re.IGNORECASE) for pattern in patterns)
+    return any(re.match(glyph + pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
 def _rows(text: str) -> list[str]:
@@ -138,7 +140,7 @@ def _exited(rows: list[str], tool: str) -> Limit | None:
             break
         output.insert(0, row)
     for row in reversed(output[-8:]):
-        if _starts_with(row, LIMITED[tool]) and not row.strip().startswith(FORBIDDEN_TOOL_OUTPUT):
+        if _starts_with(row, LIMITED[tool], LIMIT_GLYPH[tool]):
             return Limit("limited", row.strip(), exited=True)
     return None
 
@@ -161,7 +163,7 @@ def _claude(rows: list[str]) -> Limit | None:
         return None
     item = starts[-1]
     row = block[item]
-    if not _starts_with(row, LIMITED["claude"]):
+    if not _starts_with(row, LIMITED["claude"], LIMIT_GLYPH["claude"]):
         return None
     if row.strip().startswith("⎿"):
         # Its parent is the nearest item above that is not itself a result: a user prompt or a
@@ -184,7 +186,7 @@ def _codex(rows: list[str]) -> Limit | None:
     for row in reversed(_last_block(above)):
         if not CODEX_CELL_RE.match(row) or row.strip().startswith(FORBIDDEN_TOOL_OUTPUT):
             continue               # tool output and other rows inside a cell
-        if _starts_with(row, LIMITED["codex"]):
+        if _starts_with(row, LIMITED["codex"], LIMIT_GLYPH["codex"]):
             return Limit("limited", row.strip())
     return None
 
@@ -193,7 +195,7 @@ def _codex_warning(rows: list[str]) -> Limit | None:
     if not any(CHOOSER_ROW.match(row) for row in rows):
         return None
     for row in rows:
-        if _starts_with(row, WARNING_CODEX):
+        if _starts_with(row, WARNING_CODEX, WARNING_GLYPH):
             return Limit("warning", row.strip())
     return None
 

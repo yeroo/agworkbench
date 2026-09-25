@@ -1,0 +1,9 @@
+> is r17 done?
+● Done. The launcher now checks the frame and
+  Usage limit reached is matched by position.
+
+────────────────────────────────────────────────────────────
+> 
+────────────────────────────────────────────────────────────
+  [Opus 5.5] C:\Users\boris\source\workbench\repo-issue-7 on issue-7-fix
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

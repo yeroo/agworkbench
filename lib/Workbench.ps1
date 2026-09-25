@@ -12,6 +12,12 @@ class ImplementerConflict : System.Exception {
     ImplementerConflict([string] $Message) : base($Message) {}
 }
 
+class FailoverIncomplete : System.Exception {
+    # A failover that got past its point of no return (the limit recorded, or the agent stopped)
+    # but could not switch. Unlike a refusal, it did change something: exit 3.
+    FailoverIncomplete([string] $Message) : base($Message) {}
+}
+
 function Write-Step([string] $Text) { Write-LaunchLog step $Text; Write-Host "  $Text" -ForegroundColor DarkGray }
 function Write-Done([string] $Text) { Write-LaunchLog done $Text; Write-Host "  $Text" -ForegroundColor Green }
 
@@ -71,6 +77,11 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
         if ($failure.Exception -is [ImplementerConflict]) {
             $script:Launch.ExitCode = 2
             Write-Host "Implementer switch refused: $($failure.Exception.Message)" -ForegroundColor Yellow
+            return $false
+        }
+        if ($failure.Exception -is [FailoverIncomplete]) {
+            $script:Launch.ExitCode = 3
+            Write-Host "Failover incomplete: $($failure.Exception.Message)" -ForegroundColor Red
             return $false
         }
         $script:Launch.ExitCode = 1
@@ -823,7 +834,15 @@ function Set-ImplementerLimit([string] $Checkout, [string] $Tool, $Entry) {
 
 function Get-PaneLimit([string] $Text, [string] $Tool) {
     # The relay's classifier, so the launcher and the relay can never disagree about a frame.
-    $json = $Text | & python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
+    # Windows PowerShell pipes to native programs in $OutputEncoding, US-ASCII by default: every
+    # glyph and typographic apostrophe would reach limits.py as '?'. Pipe UTF-8 (no BOM) for this
+    # one call, as Invoke-Ctl does for the console. Windows PowerShell reads the GLOBAL variable
+    # for native pipes (a function-local assignment is ignored there), so set and restore that.
+    $previous = $global:OutputEncoding
+    try {
+        $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false
+        $json = $Text | & python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
+    } finally { $global:OutputEncoding = $previous }
     if ($LASTEXITCODE -ne 0) { throw "limits.py could not classify the $Tool pane" }
     return ($json | ConvertFrom-Json)
 }
@@ -889,8 +908,9 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
 
 function Invoke-Failover {
     <# Stops a limited implementer (only when it is provably idle at its limit) or accepts an exited
-       one, records the limit, clears the pane, and returns the tool to switch to. Every refusal is
-       an [ImplementerConflict] (exit 2) and happens before anything is stopped or written. #>
+       one, records the limit, clears the pane, and returns the tool to switch to. A refusal is an
+       [ImplementerConflict] (exit 2) and happens before anything is stopped or written. A failure
+       after that point is a [FailoverIncomplete] (exit 3): the human relaunches with -Implementer. #>
     param([string] $Checkout, $Config, $Tree)
     if (-not $Config.failover) { throw [ImplementerConflict]::new('failover refused: "failover" is false in ~/.agworkbench.json') }
     $saved = Get-SavedImplementerTool $Checkout
@@ -925,21 +945,33 @@ function Invoke-Failover {
             $list = ($roots | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '
             throw [ImplementerConflict]::new("failover refused: expected exactly one $saved process for this checkout, found $($roots.Count)$(if ($list) { ": $list" }); nothing was stopped")
         }
-        Write-Step "failover: stopping the limited $saved (process $($roots[0].ProcessId)) - '$($seen.line)'"
-        Stop-AgentTree ([int]$roots[0].ProcessId)
-        if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
-            throw [ImplementerConflict]::new("failover refused: the $saved pane did not return to a shell prompt within $($script:FailoverTiming.ShellWait)s after the stop")
+        $rootId = [int]$roots[0].ProcessId
+        Write-Step "failover: stopping the limited $saved (process $rootId) - '$($seen.line)'"
+        Stop-AgentTree $rootId
+        $incomplete = "failover stopped $saved but could not switch"
+        $deadline = (Get-Date).AddSeconds($script:FailoverTiming.ShellWait)
+        while (@(Get-AgentProcesses | Where-Object { [int]$_.ProcessId -eq $rootId }).Count) {
+            if ((Get-Date) -ge $deadline) { throw [FailoverIncomplete]::new("${incomplete}: process $rootId is still running $($script:FailoverTiming.ShellWait)s after the stop") }
+            Start-Sleep -Milliseconds 200
+        }
+        # A force-stopped inline TUI runs no cleanup: its last frame (rules, footer) stays above the
+        # new prompt, which Test-ShellReady rightly refuses. Wait for the plain prompt row first;
+        # Clear-Host below then has to produce a clean shell.
+        if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait)) {
+            throw [FailoverIncomplete]::new("${incomplete}: the pane showed no shell prompt within $($script:FailoverTiming.ShellWait)s")
         }
         if (Test-Path -LiteralPath $lock) {
-            throw [ImplementerConflict]::new("failover refused: '$lock' appeared while $saved was being stopped. It was not deleted: check the repository, then run github-workbench <issue> -Implementer $target")
+            throw [FailoverIncomplete]::new("${incomplete}: '$lock' appeared while it was being stopped. It was not deleted: check the repository, then run github-workbench <issue> -Implementer $target")
         }
-    }
+    } else { $incomplete = 'failover could not switch' }
     $line = $seen.line
     if (-not $line) { $line = '(the pane was already at a shell prompt)' }
     Set-ImplementerLimit $Checkout $saved ([pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); line = $line })
     # The old tool's limit text must not greet the new agent: its relay would read it as its own.
     Invoke-Ctl session type "Clear-Host`n" --target $pane | Out-Null
-    $null = Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted
+    if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
+        throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> -Implementer $target once it is")
+    }
     Write-Step "failover: $saved -> $target"
     return $target
 }
@@ -1724,6 +1756,7 @@ function Invoke-LauncherBody {
     }
     Invoke-WithCheckoutLock $co.Dir {
         # Decided before any pin, identity or registry change, so a refused switch changes nothing.
+        # (A -Failover that reaches its stop has changed something; its failures exit 3, not 2.)
         Set-LaunchStage implementer
         if ($Failover) {
             Set-LaunchStage failover

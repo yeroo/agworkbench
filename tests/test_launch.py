@@ -2662,17 +2662,23 @@ class FailoverLaunch(LauncherFixtures):
         return table + list(extra)
 
     def failover(self, processes=None, stop_to_shell=True, timing="Stable=90; Confirm=0; Sample=0.3; Step=0.1; ShellWait=2",
-                 lock_after_stop=False, config=None):
+                 lock_after_stop=False, config=None, after_stop='PS C:\\checkout> ', survives=False):
         table = json.dumps(self.processes() if processes is None else processes)
         shell_write = ''
         if stop_to_shell:
+            (self.temp / 'after-stop.txt').write_text(after_stop, encoding='utf-8')
             shell_write = ("$s = Get-Content -Raw " + ps_quote(self.scenario_path) + " | ConvertFrom-Json; "
-                           "$s.text.'" + RIGHT_ID + "' = 'PS C:\\checkout> '; "
+                           "$s.text.'" + RIGHT_ID + "' = [IO.File]::ReadAllText(" + ps_quote(self.temp / 'after-stop.txt') +
+                           ", [Text.Encoding]::UTF8); "
                            "$s | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 " + ps_quote(self.scenario_path) + "; ")
         lock = ''
         if lock_after_stop:
             lock = "New-Item -ItemType File -Force " + ps_quote(self.checkout / '.git/index.lock') + " | Out-Null; "
-        overrides = ("function Get-AgentProcesses { " + ps_quote(table) + " | ConvertFrom-Json }; "
+        # A stopped process leaves the table, unless the test says it survives the stop.
+        gone = '' if survives else (" | Where-Object { $stopped = @(); if (Test-Path " + ps_quote(self.stopped) +
+                                    ") { $stopped = @(Get-Content " + ps_quote(self.stopped) + ") }; "
+                                    "$stopped -notcontains [string]$_.ProcessId }")
+        overrides = ("function Get-AgentProcesses { " + ps_quote(table) + " | ConvertFrom-Json" + gone + " }; "
                      "function Stop-AgentTree([int] $ProcessId) { Add-Content " + ps_quote(self.stopped) +
                      " $ProcessId; " + shell_write + lock + "}; "
                      "$script:FailoverTiming = @{ " + timing + " }; ")
@@ -2776,7 +2782,9 @@ class FailoverLaunch(LauncherFixtures):
         (self.checkout / '.git').mkdir(exist_ok=True)
         result = self.failover(lock_after_stop=True)
         self.assertEqual(1, result.returncode, result.stdout)
-        self.assertIn('appeared while codex was being stopped', result.stdout)
+        self.assertIn('EXIT=3', result.stdout)
+        self.assertIn('Failover incomplete: failover stopped codex but could not switch', result.stdout)
+        self.assertIn('appeared while it was being stopped', result.stdout)
         self.assertTrue((self.checkout / '.git/index.lock').exists())
         self.assertEqual('codex', self.state('implementer.json')['tool'])
 
@@ -2796,8 +2804,26 @@ class FailoverLaunch(LauncherFixtures):
         self.right(self.frame('codex-limited-live'))
         result = self.failover(stop_to_shell=False)
         self.assertEqual(1, result.returncode, result.stdout)
-        self.assertIn('did not return to a shell prompt', result.stdout)
+        self.assertIn('EXIT=3', result.stdout)
+        self.assertIn('failover stopped codex but could not switch: the pane showed no shell prompt', result.stdout)
         self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_a_process_that_survives_the_stop_is_reported(self):
+        # r17 M2 (1): the root must be gone before anything else happens.
+        self.right(self.frame('codex-limited-live'))
+        result = self.failover(survives=True)
+        self.assertIn('EXIT=3', result.stdout)
+        self.assertIn(f'process {self.CODEX_PID} is still running', result.stdout)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_a_force_stopped_frame_left_above_the_prompt_still_switches(self):
+        # r17 M2: taskkill /F runs no cleanup, so the dead TUI's rules and footer stay on screen
+        # above the new prompt; Test-ShellReady refuses that until Clear-Host.
+        text = self.frame('codex-limited-live')
+        self.right(text)
+        leftover = text.rstrip('\n') + '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nPS C:\\checkout> '
+        result = self.failover(after_stop=leftover)
+        self.assert_switched_to_claude(result)
 
     def test_failover_off_is_refused(self):
         self.right(self.frame('codex-limited-exited'))
@@ -2852,6 +2878,19 @@ class FailoverLaunch(LauncherFixtures):
 
 class AgentRoots(LauncherFixtures):
     """#24: which process is the limited agent - the binary itself, found by this checkout's marks."""
+
+    def test_the_pane_frame_reaches_the_classifier_as_utf8_in_both_shells(self):
+        # r17 M3: Windows PowerShell pipes to native programs as US-ASCII by default.
+        frame = LIMIT_FRAMES / 'claude-limited-idle.txt'
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                command = (". ./lib/Workbench.ps1; $before = $OutputEncoding.WebName; "
+                           "$t = [IO.File]::ReadAllText(" + ps_quote(frame) + ", [Text.Encoding]::UTF8); "
+                           "$r = Get-PaneLimit $t claude; \"$($r.kind)|$($before -eq $OutputEncoding.WebName)\"")
+                result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                                        env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=30)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual('limited|True', result.stdout.strip())
 
     def test_failover_config_is_strictly_boolean(self):
         for value, ok in ((False, True), (True, True), ('false', False), (0, False)):
