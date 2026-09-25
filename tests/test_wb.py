@@ -1132,7 +1132,7 @@ class AutoMergeProse(unittest.TestCase):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
         phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
         for needle in ['wb.py" settings', 'autoMerge=true', 'wb.py" merge-check --pr <N> --head <full sha>',
-                       '--match-head-commit <full sha>', 'None is deferred', 'three-round cap',
+                       '--match-head-commit <full sha>', 'None is deferred', 'five-round cap',
                        'whole suite passed on the PR head', 'If any condition fails, do not merge',
                        'UNKNOWN', 'go ahead']:
             self.assertIn(needle, ' '.join(phase6.split()) if ' ' in needle else phase6)

@@ -51,7 +51,7 @@ all stop you exactly as they do without autonomy.
   Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`.
   It dedupes on the exact title, labels the issue `follow-up` (`follow-up-nested` when this issue is
   itself a follow-up), and adds the planner marker. merge-check refuses while any item is unfiled.
-- **What may be deferred.** After at most three rounds, a remaining Minor or Immaterial finding may
+- **What may be deferred.** After at most five rounds, a remaining Minor or Immaterial finding may
   be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
   stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
   it honestly (with `--disputed` when it ended disputed) and the human decides.
@@ -277,7 +277,7 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    (with a reason). Silence on a finding is not an answer. Check the fixes; argue the disputes.
 
 Repeat until a round is clean, or what remains is minor and both of you agree to defer it. At most
-three revmux rounds; after that, what is left goes to the human with both positions. With full
+five revmux rounds; after that, what is left goes to the human with both positions. With full
 autonomy, a deferred finding is always a recorded and filed follow-up (see "Full autonomy").
 In queue mode, report `wb.py loop-state blocked --reason "review rounds exhausted: <remaining issue>"`
 before ending the turn to wait for the human.
@@ -304,7 +304,7 @@ watches it from then on.
 on, you merge only when **all** of these hold:
 
 1. **The review is clean.** The last revmux round's findings are all fixed and verified, or disputed
-   with evidence. None is deferred, and it is within the three-round cap. With full autonomy, a
+   with evidence. None is deferred, and it is within the five-round cap. With full autonomy, a
    remaining Minor or Immaterial finding may also be deferred **with a filed follow-up issue**; a
    Major or blocker never may, disputed or not. A round that ended with open findings goes to the
    human instead.
