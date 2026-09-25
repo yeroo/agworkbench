@@ -287,9 +287,12 @@ That check is read-only. It requires:
 - there is no unread mail from you (`human`) or from GitHub;
 - the relay has seen the PR open;
 - the PR head is the tested commit;
-- **no hold**: a comment, review or line comment containing `hold`, `wait`, `do not merge`,
-  `don't merge` or `dont merge` (whole words, any case) holds the PR at any age, until a *later*
-  comment says `go ahead`, `resume` or `unhold`.
+- **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,
+  comment, review or line comment containing `hold`, `wait`, `waiting`, `wip`, or `do not merge` in
+  any spelling (`don't`, `dont`, `do-not-merge`, typographic apostrophes, markdown emphasis, any
+  case) holds the PR at any age. So does a negated lift like "don't go ahead". A hold is lifted only
+  by **its own author**, later, with a comment that is nothing but `go ahead`, `resume` or `unhold`
+  (optionally `@someone` first, `please` or `!` after). Bots never lift a hold.
 
 Claude posts with your GitHub account, so it ends everything it writes on GitHub with
 `<!-- agworkbench:planner -->`. merge-check treats every body without that marker as yours. Hold
@@ -300,7 +303,8 @@ comment on the PR then states each checked condition.
 If any condition fails, the reasons go on the PR and in chat, and the PR waits for you as usual.
 The choice is saved per checkout like the implementer: a rerun without the switch keeps it,
 `-NoAutoMerge` turns it off (even while the agents are running), and a queue saves either switch and
-passes it to its members. The conductor never merges; a member's planner does, and the queue then
+passes it to the members it launches from then on. To stop a member that is already running, rerun
+`github-workbench <n> -NoAutoMerge` for its checkout. The conductor never merges; a member's planner does, and the queue then
 records the member as merged.
 
 The per-issue clone gets a Codex trust entry in `~/.codex/config.toml` — the same entry Codex

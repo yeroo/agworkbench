@@ -193,7 +193,7 @@ class Store:
                 raise ValueError('invalid settings')
             if data.get('implementer') not in (None, 'codex', 'claude'):
                 raise ValueError('invalid implementer')
-            if data.get('autoMerge') not in (None, True, False):
+            if 'autoMerge' in data and data['autoMerge'] is not None and type(data['autoMerge']) is not bool:
                 raise ValueError('invalid autoMerge')
             if (not isinstance(data['config'], str) or not Path(data['config']).is_absolute() or
                     type(data['yes']) is not bool or not isinstance(data['members'], list) or

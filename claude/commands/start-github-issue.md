@@ -229,17 +229,27 @@ on, you merge only when **all** of these hold:
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count.
 3. **merge-check says `ok`.** It checks, read-only: the PR is OPEN, MERGEABLE and CLEAN; no review
-   requests changes; no unmarked comment, review or line comment holds it (`hold`, `wait`, `do not
-   merge`, `don't merge`, lifted only by a later unmarked `go ahead`, `resume` or `unhold`); you
-   have no unread mail from `human` or `github`; the relay has seen the PR open; and the PR head is
-   the tested SHA.
+   requests changes; no hold label, title, description, comment, review or line comment that you
+   did not mark (`hold`, `wait`, `waiting`, `wip`, `do not merge` and their spellings; a hold is
+   lifted only by its own author, later, with a comment that is just `go ahead`, `resume` or
+   `unhold`); you have no unread mail from `human` or `github`; the relay has seen the PR open; and
+   the PR head is the tested SHA.
+
+   **Wait for the relay first.** After opening the PR, keep the background waiter and end your turn
+   until the relay's `PR #N is open` mail from `github` arrives. Read it, and any other unread mail,
+   and only then run:
 
    ```bash
    python "$AGWORKBENCH/lib/wb.py" merge-check --pr <N> --head <full sha>
    ```
 
-   If the only failure is a merge state of `UNKNOWN` ("retry in ~30s"), run it once more after about
-   30 seconds, then treat the result as final.
+   **Retryable failures:** `relay:` (wait for the relay's mail), `mail:` (read and handle the mail),
+   and a merge state of `UNKNOWN` ("retry in ~30s", run once more after about 30 seconds). Handle
+   them, then check again. Every other failure is final for this head.
+
+   **Check again after any event that could change the verdict**, such as the hold's author lifting
+   it, or a fix round pushing a new head with the whole suite re-run on it. Run the auto-merge check
+   for the new head.
 
 On `ok`, merge exactly that commit, then say so in the PR and in chat:
 

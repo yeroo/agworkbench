@@ -77,12 +77,7 @@ def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
 def revmux_profile(root: Path) -> str:
     """The profile the launcher resolved for this checkout (#20): claude-only when Claude is the
     implementer and Codex may be out of quota, comprehensive otherwise, or the human's revmuxProfile."""
-    try:
-        saved = json.loads((root / ".workbench" / "state" / "implementer.json").read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return "comprehensive"
-    profile = saved.get("revmuxProfile") if isinstance(saved, dict) else None
-    return profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]+", profile) else "comprehensive"
+    return checkout_settings(root)["revmuxProfile"]
 
 
 def cmd_revmux(args: argparse.Namespace) -> int:
@@ -122,8 +117,8 @@ def cmd_loop_state(args: argparse.Namespace) -> int:
 
 
 def checkout_settings(root: Path) -> dict:
-    """The checkout's settings record (state/implementer.json, #20 and #23). Missing keys read as
-    their defaults: a record written before #23 has no autoMerge, and that is off."""
+    """The checkout's settings record (state/implementer.json, #20 and #23), parsed once. Missing or
+    invalid keys read as their defaults: a record written before #23 has no autoMerge, and that is off."""
     try:
         saved = json.loads((root / ".workbench" / "state" / "implementer.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
@@ -131,7 +126,10 @@ def checkout_settings(root: Path) -> dict:
     if not isinstance(saved, dict):
         saved = {}
     tool = saved.get("tool") if saved.get("tool") in ("codex", "claude") else "codex"
-    return {"implementer": tool, "revmuxProfile": revmux_profile(root), "autoMerge": saved.get("autoMerge") is True}
+    profile = saved.get("revmuxProfile")
+    if not (isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9._-]+", profile)):
+        profile = "comprehensive"
+    return {"implementer": tool, "revmuxProfile": profile, "autoMerge": saved.get("autoMerge") is True}
 
 
 def cmd_settings(args: argparse.Namespace) -> int:
@@ -142,13 +140,27 @@ def cmd_settings(args: argparse.Namespace) -> int:
 
 
 # --- merge-check (#23) -----------------------------------------------------------------------
-# Read-only. Every condition is a pure function over what one `gh pr view` (plus the PR's inline
-# comments) returned, so each is tested without a network. The planner merges only on "ok".
+# Read-only and without a network of its own: state, reviews, holds and head are pure functions
+# over what one `gh pr view` (plus the PR's inline comments) returned; mail and relay read this
+# checkout's .workbench. The planner merges only on "ok". When in doubt, hold: fail closed.
 
 PLANNER_MARKER = "<!-- agworkbench:planner -->"
-HOLD_RE = re.compile(r"\b(hold|wait|do not merge|don't merge|dont merge)\b", re.IGNORECASE)
-LIFT_RE = re.compile(r"\b(unhold|resume|go ahead)\b", re.IGNORECASE)
-PR_FIELDS = "number,url,state,mergeable,mergeStateStatus,reviewDecision,headRefOid,reviews,comments"
+NEGATION = r"(?:do[\s-]*not|don'?t|dont)[\s-]*"
+HOLD_RE = re.compile(r"\b(?:hold|wait(?:ing)?|wip|" + NEGATION + r"merge|" +
+                     NEGATION + r"(?:go[\s-]*ahead|resume|unhold))\b")
+# A lift is the whole comment, a bare directive, optionally addressed: "go ahead", "@claude resume.".
+LIFT_RE = re.compile(r"(?:@\S+ )?(?:go ahead|resume|unhold)(?: please)?[.!]?")
+LABEL_HOLD_RE = re.compile(r"do.?not.?merge|hold|wip")
+PR_FIELDS = ("number,url,state,mergeable,mergeStateStatus,reviewDecision,headRefOid,reviews,comments,"
+             "labels,title,body,author")
+
+
+def normalize(text: str) -> str:
+    """Lower-case, typographic apostrophes to ', markdown emphasis and code marks dropped,
+    whitespace collapsed - so "Do **not**\\nmerge" and "Don’t merge" read as what they say."""
+    text = re.sub("[‘’ʼ]", "'", text or "")
+    text = re.sub(r"[*_~`]", "", text)
+    return " ".join(text.split()).lower()
 
 
 def _login(item: dict) -> str:
@@ -191,25 +203,39 @@ def check_reviews(pr: dict) -> list[str]:
     return failures
 
 
+def check_labels_and_title(pr: dict) -> list[str]:
+    failures = []
+    for label in pr.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else str(label)
+        if LABEL_HOLD_RE.search(normalize(name)):
+            failures.append(f"label: the PR is labelled '{name}'")
+    if HOLD_RE.search(normalize(pr.get("title") or "")):
+        failures.append(f"hold: the PR title says \"{pr.get('title')}\"")
+    return failures
+
+
 def check_holds(pr: dict, inline: list[dict]) -> list[str]:
-    """A hold word in any body the planner did not mark holds the PR, at any age. Only a later
-    unmarked lift word releases it; a body with both is a hold (fail safe)."""
+    """A hold word in any body the planner did not mark holds the PR, at any age. A hold is lifted
+    only by its own author, later, with a comment that is nothing but "go ahead", "resume" or
+    "unhold"; bots never lift. Each author's hold stands on its own."""
     bodies = []
+    body = pr.get("body") or ""
+    if body and PLANNER_MARKER not in body:
+        bodies.append(("", _login(pr), body))      # the PR description predates every comment
     for item in list(pr.get("comments") or []) + list(pr.get("reviews") or []) + list(inline or []):
-        body = item.get("body") or ""
-        if body and PLANNER_MARKER not in body:
-            bodies.append((_when(item), _login(item), body))
-    holding = None
-    for when, who, body in sorted(bodies, key=lambda entry: entry[0]):
-        if HOLD_RE.search(body):
-            holding = (when, who, body)
-        elif LIFT_RE.search(body):
-            holding = None
-    if holding is None:
-        return []
-    when, who, body = holding
-    excerpt = " ".join(body.split())[:80]
-    return [f"hold: {who} at {when}: \"{excerpt}\" (lift with a later comment: go ahead / resume / unhold)"]
+        text = item.get("body") or ""
+        if text and PLANNER_MARKER not in text:
+            bodies.append((_when(item), _login(item), text))
+    holds: dict[str, tuple[str, str]] = {}
+    for when, who, text in sorted(bodies, key=lambda entry: entry[0]):
+        plain = normalize(text)
+        if HOLD_RE.search(plain):
+            holds[who] = (when, text)
+        elif LIFT_RE.fullmatch(plain) and who in holds and not who.endswith("[bot]"):
+            del holds[who]
+    return [f"hold: {who} at {when or 'PR description'}: \"{' '.join(text.split())[:80]}\" "
+            f"(only {who} can lift it, with a later comment that just says: go ahead)"
+            for who, (when, text) in sorted(holds.items())]
 
 
 def check_mail(box: str = "claude") -> list[str]:
@@ -218,11 +244,14 @@ def check_mail(box: str = "claude") -> list[str]:
     for path in hub.unread(box):
         try:
             message = hub.parse_message(path)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            continue       # read, and so moved, after it was listed
+        except (OSError, ValueError) as err:
+            failures.append(f"mail: cannot read unread message {path.name}: {err}")
             continue
         if message.get("from") in ("human", "github"):
             failures.append(f"mail: unread from {message.get('from')}: {message.get('subject', '')} "
-                            f"[{message.get('id', path.stem)}] - read and handle it first")
+                            f"[{message.get('id', path.stem)}] - read and handle it, then check again")
     return failures
 
 
@@ -232,7 +261,8 @@ def check_relay(root: Path, number: int) -> list[str]:
         seen = number in (state.get("seen_open") or [])
     except (OSError, ValueError, AttributeError):
         seen = False
-    return [] if seen else [f"relay: the relay has not recorded PR #{number} as seen open yet"]
+    return [] if seen else [f"relay: the relay has not recorded PR #{number} as seen open yet - "
+                            "wait for its 'PR is open' mail, then check again"]
 
 
 def check_head(pr: dict, head: str) -> list[str]:
@@ -243,8 +273,8 @@ def check_head(pr: dict, head: str) -> list[str]:
 
 
 def merge_failures(pr: dict, inline: list[dict], head: str, root: Path) -> list[str]:
-    return (check_state(pr) + check_reviews(pr) + check_holds(pr, inline) + check_mail() +
-            check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head))
+    return (check_state(pr) + check_reviews(pr) + check_labels_and_title(pr) + check_holds(pr, inline) +
+            check_mail() + check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head))
 
 
 def gh_json(*args: str):

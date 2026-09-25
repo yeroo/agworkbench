@@ -491,7 +491,7 @@ class MergeCheck(unittest.TestCase):
     def test_holds_do_not_expire_and_only_a_later_unmarked_lift_releases_them(self):
         hold = comment("don't merge yet", '2026-09-01T00:00:00Z')      # long before any later commit
         self.assertTrue(self.failures(clean_pr(comments=[hold])))
-        lift = comment('ok, go ahead', '2026-09-24T12:00:00Z')
+        lift = comment('go ahead', '2026-09-24T12:00:00Z')
         self.assertEqual([], self.failures(clean_pr(comments=[lift, hold])))
         early_lift = comment('resume', '2026-08-01T00:00:00Z')
         self.assertTrue(self.failures(clean_pr(comments=[hold, early_lift])))
@@ -499,11 +499,50 @@ class MergeCheck(unittest.TestCase):
         self.assertTrue(self.failures(clean_pr(comments=[hold, planner_lift])))
 
     def test_hold_word_matching(self):
+        # r16 M1: bodies are normalised (apostrophes, emphasis, whitespace, case) before matching.
         for body, holds in [('hold', True), ('Please WAIT', True), ('do not merge', True), ('dont merge', True),
-                            ("don't merge", True), ('unhold', False), ('waiting on nothing', False),
-                            ('household threshold', False), ('hold, then go ahead', True)]:
+                            ("don't merge", True), ('Don\u2019t merge this yet', True), ('Don\u02bct merge', True),
+                            ('do not\nmerge', True), ('do not  merge', True), ('Do **not** merge', True),
+                            ('do-not-merge', True), ('DO NOT MERGE', True), ('waiting on legal', True),
+                            ('`wip`', True), ('unhold', False), ('household threshold', False),
+                            ('wipe the cache', False), ('hold, then go ahead', True),
+                            # r16 M2: negated lifts are holds
+                            ("don't go ahead", True), ('do not resume', True), ("don't unhold", True)]:
             with self.subTest(body=body):
                 self.assertEqual(holds, bool(self.failures(clean_pr(comments=[comment(body, '2026-09-24T10:00:00Z')]))))
+
+    def test_only_the_hold_author_lifts_it_with_a_bare_directive(self):
+        # r16 M2
+        hold = comment('hold', '2026-09-24T10:00:00Z', who='yeroo')
+        for lift, released in [(comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo'), True),
+                               (comment('@claude resume.', '2026-09-24T11:00:00Z', who='yeroo'), True),
+                               (comment('Unhold please!', '2026-09-24T11:00:00Z', who='yeroo'), True),
+                               (comment('go ahead', '2026-09-24T11:00:00Z', who='ann'), False),
+                               (comment('I will resume reviewing tomorrow', '2026-09-24T11:00:00Z', who='yeroo'), False),
+                               (comment('go ahead and rename X first', '2026-09-24T11:00:00Z', who='yeroo'), False),
+                               (comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo[bot]'), False)]:
+            with self.subTest(lift=lift['body'], who=lift['author']['login']):
+                self.assertEqual(not released, bool(self.failures(clean_pr(comments=[hold, lift]))))
+        both = [hold, comment('wait', '2026-09-24T10:30:00Z', who='ann'),
+                comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo')]
+        lines = self.failures(clean_pr(comments=both))
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].startswith('hold: ann at'), lines)
+        bot_hold = comment('hold', '2026-09-24T10:00:00Z', who='ci[bot]')
+        self.assertTrue(self.failures(clean_pr(comments=[bot_hold, comment('go ahead', '2026-09-24T11:00:00Z', who='ci[bot]')])))
+
+    def test_labels_title_and_description_can_hold(self):
+        # r16 m3
+        for name in ('do-not-merge', 'DO NOT MERGE', 'on hold', 'WIP'):
+            with self.subTest(label=name):
+                self.assertEqual([f"label: the PR is labelled '{name}'"], self.failures(clean_pr(labels=[{'name': name}])))
+        self.assertEqual([], self.failures(clean_pr(labels=[{'name': 'enhancement'}])))
+        self.assertTrue(self.failures(clean_pr(title='[WIP] auto-merge'))[0].startswith('hold: the PR title'))
+        described = clean_pr(body='Do not merge until #24 lands', author={'login': 'yeroo'})
+        self.assertTrue(self.failures(described)[0].startswith('hold: yeroo at PR description'))
+        self.assertEqual([], self.failures(clean_pr(body='Do not merge until #24 lands\n' + MARK)))
+        lifted = dict(described, comments=[comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo')])
+        self.assertEqual([], self.failures(lifted))
 
     def test_review_bodies_and_inline_comments_can_hold(self):
         review = {'state': 'COMMENTED', 'body': 'hold', 'submittedAt': '2026-09-24T10:00:00Z', 'author': {'login': 'yeroo'}}
@@ -523,9 +562,20 @@ class MergeCheck(unittest.TestCase):
                 self.mail(sender)
                 self.assertTrue(any(line.startswith(f'mail: unread from {sender}') for line in self.failures()))
 
+    def test_an_unreadable_unread_message_fails_closed(self):
+        # r16 m1
+        self.mail('human')
+        with patch.object(hub, 'parse_message', side_effect=UnicodeDecodeError('utf-8', b'x', 0, 1, 'bad')):
+            lines = self.failures()
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].startswith('mail: cannot read unread message m-human.md'), lines)
+        with patch.object(hub, 'parse_message', side_effect=FileNotFoundError('moved')):
+            self.assertEqual([], self.failures())
+
     def test_the_relay_must_have_seen_the_pr_open(self):
         self.seen([6])
-        self.assertEqual(['relay: the relay has not recorded PR #7 as seen open yet'], self.failures())
+        self.assertEqual(["relay: the relay has not recorded PR #7 as seen open yet - wait for its 'PR is open' "
+                          "mail, then check again"], self.failures())
         (self.state / 'relay.json').unlink()
         self.assertTrue(self.failures())
 
@@ -548,7 +598,8 @@ class MergeCheck(unittest.TestCase):
         self.assertEqual(['gh', 'api', 'repos/o/r/pulls/7/comments', '--paginate', '--slurp'], calls[1])
         self.assertEqual(2, len(calls))
         self.assertEqual([{'body': 'a'}, {'body': 'b'}], inline)
-        for field in ('headRefOid', 'mergeStateStatus', 'reviewDecision', 'reviews', 'comments'):
+        for field in ('headRefOid', 'mergeStateStatus', 'reviewDecision', 'reviews', 'comments',
+                      'labels', 'title', 'body', 'author'):
             self.assertIn(field, wb.PR_FIELDS)
 
     def test_a_gh_failure_is_not_ok(self):
@@ -601,6 +652,17 @@ class AutoMergeProse(unittest.TestCase):
         self.assertIn('Never approve your own PR', rules)
         self.assertIn(wb.PLANNER_MARKER, text)
         self.assertIn('ends with the planner marker line', text.split('## Phase 5')[1].split('## Phase 6')[0])
+
+    def test_phase_6_waits_for_the_relay_and_rechecks(self):
+        # r16 M3
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        auto = ' '.join(text.split('### Auto-merge')[1].split('### The human')[0].split())
+        for needle in ['**Wait for the relay first.**', "`PR #N is open` mail from `github`",
+                       '**Retryable failures:** `relay:`', '`mail:` (read and handle the mail)', '`UNKNOWN`',
+                       'Every other failure is final for this head', '**Check again after any event',
+                       'new head with the whole suite re-run on it']:
+            self.assertIn(needle, auto)
+        self.assertLess(auto.index('Wait for the relay first'), auto.index('merge-check --pr <N> --head <full sha>'))
 
     def test_implementer_never_merges(self):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/workbench-implementer.md').read_text(encoding='utf-8')

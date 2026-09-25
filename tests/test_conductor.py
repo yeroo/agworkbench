@@ -561,10 +561,12 @@ class QueueCase(unittest.TestCase):
     def test_invalid_saved_auto_merge_is_refused(self):
         self.start('o/r#1')
         data = json.loads(self.store.path.read_text())
-        data['autoMerge'] = 'yes'
-        self.store.path.write_text(json.dumps(data))
-        with self.assertRaises(q.StateError):
-            self.store.load()
+        for bad in ('yes', 0, 1, 0.0):      # r16 i1: 0 == False and 1 == True, but they are not booleans
+            with self.subTest(value=bad):
+                data['autoMerge'] = bad
+                self.store.path.write_text(json.dumps(data))
+                with self.assertRaises(q.StateError):
+                    self.store.load()
 
     def test_cli_auto_merge_flags_are_exclusive(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
