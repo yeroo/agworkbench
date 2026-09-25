@@ -189,6 +189,87 @@ ring, which normally raises an alert after a minute (ambiguous Claude text has a
 described below); the background waiter still wakes Claude. Codex uses
 the relay's queued pointers. Claude stops its waiter when the loop is complete.
 
+### Issue triage: priority labels from the private spec repos
+
+`-Triage` gives every open issue of a product repo exactly one `priority:P0`..`priority:P3` label,
+plus `ux` when UI/UX is the reason. It judges each issue against the product's private spec
+repos. The labels must already exist on the repo.
+
+```powershell
+github-workbench -Triage -Repo yeroo/docxy              # every open issue without a priority: label
+github-workbench -Triage -Repo yeroo/docxy -Watch       # keep doing it for new ones, every 5 minutes
+github-workbench -Retriage -Repo yeroo/docxy -DryRun    # re-judge labelled ones too; print, write nothing
+github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous -Triage
+```
+
+Configure it locally in `~/.agworkbench.json`, never in the repo:
+
+```json
+"triage": {"yeroo/docxy": {"specRepos": ["yeroo/docxy-project-spec", "yeroo/docxy-word-spec",
+                                          "yeroo/docxy-excel-spec"], "model": "sonnet"}}
+```
+
+**The rules:**
+- **P0:** it blocks an open spec issue, or it has a severe user-facing impact (a crash, data loss,
+  an unusable or silently wrong flow).
+- **P1:** a visible UI/UX defect against the reference app or `docs/ui/`, or it blocks a spec
+  enabler or the harness.
+- **P2:** a correctness defect in a spec area that blocks nothing open.
+- **P3:** out of the current spec scope, cosmetic, or internal only.
+
+**How it decides (`lib/triage.py`):**
+1. **The facts, without a model.** triage.py reads every configured spec repo that exists: its
+   open issues and a shallow cached clone (`~/.agworkbench/spec-cache`). A repo that does not exist
+   is skipped with a note, so `docxy-excel-spec` joins once it exists. GitHub answers a private
+   repo your gh account cannot see exactly like a missing one, so if **none** of the configured
+   spec repos can be read, the run stops (check `gh auth status`). Any other failure (network,
+   auth, rate limit, clone, a stalled fetch) stops the run before anything is written. Judging
+   without the specs would put everything too low. The cache is only ever touched through its own
+   `.git` (never git's discovery of a parent repo), and a per-repo lock keeps a `-Watch` session
+   and the queue's triage runs from re-syncing a clone while the model reads it.
+2. **References.** Only an exact reference in an open spec issue's title or body counts:
+   `docxy#12`, `yeroo/docxy#12`, or the issue's URL. `docxy#120`, `docxy-word#12` and a bare `#12`
+   do not, and spec comments are not scanned. A referenced **bug**, or an issue referenced by a
+   spec bug mirror (title `bug:` or a `bug` label), is **P0 without asking the model**. Any other
+   referenced issue gets a P1 floor.
+3. **The model,** everywhere else. It runs as `claude -p` with the text of
+   `claude/commands/triage-issue.md` (also installed as `/triage-issue`). It runs `--restricted`,
+   with only Read, Grep and Glob, no MCP servers, no settings but the quiet file, and a JSON schema
+   for its answer, within 300 s. triage.py enforces the rules, whatever the answer says:
+   - the floor is never lowered;
+   - a P0 from the model alone, for an author outside the repo (not OWNER, MEMBER or
+     COLLABORATOR), is written as P1. Anyone can file a public issue, and its text is untrusted
+     input to the model, so it must not be able to put itself at the front of the queue;
+   - an answer that breaks the schema, or cites a spec issue that is not in the facts, fails that
+     issue with nothing written; the others go on;
+   - a usage-limit or auth failure stops the run.
+
+**Nothing private reaches the public repo.** The rationale is written to the private log first;
+then the public issue gets its labels and one comment from a fixed template, for example
+`Triaged priority:P1 (user-facing UI/UX).`, carrying the planner marker. If that comment fails
+after the label is on, the run says so (`labelled priority:P1, but the public comment failed`);
+the issue counts as triaged. Capability ids, spec text, spec titles and links never appear there. The rationale goes to
+a "Triage log" issue in the first spec repo that exists: one comment per decision, with the spec
+refs and any rule that changed the model's answer. The issue asked for a comment on the blocking
+spec issue; one log is less noise there.
+
+**What gets triaged.** Open issues without a `priority:` label, oldest first, at most `-Limit`
+(default 20) per run. A label already there counts as triaged, including one you applied by hand.
+The labels are read again just before writing, so a label you add meanwhile wins. `-Retriage`
+also re-judges the labelled ones and replaces their label. `-Watch` opens a visible
+`#triage owner/repo` session that re-scans every 5 minutes; nothing that goes wrong in one scan
+ends it. An issue that keeps failing there is retried with a growing delay, then left alone after
+3 failures, with one notification. Only the watch counts failures: a manual or queue run always
+tries again.
+
+**The queue.** Pending members are admitted P0, then P1, then untriaged, then P2, then P3, oldest
+issue first within each. The conductor reads the labels for the whole repo on each refresh, and
+active or PR-open members are never touched. With `-Queue ... -Triage`, an untriaged pending member
+is triaged in the background, one at a time, before it may be admitted. A failed triage admits it
+at the untriaged rank. A queue that is already running picks this up only after a restart: close
+its `#queue` session and start it again with `-Triage`. Its pending members are then triaged and
+sorted, and its active ones are left alone.
+
 ## Safety model
 
 **Codex** runs `--sandbox workspace-write --ask-for-approval never`, rooted at the issue's own
@@ -419,6 +500,7 @@ are trusted.
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
+| `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
@@ -434,6 +516,7 @@ lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/wo
 lib/relay.py                mail doorbell and PR watcher; spots usage limits in the agent panes
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
 lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
+lib/triage.py               priority labels for a product repo's issues, from its private spec repos (#34)
 lib/helper_done.py          a helper session's completion marker (#33)
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude
@@ -442,6 +525,7 @@ lib/agmsg.py, hub.py,       the mailbox and the fail-closed pane messenger, vend
     agw.py, peerchat.py     tested ai-hub tooling
 claude/commands/start-github-issue.md      the loop, from Claude's side
 claude/commands/workbench-implementer.md   the loop, from the implementer's side when it is Claude
+claude/commands/triage-issue.md            one issue's priority judgment; triage.py runs it headless
 codex/skills/workbench-implementer/        the loop, from Codex's side
 tests/                      python -m unittest discover -s tests   (no terminal needed)
 ```

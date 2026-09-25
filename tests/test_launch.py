@@ -1315,7 +1315,7 @@ class QueueEntry(LauncherFixtures):
                               parallel=1, watch=False, yes=False, label=None, owner=None, members=[member]))
         self.entry_lib = self.temp / 'queue entry'
         self.entry_lib.mkdir()
-        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py']:
+        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py', 'triage.py']:
             shutil.copyfile(LIB / name, self.entry_lib / name)
         self.overrides = (
             "\nfunction Get-IssueInfo { return @{title='fix-x';state='OPEN'} }\n"
@@ -1351,6 +1351,38 @@ class QueueEntry(LauncherFixtures):
         args = args_file.read_text(encoding='utf-8', errors='replace')
         self.assertIn('start --spec bugs --repo o/repo --watch', args)
         self.assertIn('--autonomous', args)
+
+    def launcher(self, *args, shell=PWSH):
+        args_file = self.temp / 'python-args.txt'
+        args_file.unlink(missing_ok=True)
+        self.cmd('python', f'echo %* > "{args_file}"')
+        result = subprocess.run([shell, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'), *args],
+                                env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
+        return result, (args_file.read_text(encoding='utf-8', errors='replace').strip() if args_file.exists() else None)
+
+    def test_triage_switches_reach_triage_py_under_both_shells(self):
+        # #34: PowerShell hands -Triage to lib/triage.py; the claude argv itself is built in Python.
+        triage = str(self.entry_lib / 'triage.py')
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            for args, expected in ((('-Triage', '-Repo', 'o/repo'), f'{triage} run --repo o/repo'),
+                                   (('-Retriage', '-Repo', 'o/repo', '-Limit', '5', '-DryRun'),
+                                    f'{triage} run --repo o/repo --retriage --dry-run --limit 5'),
+                                   (('-Triage', '-Repo', 'o/repo', '-Watch'), f'{triage} start-watch --repo o/repo'),
+                                   (('-Queue', 'bugs', '-Repo', 'o/repo', '-Triage'), '--triage')):
+                with self.subTest(shell=shell, args=args):
+                    result, seen = self.launcher(*args, shell=shell)
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    self.assertIn(expected, seen.replace('"', ''))
+
+    def test_triage_misuse_is_refused_before_python(self):
+        for args in (('-Triage',), ('-Triage', '-Repo', 'o/repo', '7'), ('-Triage', '-Repo', 'o/repo', '-Autonomous'),
+                     ('-Triage', '-Repo', 'o/repo', '-Limit', '0'), ('-Retriage', '-Repo', 'o/repo', '-Watch'),
+                     ('-Queue', 'bugs', '-Repo', 'o/repo', '-Retriage'), ('-Queue', 'bugs', '-Repo', 'o/repo', '-Limit', '3'),
+                     ('7', '-Limit', '3')):
+            with self.subTest(args=args):
+                result, seen = self.launcher(*args)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIsNone(seen)
 
     def test_member_autonomous_switch_reaches_its_checkout(self):
         # #27: the conductor passes a queue's saved autonomy as -Autonomous / -NoAutonomous.

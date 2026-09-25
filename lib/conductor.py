@@ -18,6 +18,7 @@ from urllib.parse import quote, urlparse
 
 import agw
 import closer
+import triage
 
 HERE = Path(__file__).resolve().parent
 STATES = {'pending', 'launching', 'active', 'pr-open', 'blocked', 'failed', 'merged'}
@@ -102,6 +103,8 @@ def repo_name(value):
 
 
 CLOSE_BACKSTOP_AFTER = 900.0   # a merged member's close pending this long gets the backstop (#33)
+TRIAGE_JOB_TIMEOUT = 600.0     # one triage.py run for one member (#34)
+TRIAGE_PAUSE = 1800.0          # after a triage run stopped on a usage limit/auth or incomplete facts
 RELAY_ALIVE = 'the relay is alive but its close has been pending for 15 minutes'
 
 
@@ -134,10 +137,7 @@ def run_gh(args, timeout=60):
     except subprocess.TimeoutExpired:
         # repo clone can have a git child; terminating just gh would leave it
         # writing into a checkout that a later Retry is about to repair.
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=30)
-        else:
-            process.kill()
+        triage.kill_tree(process)
         process.communicate(timeout=10)
         raise
     return subprocess.CompletedProcess(argv, process.returncode, out, err)
@@ -179,10 +179,11 @@ def resolve_spec(spec, hint=None, gh=gh_json):
 def bug_label(config):
     """`bugLabel` from the config (#28): the label `-Queue bugs` stands for. Default `bug`."""
     settings = read_json(config) if Path(config).exists() else {}
-    label = settings.get('bugLabel', 'bug')
-    if not isinstance(label, str) or not label.strip() or ',' in label:
-        raise UsageError(f'bugLabel in {config} must be a non-empty label name without a comma (got {label!r})')
-    return label.strip()
+    label = triage.bug_label_of(settings)             # one rule for -Queue bugs and -Triage (#34)
+    if label is None:
+        raise UsageError(f'bugLabel in {config} must be a non-empty label name without a comma '
+                         f'(got {settings.get("bugLabel")!r})')
+    return label
 
 
 def expand_spec(spec, config):
@@ -305,6 +306,8 @@ class Store:
                 raise ValueError('invalid autonomous')
             if 'autoMerge' in data and data['autoMerge'] is not None and type(data['autoMerge']) is not bool:
                 raise ValueError('invalid autoMerge')
+            if data.get('triage') is not None and type(data['triage']) is not bool:
+                raise ValueError('invalid triage')
             if (not isinstance(data['config'], str) or not Path(data['config']).is_absolute() or
                     type(data['yes']) is not bool or not isinstance(data['members'], list) or
                     (data['watch'] and (not isinstance(data['label'], str) or not data['label']))):
@@ -316,7 +319,9 @@ class Store:
                         not isinstance(m['checkout'], str) or not Path(m['checkout']).is_absolute() or
                         type(m['checkoutEstablished']) is not bool or type(m['consumedRev']) is not int or
                         m['consumedRev'] < 0 or m['phase'] not in {'active', 'pr-open', 'blocked'} or
-                        (m['attempt'] > 0 and not valid_uuid(m.get('token')))):
+                        (m['attempt'] > 0 and not valid_uuid(m.get('token'))) or
+                        m.get('priority') not in (None, *triage.PRIORITIES) or
+                        not isinstance(m.get('createdAt') or '', str)):
                     raise ValueError('invalid member')
                 seen.add(m['number'])
             return data
@@ -348,6 +353,18 @@ def find_member(data, number):
     return next((m for m in data['members'] if m['number'] == number), None)
 
 
+def admission_key(m):
+    """Pending members are admitted P0, P1, untriaged, P2, P3 (#34); oldest issue first within a
+    rank, then the order they were queued."""
+    created = m.get('createdAt')
+    return triage.RANK.get(m.get('priority'), 2), created is None, created or '', m.get('since') or 0, m['number']
+
+
+def awaits_triage(data, m):
+    """With -Triage, an untriaged member waits for its triage run before it may be admitted."""
+    return bool(data.get('triage')) and m.get('priority') is None and 'triageResult' not in m
+
+
 def command_line(parts):
     # Commands supplied to a terminal shell use PowerShell quoting; subprocess argv never does.
     return ' '.join("'" + str(p).replace("'", "''") + "'" for p in parts)
@@ -368,11 +385,11 @@ def pin_conductor(store, owner):
             data['owner']['pinned'] = True
 
 
-def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label):
+def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on=False):
     """What this start or append changes in a queue's saved settings (#28): {key: [old, new]}."""
     current = data or {}
     wanted = {'parallel': parallel, 'yes': True if yes else None, 'implementer': implementer,
-              'autoMerge': auto_merge, 'autonomous': autonomous}
+              'autoMerge': auto_merge, 'autonomous': autonomous, 'triage': True if triage_on else None}
     if watch:
         wanted.update(watch=True, label=label)
     return {key: [current.get(key), value] for key, value in wanted.items()
@@ -380,7 +397,7 @@ def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, w
 
 
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
-                implementer=None, auto_merge=None, autonomous=None, gh=gh_json):
+                implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False):
     repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
     if watch and not label:
         raise UsageError('-Watch requires a label spec')
@@ -403,7 +420,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     if dry_run:
         live = store.running() if store.worker_lock.exists() else False
         mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
-        changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label)
+        changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
         print(json.dumps(dict(repo=repo, members=numbers, running=live, mode=mode,
                               skipped=[dict(number=n, reason=r) for n, r in sorted(skipped.items())],
                               settings=changes, owner=existing.get('owner') if existing else None)))
@@ -421,7 +438,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         # One mapping decides and applies every switch, and is what gets reported (#28). All apply to
         # members launched from now on; autonomous/autoMerge are saved explicitly, false included,
         # and -Watch onto a queue started from a list turns watching on.
-        changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label)
+        changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on)
         for key, (_, new) in changes.items():
             data[key] = new
         known = {m['number'] for m in data['members']}
@@ -573,11 +590,14 @@ def summary(data):
 
 
 class Worker:
-    def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None):
+    def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None):
         self.store, self.token, self.gh, self.clock = store, token, gh, clock
         self.spawn = spawn or self.spawn_launcher
+        self.spawn_triage = spawn_triage or self.spawn_triage_run
         self.jobs = {}
-        self.next_pr = self.next_scan = 0
+        self.triage_job = None        # the one running triage.py for a pending member (#34)
+        self.triage_paused_until = 0
+        self.next_pr = self.next_scan = self.next_labels = 0
         self.errors = {}
         self.alerts = []
         self.last_display = {}
@@ -632,10 +652,7 @@ class Worker:
             if code is None and not timed_out:
                 continue
             if code is None:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=30)
-                else:
-                    process.kill()
+                triage.kill_tree(process)
                 process.wait(timeout=30)
             job['stream'].close()
             tail = '\n'.join(job['path'].read_text(encoding='utf-8', errors='replace').splitlines()[-20:])
@@ -690,6 +707,97 @@ class Worker:
                 self.errors.pop('label scan', None)
             except (OSError, ValueError, KeyError, subprocess.SubprocessError, QueueError, agw.CtlError) as err:
                 self.error('label scan', err)
+
+    # --- priorities (#34) ----------------------------------------------------------------------------
+    # Pending members are admitted by their issue's `priority:` label. The labels are read once per
+    # refresh for the whole repo. With -Triage an untriaged pending member gets one triage.py run, in
+    # the background and one at a time, before it may be admitted; a failed run admits it untriaged.
+
+    def refresh_priorities(self):
+        data = self.store.load()
+        if not any(m['state'] == 'pending' for m in data['members']):
+            return
+        if self.clock() < self.next_labels:
+            return
+        self.next_labels = self.clock() + 300
+        try:
+            issues = self.gh('issue', 'list', '--repo', data['repo'], '--state', 'open', '--limit', '1000',
+                             '--json', 'number,labels,createdAt')
+            if not isinstance(issues, list):
+                raise QueueError('invalid issue list')
+            found = {issue['number']: issue for issue in issues if isinstance(issue, dict)}
+            with self.store.transaction() as current:
+                for m in current['members']:
+                    issue = found.get(m['number'])
+                    if m['state'] == 'pending' and issue:
+                        priority = triage.priority_of(issue.get('labels'))
+                        # A label just written by this queue's triage may not be listed yet: keep it.
+                        if priority is not None or 'triageResult' not in m:
+                            m['priority'] = priority
+                        if isinstance(issue.get('createdAt'), str):
+                            m['createdAt'] = issue['createdAt']
+            self.errors.pop('labels', None)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as err:
+            self.error('labels', err)
+
+    def spawn_triage_run(self, data, m):
+        output = self.store.directory / f'triage-{m["number"]}.log'
+        result = self.store.directory / f'triage-{m["number"]}.json'
+        result.unlink(missing_ok=True)
+        stream = open(output, 'wb')
+        try:
+            process = subprocess.Popen([sys.executable, str(HERE / 'triage.py'), 'run', '--repo', data['repo'],
+                                        '--issue', str(m['number']), '--result-file', str(result)],
+                                       cwd=HERE.parent, env=dict(os.environ, AGWORKBENCH_CONFIG=data['config']),
+                                       stdout=stream, stderr=subprocess.STDOUT)
+        except BaseException:
+            stream.close()
+            raise
+        return dict(process=process, stream=stream, path=output, result=result, number=m['number'], started=self.clock())
+
+    def step_triage(self):
+        job = self.triage_job
+        if job is not None:
+            code = job['process'].poll()
+            timed_out = self.clock() - job['started'] >= TRIAGE_JOB_TIMEOUT
+            if code is None and not timed_out:
+                return
+            if code is None:
+                triage.kill_tree(job['process'])
+                job['process'].wait(timeout=30)
+            job['stream'].close()
+            self.triage_job = None
+            number = job['number']
+            try:
+                outcome = read_json(job['result']).get(str(number)) or {}
+            except (OSError, ValueError, AttributeError):
+                outcome = {}
+            tail = ' '.join(job['path'].read_text(encoding='utf-8', errors='replace').splitlines()[-3:])
+            if code in (triage.StopRun.code, triage.FactsError.code):
+                self.triage_paused_until = self.clock() + TRIAGE_PAUSE
+            with self.store.transaction() as data:
+                m = find_member(data, number)
+                if m is not None:
+                    # A label that was written counts, even when a later step of that run failed.
+                    if outcome.get('written') and outcome.get('priority') in triage.PRIORITIES:
+                        m['priority'] = outcome['priority']
+                    if code == 0:
+                        m['triageResult'] = 'ok'
+                    else:
+                        reason = 'timed out' if timed_out else f'exited {code}: {tail}'
+                        m['triageResult'] = f'failed: {reason}'[:300]
+            print(f'#{number}: triage {"done" if code == 0 else "failed; admitted untriaged"} '
+                  f'{outcome.get("priority") or ""}'.rstrip(), flush=True)
+        data = self.store.load()
+        if not data.get('triage') or self.triage_job is not None or self.clock() < self.triage_paused_until:
+            return
+        waiting = sorted((m for m in data['members'] if m['state'] == 'pending' and awaits_triage(data, m)),
+                         key=admission_key)
+        if waiting:
+            try:
+                self.triage_job = self.spawn_triage(data, waiting[0])
+            except (OSError, ValueError) as err:
+                self.mark(waiting[0]['number'], triageResult=f'failed: {err}'[:300])
 
     # --- the close backstop (#33) -------------------------------------------------------------------
     # The relay closes a merged member's sessions. When that relay is gone (killed, closed, never
@@ -800,20 +908,27 @@ class Worker:
                         # A partial/unrelated report never turns into an admission signal.
                         self.error(f'loop #{m["number"]}', err)
         self.refresh_remote()
+        self.refresh_priorities()
+        self.step_triage()
         self.close_backstop()
         launches = []
         with self.store.transaction() as data:
             count = sum(m['state'] in {'launching', 'active'} and not m['slotReleased'] for m in data['members'])
+            # While triage is paused (a usage limit, or facts it could not read) nobody waits for it.
+            paused = self.clock() < self.triage_paused_until
+            for m in sorted((m for m in data['members'] if m['state'] == 'pending'), key=admission_key):
+                if count >= data['parallel'] or (awaits_triage(data, m) and not paused):
+                    break                  # strictly in order: nothing behind a member still being triaged
+                if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
+                    m.update(state='failed', slotReleased=True, reason=f'checkout moved or deleted: {m["checkout"]}; restore it or remove the member')
+                    continue
+                m.update(state='launching', attempt=m['attempt'] + 1, token=str(uuid.uuid4()),
+                         result=None, startedAt=self.clock(), slotReleased=False)
+                launches.append(dict(m))
+                count += 1
+            admitted = {m['number'] for m in launches}
             for m in data['members']:
-                if m['state'] == 'pending' and count < data['parallel']:
-                    if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
-                        m.update(state='failed', slotReleased=True, reason=f'checkout moved or deleted: {m["checkout"]}; restore it or remove the member')
-                        continue
-                    m.update(state='launching', attempt=m['attempt'] + 1, token=str(uuid.uuid4()),
-                             result=None, startedAt=self.clock(), slotReleased=False)
-                    launches.append(dict(m))
-                    count += 1
-                elif m['state'] == 'launching' and m['number'] not in self.jobs and not m.get('result'):
+                if m['state'] == 'launching' and m['number'] not in self.jobs and not m.get('result') and m['number'] not in admitted:
                     # A predecessor may still be running after its conductor died. The
                     # checkout lock or fresh durable start intent gives it time to report.
                     if self.clock() - m['startedAt'] >= 600:
@@ -920,7 +1035,7 @@ def main(argv=None):
     start.add_argument('--spec', required=True)
     start.add_argument('--repo')
     start.add_argument('--parallel', type=int)
-    for flag in ('watch', 'retry', 'yes', 'dry-run'):
+    for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage'):
         start.add_argument('--' + flag, action='store_true')
     start.add_argument('--implementer', choices=('codex', 'claude'))
     merge = start.add_mutually_exclusive_group()
@@ -956,7 +1071,7 @@ def main(argv=None):
                 raise UsageError('queue mode requires running inside agwinterm')
             return start_queue(args.spec, args.repo, args.parallel, args.watch, args.retry, args.yes, args.dry_run,
                                implementer=args.implementer, auto_merge=args.auto_merge,
-                               autonomous=args.autonomous)
+                               autonomous=args.autonomous, triage_on=args.triage)
         if args.command == 'run':
             return Worker(Store(args.file), args.token).run()
         if args.command == 'member-context':

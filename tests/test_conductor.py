@@ -39,6 +39,7 @@ class QueueCase(unittest.TestCase):
         self.store = q.Store(self.root / 'queues/o/r.json')
         self.launches = []
         self.pr_state = 'OPEN'
+        self.issues = []
 
     def terminal(self, command, **kwargs):
         self.requests.append((command, kwargs))
@@ -52,6 +53,8 @@ class QueueCase(unittest.TestCase):
         return q.start_queue(spec, root=self.root / 'queues', **kwargs)
 
     def gh(self, *args):
+        if args[:2] == ('issue', 'list'):          # the priority labels (#34); none unless a test sets them
+            return self.issues
         self.assertEqual(('pr', 'view'), args[:2])
         return {'state': self.pr_state}
 
@@ -402,6 +405,8 @@ class QueueCase(unittest.TestCase):
         worker = self.worker()
         responses = [OSError('offline'), [], [[{'number': 8, 'created_at': 'a'}]]]
         def gh(*args):
+            if args[:2] == ('issue', 'list'):
+                return []
             value = responses.pop(0)
             if isinstance(value, Exception):
                 raise value
@@ -938,6 +943,180 @@ class CloseBackstop(unittest.TestCase):
             self.w.close_backstop()
         self.assertEqual([], self.actions)
         self.assertIn('close #7', self.w.errors)
+
+class PriorityOrder(unittest.TestCase):
+    """#34: pending members are admitted P0, P1, untriaged, P2, P3, oldest issue first; with -Triage
+    an untriaged member is triaged (in the background, one at a time) before it may be admitted."""
+    terminal, start, gh, spawn, worker, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                          QueueCase.spawn, QueueCase.worker, QueueCase.member,
+                                                          QueueCase.report)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.triage_runs = []
+        self.exit_code = {}                 # number -> the triage run's exit code (None: still running)
+        self.outcome = {}                   # number -> the priority the run wrote
+
+    def label(self, number, created, priority=None):
+        labels = [{'name': f'priority:{priority}'}] if priority else [{'name': 'bug'}]
+        self.issues.append({'number': number, 'createdAt': created, 'labels': labels})
+
+    def spawn_triage(self, data, m):
+        number = m['number']
+        self.triage_runs.append(number)
+        result = self.root / f'triage-{number}.json'
+        log = self.root / f'triage-{number}.log'
+        log.write_text('triage output\n')
+        case = self
+
+        class Run:
+            pid = 456
+            killed = False
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                return None
+
+            def poll(self):
+                code = case.exit_code.get(number)
+                if code is not None and number in case.outcome:
+                    result.write_text(json.dumps({str(number): {'priority': case.outcome[number], 'written': True}}))
+                return code
+        return dict(process=Run(), stream=io.BytesIO(), path=log, result=result, number=number, started=self.now)
+
+    def admit_all(self, worker, count):
+        for _ in range(count):
+            worker.tick()
+            self.now += 20
+            launched = self.launches[-1][0]
+            self.report(launched)
+            worker.tick()
+        return [x[0] for x in self.launches]
+
+    def test_admission_follows_priority_then_age(self):
+        self.start('o/r#1,2,3,4,5,6')
+        self.label(1, '2026-01-01', 'P3')
+        self.label(2, '2026-01-02')                 # untriaged: after P1, before P2
+        self.label(3, '2026-03-01', 'P0')
+        self.label(4, '2026-01-04', 'P1')
+        self.label(5, '2026-02-01', 'P0')           # the older P0 goes first
+        self.label(6, '2026-01-06', 'P2')
+        order = self.admit_all(self.worker(), 6)
+        self.assertEqual([5, 3, 4, 2, 6, 1], order)
+        self.assertEqual('P0', self.member(5)['priority'])
+        self.assertEqual('2026-02-01', self.member(5)['createdAt'])
+
+    def test_active_members_are_left_alone(self):
+        self.start('o/r#1,2')
+        worker = self.worker()
+        worker.tick(); worker.tick()                # 1 admitted before any label was read
+        self.assertEqual('active', self.member(1)['state'])
+        self.label(1, '2026-01-01', 'P3')
+        self.label(2, '2026-01-02', 'P0')
+        worker.next_labels = 0
+        worker.tick()
+        self.assertEqual('active', self.member(1)['state'])
+        self.assertNotIn('priority', self.member(1))            # only pending members are re-read
+        self.assertEqual('pending', self.member(2)['state'])     # parallel 1: it waits its turn
+        self.assertEqual('P0', self.member(2)['priority'])
+
+    def test_an_old_queue_file_loads_and_a_bad_priority_is_refused(self):
+        self.start('o/r#1')
+        data = q.read_json(self.store.path)
+        self.assertNotIn('triage', data)
+        self.assertNotIn('priority', data['members'][0])
+        data['members'][0]['priority'] = 'P9'
+        q.atomic_json(self.store.path, data)
+        with self.assertRaises(q.StateError):
+            self.store.load()
+
+    def test_triage_saves_the_setting(self):
+        self.start('o/r#1')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.start('o/r#1', triage_on=True)
+        self.assertIs(True, self.store.load()['triage'])
+        self.assertIn('settings: triage null -> true', out.getvalue())
+
+    def triage_worker(self):
+        self.start('o/r#1,2', triage_on=True)
+        self.label(1, '2026-01-01')                 # untriaged, the oldest
+        self.label(2, '2026-01-02', 'P2')
+        return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now,
+                        spawn=self.spawn, spawn_triage=self.spawn_triage)
+
+    def test_an_untriaged_member_is_triaged_before_it_is_admitted(self):
+        worker = self.triage_worker()
+        self.exit_code[1] = None
+        for _ in range(3):
+            worker.tick()
+            self.now += 20
+        self.assertEqual([1], self.triage_runs)     # one run, in the background
+        self.assertEqual([], self.launches)         # nothing jumps the member being triaged
+        self.exit_code[1], self.outcome[1] = 0, 'P3'
+        order = self.admit_all(worker, 2)
+        self.assertEqual([2, 1], order)             # triaged P3: after the P2
+        self.assertEqual(('P3', 'ok'), (self.member(1)['priority'], self.member(1)['triageResult']))
+
+    def test_a_failed_triage_admits_the_member_untriaged(self):
+        worker = self.triage_worker()
+        self.exit_code[1] = 1
+        worker.tick()                               # starts the run; it is polled from the next tick
+        order = self.admit_all(worker, 2)
+        self.assertEqual([1, 2], order)             # untriaged ranks before P2
+        self.assertTrue(self.member(1)['triageResult'].startswith('failed: exited 1'))
+
+    def test_a_usage_limit_pauses_triage(self):
+        worker = self.triage_worker()
+        self.label(3, '2026-01-03')
+        with self.store.transaction() as data:
+            data['members'].append(q.new_member(3, 'o/r', self.root / 'clones'))
+        self.exit_code[1] = 3
+        worker.tick()
+        self.now += 20
+        worker.tick()
+        self.assertEqual([1], self.triage_runs)     # #3 is not triaged while paused
+        self.assertEqual([1], [x[0] for x in self.launches])
+        self.report(1)
+        worker.tick()
+        self.assertEqual([1, 3], [x[0] for x in self.launches])     # ...and does not hold the queue
+        with self.store.transaction() as data:     # put #3 back to see triage resume after the pause
+            m = q.find_member(data, 3)
+            m.update(state='pending', attempt=0, slotReleased=False)
+            m.pop('token'); m.pop('result', None); m.pop('startedAt', None)
+        worker.jobs.clear()
+        self.now += q.TRIAGE_PAUSE
+        self.exit_code[3] = None
+        worker.tick()
+        self.assertEqual([1, 3], self.triage_runs)
+
+    def test_a_triage_run_that_hangs_is_killed_and_fails(self):
+        worker = self.triage_worker()
+        self.exit_code[1] = None
+        worker.tick()
+        self.now += q.TRIAGE_JOB_TIMEOUT
+        job = worker.triage_job
+        with patch.object(q.subprocess, 'run') as kill:
+            kill.return_value = subprocess.CompletedProcess([], 0)
+            worker.tick()
+        self.assertEqual('failed: timed out', self.member(1)['triageResult'])
+        if os.name == 'nt':                          # r21: the whole tree, claude -p included
+            self.assertEqual(['taskkill', '/PID', '456', '/T', '/F'], kill.call_args.args[0])
+        else:
+            self.assertTrue(job['process'].killed)
+
+    def test_a_partial_write_keeps_the_priority_it_wrote(self):
+        # r21 m1: the label was written but the comment failed (exit 1): the member ranks as labelled.
+        worker = self.triage_worker()
+        self.exit_code[1], self.outcome[1] = 1, 'P0'
+        worker.tick()
+        worker.tick()
+        self.assertEqual('P0', self.member(1)['priority'])
+        self.assertTrue(self.member(1)['triageResult'].startswith('failed'))
+        self.assertEqual([1], [x[0] for x in self.launches])
+
 
 class Specs(unittest.TestCase):
     def test_lists_and_repositories(self):
