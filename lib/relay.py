@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Three jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Four jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -21,6 +21,13 @@ Three jobs, one loop, one process per issue, running in its own visible agwinter
    consecutive reads is mailed to the planner once (sender `relay`), with a blocked status and a
    notification; mail to a limited implementer is held until the planner fails it over. Checks
    stop once the PR is finished.
+
+4. **The close after merge (#27).** On an autonomous checkout, after a MERGED PR's final notices
+   are delivered, it closes the issue's helper sessions that are back at a shell, then the issue
+   session, then its own - only when the planner has recorded `loop-state done`, no mail is unread
+   and both agent panes are provably idle, while it keeps delivering mail. Every step goes to
+   `.workbench/state/relay-close.log`; a stop request, a human's mail or autonomy turned off stops it,
+   and it never closes on a timeout. A pending close survives a restart (`close_pending`).
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
@@ -274,7 +281,7 @@ class PrFetch:
 class Relay:
     def __init__(self, hub_dir: Path, peers: list[Peer], repo: str, branch: str,
                  mail_interval: float, pr_interval: float, dry_run: bool = False,
-                 limit_interval: float = 30.0, close_wait: float = CLOSE_WAIT):
+                 limit_interval: float = 30.0):
         os.environ["AI_HUB"] = str(hub_dir)
         import hub  # noqa: E402 - imported after AI_HUB is set so its paths point at this workbench
         hub.reload_paths()
@@ -286,8 +293,6 @@ class Relay:
         self.mail_interval = mail_interval
         self.pr_interval = pr_interval
         self.limit_interval = limit_interval
-        self.close_wait = close_wait
-        self.retired_on_start: tuple[int, str] | None = None
         # Limit rows already on screen when this relay started (e.g. the old tool's message above
         # the agent that replaced it): ignored until they leave the pane's tail.
         self.limit_baseline: dict[str, set[str]] = {}
@@ -337,8 +342,7 @@ class Relay:
         if (saved_pr and saved_pr.get('state') in ('MERGED', 'CLOSED')
                 and not self.state.get('outbox')
                 and not self.pending_terminal_mail() and not self.state.get('reset_pending')):
-            # A restart after a complete drain: the close (#27) still has to happen, from run().
-            self.retired_on_start = (saved_pr['number'], saved_pr.get('state'))
+            # A restart after a complete drain: retire() records the pending close (#27) for run().
             self.retire(saved_pr['number'])
 
     def _load(self) -> dict[str, Any]:
@@ -535,12 +539,15 @@ class Relay:
             done = {}
         if not isinstance(done, dict) or done.get('pr') != number:
             reasons.append(f'the planner has not recorded `wb.py loop-state done --pr {number}`')
+        for path in self.hub.unread('claude'):
+            # Anything the planner has not read - above all a human's "don't close" - stops the close.
+            reasons.append(f'the planner has unread mail {path.stem}')
         for path in self.hub.unread('codex'):
             try:
                 sender = self.hub.parse_message(path).get('from')
             except (OSError, ValueError):
                 sender = None
-            if sender in (None, 'claude'):
+            if sender in (None, 'claude', 'human', 'github'):
                 reasons.append(f'the implementer has not read {path.stem}')
         if (self.hub_dir.parent / '.git' / 'index.lock').exists():
             reasons.append('.git/index.lock exists')
@@ -565,37 +572,81 @@ class Relay:
                 reasons.append(f'{peer.box} composer is not provably empty')
         return reasons
 
-    def close_after_merge(self, number: int) -> None:
-        """After a merged PR and a complete drain, on an autonomous checkout: close the issue's
-        helper sessions (only those back at a shell), then the issue session (only when both agents
-        are provably done and idle), then this relay's own session. Never on a timeout."""
-        import agw
+    def autonomous(self) -> bool:
         try:
             settings = json.loads((self.hub_dir / 'state' / 'implementer.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
-            settings = {}
-        if not (isinstance(settings, dict) and settings.get('autonomous') is True):
+            return False
+        return isinstance(settings, dict) and settings.get('autonomous') is True
+
+    def finish_close(self) -> None:
+        """The close is done or refused: nothing to resume on a restart."""
+        if self.state.pop('close_pending', None) is not None and not self.dry_run:
+            self._save()
+
+    def close_alert(self, reason: str) -> None:
+        import agw
+        message = f"autonomous close stopped: {reason} (log: .workbench/state/relay-close.log)"
+        if self.dry_run:
+            return
+        for peer in self.peers:
+            if peer.box != 'claude':
+                continue
+            try:
+                agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not set blocked status: {err}")
+            try:
+                agw.notify(peer.pane, message, title='workbench relay')
+            except (agw.CtlError, OSError) as err:
+                self.log(f"could not notify: {err}")
+
+    def close_after_merge(self, number: int) -> None:
+        """After a merged PR and a complete drain, on an autonomous checkout: close the issue's
+        helper sessions (only those back at a shell), then the issue session (only when both agents
+        are provably done and idle), then this relay's own session. Mail keeps flowing while it
+        waits; a stop request, a human's mail or autonomy turned off stops it; never on a timeout."""
+        import agw
+        if not self.autonomous():
             self.log("autonomy is off for this checkout; the sessions stay open")
+            self.finish_close()
             return
         self.close_log(f"PR #{number} merged; autonomous close starting")
-        deadline = now() + self.close_wait
+        deadline = now() + CLOSE_WAIT
         settled: dict[str, tuple[str, float]] = {}
         while True:
+            if self.stop_file.exists():
+                # The launcher is restarting this relay; the pending close resumes after it.
+                self.close_log("NOT closing: stop requested; the close resumes when the relay restarts")
+                return
+            # The planner's "loop complete" mail (and any human mail) must still be rung.
+            self.flush_outbox()
+            self.deliver_mail()
             reasons = self.close_blockers(number, settled)
             if not reasons:
                 break
             if now() >= deadline:
-                self.close_log("NOT closing, still waiting after " + f"{self.close_wait:.0f}s: " + '; '.join(reasons))
-                if not self.dry_run:
-                    for peer in self.peers:
-                        if peer.box == 'claude':
-                            self.alert(peer, 'close', 'autonomous close stopped: ' + '; '.join(reasons)
-                                       + ' (see .workbench/state/relay-close.log)')
+                self.close_log(f"NOT closing, still waiting after {CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
+                self.close_alert('; '.join(reasons))
+                self.finish_close()
                 return
             pause(self.mail_interval)
+        if not self.autonomous():
+            self.close_log("NOT closing: autonomy was turned off during the wait")
+            self.finish_close()
+            return
         if self.dry_run:
             self.close_log('[dry-run] would close the helpers, the issue session and the relay')
             return
+        try:
+            self.close_sessions(number)
+        except (agw.CtlError, OSError) as err:
+            self.close_log(f"close failed: {err}")
+            self.close_alert(f"a close step failed: {err}")
+            self.finish_close()
+
+    def close_sessions(self, number: int) -> None:
+        import agw
         match = re.match(r'issue-(\d+)', self.branch)
         issue = match.group(1) if match else None
         workspace_name = self.repo.split('/')[-1]
@@ -628,21 +679,27 @@ class Relay:
             for pane in sorted(agents):
                 agw.clear_restore(pane)
             agw.close_session(issue_session.get('id'))
-        mine = agw.my_pane()
         summary = (f"PR #{number} merged; sessions closed"
                    + (f"; left open: {', '.join(left_open)}" if left_open else '')
                    + "; log: .workbench/state/relay-close.log")
+        mine = agw.my_pane()
         found = agw.find_pane(mine, agw.tree()) if mine else None
         try:
             agw.notify(mine or 'active', summary, title='workbench relay')
         except (agw.CtlError, OSError) as err:
             self.log(f"could not notify: {err}")
-        if not found:
-            self.close_log('the relay session is not in the tree; done')
+        self.finish_close()
+        # Its own session only when it is provably the relay's: the name, this repo's workspace, and
+        # no pane but this one - a human's shell split beside it must never go with it.
+        own = found[1] if found else None
+        if (own is None or found[0].get('name') != workspace_name or own.get('name') != f'#{issue} relay'
+                or agw.panes_of(own) != [mine]):
+            self.close_log(f"leaving this relay's session open: it is not a single-pane '#{issue} relay' "
+                           f"in workspace {workspace_name}")
             return
-        self.close_log(f"closing the relay session {found[1].get('id')}: {summary}")
+        self.close_log(f"closing the relay session {own.get('id')}: {summary}")
         agw.clear_restore(mine)
-        agw.close_session(found[1].get('id'))
+        agw.close_session(own.get('id'))
 
     def deliver_mail(self) -> None:
         import agw
@@ -712,6 +769,9 @@ class Relay:
             self._save()
 
     def retire(self, number: int) -> None:
+        if (self.state.get('pr') or {}).get('state') == 'MERGED':
+            # Persisted, so a relay that dies or restarts during the close wait resumes it (#27).
+            self.state['close_pending'] = number
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
@@ -939,8 +999,8 @@ class Relay:
                 self.log('[dry-run] saved PR is finished; no final mail filed')
                 return 0
             self.log('saved PR is finished; resuming final notice drain')
-        if self.retired_on_start and self.retired_on_start[1] == 'MERGED':
-            self.close_after_merge(self.retired_on_start[0])
+        if self.state.get('close_pending') and not self.dry_run:
+            self.close_after_merge(self.state['close_pending'])
         next_limit = 0.0
         while True:
             if self.stop_file.exists():

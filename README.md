@@ -282,9 +282,9 @@ merges, unless you opted in for that checkout.
   plan, is filed before the merge (`wb.py follow-up`). Titles are deduped exactly. The label is
   `follow-up`, or `follow-up-nested` for a follow-up's own follow-ups, so a `-Watch label:follow-up`
   queue chains at most one level. merge-check refuses while any is unfiled.
-- **Disputes have a ceiling.** A Major or blocker finding that ends disputed stops the merge and
-  waits for you. Minor ones may be deferred as follow-ups. The merge comment lists them all with
-  their severity and issue links.
+- **Only Minor findings may be deferred.** A Major or blocker review finding stops the merge and
+  waits for you, whether it was deferred or ended disputed. Minor and Immaterial ones may be
+  deferred as follow-ups. The merge comment lists them all with their severity and issue links.
 - **It closes the sessions.** After a MERGED PR, never a closed one, the relay closes nothing until
   the planner has recorded `wb.py loop-state done`, the implementer has read its last mail, and
   both panes are unchanged for 30 s with empty composers and no `.git/index.lock`. Then it closes

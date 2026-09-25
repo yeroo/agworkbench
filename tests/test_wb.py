@@ -916,6 +916,51 @@ class FollowUps(unittest.TestCase):
         (self.state / 'follow-ups.json').write_text(json.dumps(items), encoding='utf-8')
         self.assertEqual(['review:'], [line.split()[0] for line in wb.check_follow_ups(self.folder)])
 
+    def test_any_deferred_major_review_finding_blocks_but_plan_items_do_not(self):
+        # r18 M4/m1: only Minor/Immaterial findings (and plan items) may be deferred when autonomous.
+        self.settings(True)
+        items = [{'key': 'r2-M1', 'title': 'a', 'severity': 'major', 'origin': 'review r2', 'disputed': False, 'url': 'u'},
+                 {'key': 'r2-B1', 'title': 'b', 'severity': 'blocker', 'origin': 'review r2', 'disputed': True, 'url': 'u'},
+                 {'key': 'plan-x', 'title': 'c', 'severity': 'plan', 'origin': 'plan', 'disputed': False, 'url': 'u'},
+                 {'key': 'r2-m1', 'title': 'd', 'severity': 'minor', 'origin': 'review r2', 'disputed': True, 'url': 'u'}]
+        (self.state / 'follow-ups.json').write_text(json.dumps(items), encoding='utf-8')
+        self.assertEqual(["review: the major finding 'r2-M1' is deferred; an autonomous merge stops here and the human decides",
+                          "review: the blocker finding 'r2-B1' ended disputed; an autonomous merge stops here and the human decides"],
+                         wb.check_follow_ups(self.folder))
+
+    def test_re_adding_a_filed_key_updates_what_merge_check_gates_on(self):
+        # r18 m8
+        self.settings(True)
+        self.add('r2-m1')
+        self.run_wb('follow-up', 'file', '--source', '27', gh=FakeGh())
+        self.add('r2-m1', severity='major', disputed=True)
+        item = self.items()[0]
+        self.assertEqual(('major', True, 'https://github.com/o/r/issues/101'), (item['severity'], item['disputed'], item['url']))
+        self.assertIn('severity/origin/disputed updated', self.out.getvalue())
+        self.assertTrue(any(line.startswith('review:') for line in wb.check_follow_ups(self.folder)))
+
+    def test_titles_are_searched_as_a_quoted_phrase_and_matched_exactly(self):
+        # r18 m9
+        for title in ('Fix -Failover under PowerShell 5.1', 'relay: close waits', 'Follow up #12', 'The "hold" rule'):
+            with self.subTest(title=title):
+                (self.state / 'follow-ups.json').unlink(missing_ok=True)
+                self.add('k', title=title)
+                gh = FakeGh(open_issues=[{'title': title, 'url': 'https://github.com/o/r/issues/5'}])
+                self.assertEqual(0, self.run_wb('follow-up', 'file', '--source', '27', gh=gh))
+                search = next(c for c in gh.calls if c[1:3] == ['issue', 'list'])
+                query = search[search.index('--search') + 1]
+                self.assertTrue(query.startswith('"') and query.endswith('" in:title'), query)
+                self.assertNotIn('"', query[1:-len('" in:title')])      # an embedded quote cannot end the phrase
+                self.assertEqual('https://github.com/o/r/issues/5', self.items()[0]['url'])
+
+    def test_a_nested_source_also_nests(self):
+        # r18 m4
+        self.add('r2-m1')
+        gh = FakeGh(source_labels=['follow-up-nested'])
+        self.run_wb('follow-up', 'file', '--source', '31', gh=gh)
+        create = next(c for c in gh.calls if c[1:3] == ['issue', 'create'])
+        self.assertEqual('follow-up-nested', create[create.index('--label') + 1])
+
     def test_merge_failures_include_the_follow_up_gate(self):
         self.settings(True)
         self.add('r2-m1')
@@ -932,11 +977,12 @@ class AutonomyProse(unittest.TestCase):
                         .read_text(encoding='utf-8').split())
         section = text.split('## Full autonomy')[1].split('## When the implementer is Claude')[0]
         for needle in ['autonomous=true', 'wb.py" follow-up add --key', '--disputed', 'follow-up file --source <N> --pr <P>',
-                       'filed before the merge', 'never lower it below revmux', 'A Major or blocker that ends **disputed** stops',
+                       'filed before the merge', 'never lower it below revmux', 'A Major or blocker **never** may, disputed or not',
                        'merge comment** lists every follow-up URL', 'loop-state done --pr <P> --sha <merged sha>',
                        'never closes on a timeout', 'brakes are unchanged']:
             self.assertIn(needle, section)
-        self.assertIn('deferred **with a filed follow-up issue**', text.split('## Phase 6')[1])
+        self.assertIn('deferred **with a filed follow-up issue**; a Major or blocker never may, disputed or not',
+                      text.split('## Phase 6')[1])
         self.assertIn('loop-state done --pr <P> --sha <sha>` as the very last step', text.split('## Phase 7')[1])
 
 

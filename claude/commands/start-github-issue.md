@@ -52,9 +52,9 @@ all stop you exactly as they do without autonomy.
   It dedupes on the exact title, labels the issue `follow-up` (`follow-up-nested` when this issue is
   itself a follow-up), and adds the planner marker. merge-check refuses while any item is unfiled.
 - **What may be deferred.** After at most three rounds, a remaining Minor or Immaterial finding may
-  be deferred, but only as a filed follow-up. A remaining Major or blocker stops as today. A Major or
-  blocker that ends **disputed** stops too, even with evidence: record it with `--disputed`, and
-  merge-check sends it to the human.
+  be deferred, but only as a filed follow-up. A Major or blocker **never** may, disputed or not: it
+  stops as today. merge-check refuses any Major or blocker review item in follow-ups.json, so record
+  it honestly (with `--disputed` when it ended disputed) and the human decides.
 - **The merge comment** lists every follow-up URL, and every disputed or deferred finding with its
   severity.
 - **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>`, after the
@@ -305,8 +305,9 @@ on, you merge only when **all** of these hold:
 
 1. **The review is clean.** The last revmux round's findings are all fixed and verified, or disputed
    with evidence. None is deferred, and it is within the three-round cap. With full autonomy, a
-   finding may also be deferred **with a filed follow-up issue**, but never a Major one that ended
-   disputed. A round that ended with open findings goes to the human instead.
+   remaining Minor or Immaterial finding may also be deferred **with a filed follow-up issue**; a
+   Major or blocker never may, disputed or not. A round that ended with open findings goes to the
+   human instead.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count.
 3. **merge-check says `ok`.** It checks, read-only: the PR is OPEN, MERGEABLE and CLEAN; no review

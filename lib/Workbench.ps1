@@ -769,7 +769,7 @@ function Resolve-Implementer {
         } else { $tool = $Requested }
     } elseif ($Requested) { $tool = $Requested }
     $autoMerge = [bool]$Config.autoMerge
-    $savedAutoMerge = Get-SavedAutoMerge $Checkout
+    $savedAutoMerge = Get-SavedSetting $Checkout 'autoMerge'
     if ($null -ne $savedAutoMerge) { $autoMerge = $savedAutoMerge }
     if ($null -ne $RequestedAutoMerge) { $autoMerge = [bool]$RequestedAutoMerge }
     $autonomous = [bool]$Config.autonomous
@@ -787,20 +787,12 @@ function Resolve-Implementer {
 }
 
 function Get-SavedSetting([string] $Checkout, [string] $Name) {
-    # A boolean from the checkout's settings record, or $null when it was never decided there.
+    # A boolean from the checkout's settings record, or $null when it was never decided there: a
+    # record from before #23 has no autoMerge key, and that means "the config default applies".
     $path = Get-ImplementerStatePath $Checkout
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     try { $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
     if ($data.$Name -is [bool]) { return $data.$Name }
-    return $null
-}
-
-function Get-SavedAutoMerge([string] $Checkout) {
-    # A record from before #23 has no autoMerge key: that is "not decided", so the config default applies.
-    $path = Get-ImplementerStatePath $Checkout
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
-    if ($data.autoMerge -is [bool]) { return $data.autoMerge }
     return $null
 }
 

@@ -345,13 +345,15 @@ def check_head(pr: dict, head: str) -> list[str]:
 
 
 def check_follow_ups(root: Path) -> list[str]:
-    """Autonomous only (#27): every recorded follow-up is filed, and no Major+ finding ended disputed."""
+    """Autonomous only (#27): every recorded follow-up is filed, and no Major+ review finding is
+    deferred - disputed or not (r18: only Minor/Immaterial findings and plan items may be)."""
     if not checkout_settings(root)["autonomous"]:
         return []
     failures = []
     for item in load_follow_ups(root):
-        if item.get("disputed") and item.get("severity") in SEVERE:
-            failures.append(f"review: the {item['severity']} finding '{item['key']}' ended disputed; an autonomous "
+        if item.get("severity") in SEVERE and str(item.get("origin", "")).startswith("review"):
+            state = "ended disputed" if item.get("disputed") else "is deferred"
+            failures.append(f"review: the {item['severity']} finding '{item['key']}' {state}; an autonomous "
                             "merge stops here and the human decides")
         if not item.get("url"):
             failures.append(f"follow-up: '{item['key']}' is not filed yet - run wb.py follow-up file, then check again")
@@ -402,8 +404,11 @@ def cmd_follow_up_add(args: argparse.Namespace) -> int:
     if item is None:
         item = {"key": args.key}
         items.append(item)
-    elif item.get("url"):
-        print(f"{args.key}: already filed as {item['url']}; not changed")
+    if item.get("url"):
+        # Filed already: the issue stays, but merge-check gates on severity and disputed (r18 m8).
+        item.update(severity=args.severity, origin=args.origin, disputed=bool(args.disputed))
+        save_follow_ups(root, items)
+        print(f"{args.key}: already filed as {item['url']}; severity/origin/disputed updated")
         return 0
     item.update(title=args.title, body=body, severity=args.severity, origin=args.origin, disputed=bool(args.disputed))
     save_follow_ups(root, items)
@@ -437,7 +442,7 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
         print(f"wb: follow-up: cannot read issue #{args.source}: {source.stderr.strip()}", file=sys.stderr)
         return 1
     labels = {label.get("name") for label in json.loads(source.stdout).get("labels", [])}
-    label = NESTED_LABEL if FOLLOW_UP_LABEL in labels else FOLLOW_UP_LABEL
+    label = NESTED_LABEL if labels & {FOLLOW_UP_LABEL, NESTED_LABEL} else FOLLOW_UP_LABEL
     created = gh_run(root, "label", "create", label, "--color", "BFD4F2",
                      "--description", "filed automatically by an agworkbench loop")
     use_label = created.returncode == 0 or "already exists" in (created.stderr or "")
@@ -445,7 +450,9 @@ def cmd_follow_up_file(args: argparse.Namespace) -> int:
         print(f"wb: follow-up: cannot create label '{label}' ({created.stderr.strip()}); filing without it")
     failed = 0
     for item in pending:
-        found = gh_run(root, "issue", "list", "--state", "open", "--search", f"{item['title']} in:title",
+        # A quoted phrase: `-Flag`, `word:`, `#12` or a quote in a title are not search syntax (r18 m9).
+        phrase = '"' + item["title"].replace('"', " ").strip() + '"'
+        found = gh_run(root, "issue", "list", "--state", "open", "--search", f"{phrase} in:title",
                        "--json", "title,url", "--limit", "200")
         if found.returncode != 0:
             print(f"wb: follow-up: search failed for '{item['key']}': {found.stderr.strip()}", file=sys.stderr)
