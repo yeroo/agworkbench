@@ -272,6 +272,31 @@ holding the message ID's publication lock.
 PR. It never approves its own PR and never force-pushes over commits you have reviewed. It never
 merges, unless you opted in for that checkout.
 
+### Full autonomy (opt-in)
+
+`github-workbench <issue> -Autonomous`, `-Queue <spec> -Autonomous`, or `"autonomous": true` in
+`~/.agworkbench.json` lets a loop finish without you:
+- **It merges** behind the auto-merge gate. Autonomy implies auto-merge, and `-NoAutoMerge` on an
+  autonomous checkout is refused.
+- **It files follow-up issues.** Every deferred finding, and every out-of-scope item in the agreed
+  plan, is filed before the merge (`wb.py follow-up`). Titles are deduped exactly. The label is
+  `follow-up`, or `follow-up-nested` for a follow-up's own follow-ups, so a `-Watch label:follow-up`
+  queue chains at most one level. merge-check refuses while any is unfiled.
+- **Disputes have a ceiling.** A Major or blocker finding that ends disputed stops the merge and
+  waits for you. Minor ones may be deferred as follow-ups. The merge comment lists them all with
+  their severity and issue links.
+- **It closes the sessions.** After a MERGED PR, never a closed one, the relay closes nothing until
+  the planner has recorded `wb.py loop-state done`, the implementer has read its last mail, and
+  both panes are unchanged for 30 s with empty composers and no `.git/index.lock`. Then it closes
+  the issue's revmux and review sessions that are back at a shell (a running revdiff stays open and
+  is named), then the issue session, then itself. It only ever touches this repository's
+  workspace. Every step goes to `.workbench/state/relay-close.log`. It never closes on a timeout: it
+  alerts you instead. The checkout stays on disk.
+
+It does not decide plan disagreements for you, delete checkouts, or queue its own follow-ups. To
+stop it, use `-NoAutonomous` on the checkout (read again at close time) or on the queue, a hold
+comment on the PR, or mail through revdiff.
+
 ### Usage limits: automatic failover
 
 When an agent hits its usage limit, **the loop now fails over by default**. The relay reads both
@@ -348,6 +373,7 @@ are trusted.
 | `implementer` | `"codex"` | who runs the right pane (`"codex"` or `"claude"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
+| `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout

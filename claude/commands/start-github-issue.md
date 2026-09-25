@@ -30,6 +30,42 @@ with this line:
 You post with the human's own account, so GitHub cannot tell your words from theirs. The marker is
 how `wb.py merge-check` does: any body without it is treated as the human's.
 
+## Full autonomy (only when `wb.py settings` says `autonomous=true`)
+
+The human turned this on with `-Autonomous`, on the checkout or its queue, or with `"autonomous": true`.
+It implies auto-merge. You finish the loop yourself: merge behind the Phase 6 gate, file follow-up
+issues, and let the relay close the sessions. The brakes are unchanged: a hold on the PR, mail from
+`human` or `github`, a plan disagreement after four rounds, and a refused or incomplete failover
+all stop you exactly as they do without autonomy.
+
+- **Follow-ups are recorded as you go, and filed before the merge.** For every finding you defer, and
+  for every "Out of scope" or "Follow-up" item in the agreed plan, record one item:
+
+  ```bash
+  python "$AGWORKBENCH/lib/wb.py" follow-up add --key r2-m1 --title "<issue title>" --body-file <evidence.md> \
+      --severity minor --origin "review r2"          # add --disputed for a finding that ended disputed
+  ```
+
+  The severity is revmux's, as you verified it. You may raise it, but never lower it below revmux's
+  without saying so in the merge comment.
+  Before merge-check, file them all with `python "$AGWORKBENCH/lib/wb.py" follow-up file --source <N> --pr <P>`.
+  It dedupes on the exact title, labels the issue `follow-up` (`follow-up-nested` when this issue is
+  itself a follow-up), and adds the planner marker. merge-check refuses while any item is unfiled.
+- **What may be deferred.** After at most three rounds, a remaining Minor or Immaterial finding may
+  be deferred, but only as a filed follow-up. A remaining Major or blocker stops as today. A Major or
+  blocker that ends **disputed** stops too, even with evidence: record it with `--disputed`, and
+  merge-check sends it to the human.
+- **The merge comment** lists every follow-up URL, and every disputed or deferred finding with its
+  severity.
+- **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>`, after the
+  Phase 7 steps. It refuses while any follow-up is unfiled. The relay closes nothing until this
+  record exists and the implementer has read your "loop complete" mail. Then it closes:
+  - the helper sessions that are back at a shell;
+  - this issue's session;
+  - itself.
+
+  It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout.
+
 ## When the implementer is Claude
 
 The right pane may run **Claude Code** instead of Codex (`implementer: "claude"` in
@@ -241,7 +277,8 @@ yourself before reviewing it: `git log --oneline origin/<default>..HEAD` and
    (with a reason). Silence on a finding is not an answer. Check the fixes; argue the disputes.
 
 Repeat until a round is clean, or what remains is minor and both of you agree to defer it. At most
-three revmux rounds; after that, what is left goes to the human with both positions.
+three revmux rounds; after that, what is left goes to the human with both positions. With full
+autonomy, a deferred finding is always a recorded and filed follow-up (see "Full autonomy").
 In queue mode, report `wb.py loop-state blocked --reason "review rounds exhausted: <remaining issue>"`
 before ending the turn to wait for the human.
 
@@ -267,8 +304,9 @@ watches it from then on.
 on, you merge only when **all** of these hold:
 
 1. **The review is clean.** The last revmux round's findings are all fixed and verified, or disputed
-   with evidence. None is deferred, and it is within the three-round cap. A round that ended with
-   open findings goes to the human instead.
+   with evidence. None is deferred, and it is within the three-round cap. With full autonomy, a
+   finding may also be deferred **with a filed follow-up issue**, but never a Major one that ended
+   disputed. A round that ended with open findings goes to the human instead.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
    after the push) and the test count.
 3. **merge-check says `ok`.** It checks, read-only: the PR is OPEN, MERGEABLE and CLEAN; no review
@@ -341,7 +379,7 @@ reviews, comments, line comments, the review decision). For each round of it:
 When mail arrives saying the PR was **MERGED**: post a short summary in chat (what shipped, rounds,
 anything deferred), mail Codex that the loop is complete, run
 `python "$AGWORKBENCH/lib/wb.py" status completed`, stop any running background waiter by its task ID,
-and stop. The final note to Codex does not rearm the waiter. If it was **CLOSED** without merging, ask the
+and stop. With full autonomy, run `wb.py loop-state done --pr <P> --sha <sha>` as the very last step. The final note to Codex does not rearm the waiter. If it was **CLOSED** without merging, ask the
 human what they want next. In queue mode first run
 `wb.py loop-state blocked --reason "PR closed"`, set blocked status, and keep the background waiter.
 
