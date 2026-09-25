@@ -2614,5 +2614,323 @@ class AutoMergeLaunch(LauncherFixtures):
         self.assertFalse(self.calls())
 
 
+LIMIT_FRAMES = ROOT / 'tests' / 'fixtures' / 'limits'
+
+
+class FailoverLaunch(LauncherFixtures):
+    """#24: -Failover stops a limited implementer only when provably idle at its limit (or takes an
+    exited one), records the limit, clears the pane and switches through the #20 path. No test stops
+    a real process: the process table and the stop are replaced at their boundary."""
+    body = ClaudeImplementer.body
+    state = ClaudeImplementer.state
+    relay_line = ClaudeImplementer.relay_line
+
+    CODEX_PID, NODE_PID, PANE_PID = 4242, 4241, 4240
+
+    def setUp(self):
+        super().setUp()
+        self.stopped = self.temp / 'stopped.txt'
+        first = self.body()                      # a running Codex loop: left Claude, right Codex, relay
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+
+    def frame(self, name):
+        return (LIMIT_FRAMES / f'{name}.txt').read_text(encoding='utf-8')
+
+    def right(self, text):
+        self.scenario = json.loads(self.scenario_path.read_text(encoding='utf-8'))
+        self.scenario['text'][RIGHT_ID] = text
+        self.scenario['text'][RELAY_ID] = 'PS C:\\relay> '
+        self.save_scenario()
+
+    def relay_record(self, text, age=120):
+        sys.path.insert(0, str(LIB))
+        import limits
+        path = self.checkout / '.workbench/state/relay.json'
+        data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+        data['limits'] = {'codex': {'kind': 'limited', 'tool': 'codex', 'tail': limits.tail_hash(text),
+                                    'since': time.time() - age, 'announced': True}}
+        path.write_text(json.dumps(data), encoding='utf-8')
+
+    def processes(self, *extra):
+        hub = str(self.checkout / '.workbench')
+        table = [dict(ProcessId=self.PANE_PID, ParentProcessId=1, Name='pwsh.exe',
+                      CommandLine=f"pwsh -File pane-codex.ps1 -Checkout '{self.checkout}'"),
+                 dict(ProcessId=self.NODE_PID, ParentProcessId=self.PANE_PID, Name='node.exe',
+                      CommandLine=f"node codex.js -c shell_environment_policy.set.AI_HUB='{hub}'"),
+                 dict(ProcessId=self.CODEX_PID, ParentProcessId=self.NODE_PID, Name='codex.exe',
+                      CommandLine=f"codex.exe -c shell_environment_policy.set.AI_HUB='{hub}' --sandbox workspace-write")]
+        return table + list(extra)
+
+    def failover(self, processes=None, stop_to_shell=True, timing="Stable=90; Confirm=0; Sample=0.3; Step=0.1; ShellWait=2",
+                 lock_after_stop=False, config=None, after_stop='PS C:\\checkout> ', survives=False):
+        table = json.dumps(self.processes() if processes is None else processes)
+        shell_write = ''
+        if stop_to_shell:
+            (self.temp / 'after-stop.txt').write_text(after_stop, encoding='utf-8')
+            shell_write = ("$s = Get-Content -Raw " + ps_quote(self.scenario_path) + " | ConvertFrom-Json; "
+                           "$s.text.'" + RIGHT_ID + "' = [IO.File]::ReadAllText(" + ps_quote(self.temp / 'after-stop.txt') +
+                           ", [Text.Encoding]::UTF8); "
+                           "$s | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 " + ps_quote(self.scenario_path) + "; ")
+        lock = ''
+        if lock_after_stop:
+            lock = "New-Item -ItemType File -Force " + ps_quote(self.checkout / '.git/index.lock') + " | Out-Null; "
+        # A stopped process leaves the table, unless the test says it survives the stop.
+        gone = '' if survives else (" | Where-Object { $stopped = @(); if (Test-Path " + ps_quote(self.stopped) +
+                                    ") { $stopped = @(Get-Content " + ps_quote(self.stopped) + ") }; "
+                                    "$stopped -notcontains [string]$_.ProcessId }")
+        overrides = ("function Get-AgentProcesses { " + ps_quote(table) + " | ConvertFrom-Json" + gone + " }; "
+                     "function Stop-AgentTree([int] $ProcessId) { Add-Content " + ps_quote(self.stopped) +
+                     " $ProcessId; " + shell_write + lock + "}; "
+                     "$script:FailoverTiming = @{ " + timing + " }; ")
+        if config is not None:
+            self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding='utf-8')
+        return ps(self.setup_ps() + overrides +
+                  "function Get-IssueInfo { return @{title='fix-x'; state='OPEN'} }; "
+                  "function New-IssueCheckout { Connect-LaunchLog " + ps_quote(self.log_path) +
+                  "; return @{Dir=" + ps_quote(self.checkout) + "; Branch='issue-7-fix-x'} }; "
+                  "function Grant-CodexTrust {}; function Grant-ClaudeTrust {}; "
+                  "$ok=Invoke-LaunchSafely { Invoke-LauncherBody -Issue 'o/repo#7' -NewSession -Failover }; "
+                  "if (-not $ok) { Write-Output \"EXIT=$($script:Launch.ExitCode)\"; exit 1 }", env=self.env)
+
+    def typed_right(self):
+        # The launch lines are typed with --select; the failover's Clear-Host is not.
+        return [c[3] if c[2] == '--select' else c[2] for c in self.calls()
+                if c[:2] == ['session', 'type'] and c[-1] == RIGHT_ID]
+
+    def stopped_pids(self):
+        return [int(x) for x in self.stopped.read_text(encoding='utf-8-sig').split()] if self.stopped.exists() else []
+
+    def assert_switched_to_claude(self, result):
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        record = self.state('implementer.json')
+        self.assertEqual('claude', record['tool'])
+        self.assertIn('codex', record['limits'])
+        self.assertIn('hit your usage limit', record['limits']['codex']['line'])
+        typed = self.typed_right()
+        self.assertEqual('Clear-Host\n', typed[-2])
+        self.assertIn('pane-implementer-claude.ps1', typed[-1])
+        self.assertEqual(RIGHT_ID, self.state('implementer-claude.json')['pane'])
+        self.assertEqual('claude', self.state('agents.json')['agents']['codex']['tool'])
+        relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
+        self.assertTrue(relay and relay[-1].rstrip().endswith("--implementer-tool 'claude'"), relay)
+        self.assertFalse(any(c[:2] == ['session', 'type'] and c[-1] == MAIN_ID for c in self.calls()))
+
+    def assert_refused(self, result, reason):
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn('EXIT=2', result.stdout)
+        self.assertIn('failover refused: ' + reason, result.stdout)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+        self.assertNotIn('limits', self.state('implementer.json'))
+
+    # --- the paths that switch --------------------------------------------------------------
+
+    def test_an_exited_codex_is_switched_without_stopping_anything(self):
+        self.right(self.frame('codex-limited-exited'))
+        result = self.failover(processes=[])
+        self.assert_switched_to_claude(result)
+        self.assertEqual([], self.stopped_pids())
+
+    def test_a_limited_codex_is_stopped_with_relay_history_and_one_confirming_read(self):
+        text = self.frame('codex-limited-live')
+        self.right(text)
+        self.relay_record(text)
+        result = self.failover(timing="Stable=90; Confirm=0; Sample=60; Step=30; ShellWait=2")
+        self.assert_switched_to_claude(result)
+        self.assertEqual([self.CODEX_PID], self.stopped_pids())    # the agent binary, not node or the pane's pwsh
+        self.assertIn('relay saw this frame unchanged', self.log())
+
+    def test_without_relay_history_the_pane_is_sampled(self):
+        self.right(self.frame('codex-limited-live'))
+        result = self.failover()
+        self.assert_switched_to_claude(result)
+        self.assertIn('sampling the pane', self.log())
+
+    def test_young_relay_history_falls_back_to_sampling(self):
+        text = self.frame('codex-limited-live')
+        self.right(text)
+        self.relay_record(text, age=10)
+        result = self.failover()
+        self.assert_switched_to_claude(result)
+        self.assertIn('sampling the pane', self.log())
+
+    # --- refusals: nothing stopped, nothing recorded -------------------------------------------
+
+    def test_a_working_pane_is_refused(self):
+        self.right(self.frame('codex-working'))
+        self.assert_refused(self.failover(), 'the codex pane is neither showing')
+        self.assertEqual([], self.stopped_pids())
+
+    def test_a_pane_that_changes_while_checked_is_refused(self):
+        self.right(self.frame('codex-limited-reached'))
+        self.scenario['responses'] = [{'args': '^session text --target ' + RIGHT_ID,
+                                       'stdout': self.frame('codex-limited-live'), 'once': True}]
+        self.save_scenario()
+        self.assert_refused(self.failover(), 'the codex pane changed while it was being checked')
+        self.assertEqual([], self.stopped_pids())
+
+    def test_a_git_lock_before_the_stop_is_refused(self):
+        self.right(self.frame('codex-limited-live'))
+        (self.checkout / '.git').mkdir(exist_ok=True)
+        (self.checkout / '.git/index.lock').write_text('', encoding='utf-8')
+        result = self.failover()
+        self.assert_refused(result, "'")
+        self.assertIn("index.lock' exists, so a git command may be running; nothing was stopped", result.stdout)
+        self.assertEqual([], self.stopped_pids())
+
+    def test_a_git_lock_that_appears_is_reported_and_kept(self):
+        self.right(self.frame('codex-limited-live'))
+        (self.checkout / '.git').mkdir(exist_ok=True)
+        result = self.failover(lock_after_stop=True)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn('EXIT=3', result.stdout)
+        self.assertIn('Failover incomplete: failover stopped codex but could not switch', result.stdout)
+        self.assertIn('appeared while it was being stopped', result.stdout)
+        self.assertTrue((self.checkout / '.git/index.lock').exists())
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_not_exactly_one_agent_process_is_refused(self):
+        hub = str(self.checkout / '.workbench')
+        second = dict(ProcessId=5000, ParentProcessId=1, Name='codex.exe',
+                      CommandLine=f"codex.exe -c shell_environment_policy.set.AI_HUB='{hub}'")
+        other_checkout = dict(ProcessId=5001, ParentProcessId=1, Name='codex.exe',
+                              CommandLine="codex.exe -c shell_environment_policy.set.AI_HUB='C:\\elsewhere\\.workbench'")
+        for table, found in (([other_checkout], 0), (self.processes(second), 2)):
+            with self.subTest(found=found):
+                self.right(self.frame('codex-limited-live'))
+                self.assert_refused(self.failover(processes=table), f'expected exactly one codex process for this checkout, found {found}')
+                self.assertEqual([], self.stopped_pids())
+
+    def test_a_pane_that_stays_up_after_the_stop_is_refused(self):
+        self.right(self.frame('codex-limited-live'))
+        result = self.failover(stop_to_shell=False)
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn('EXIT=3', result.stdout)
+        self.assertIn('failover stopped codex but could not switch: the pane showed no shell prompt', result.stdout)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_a_process_that_survives_the_stop_is_reported(self):
+        # r17 M2 (1): the root must be gone before anything else happens.
+        self.right(self.frame('codex-limited-live'))
+        result = self.failover(survives=True)
+        self.assertIn('EXIT=3', result.stdout)
+        self.assertIn(f'process {self.CODEX_PID} is still running', result.stdout)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+
+    def test_a_force_stopped_frame_left_above_the_prompt_still_switches(self):
+        # r17 M2: taskkill /F runs no cleanup, so the dead TUI's rules and footer stay on screen
+        # above the new prompt; Test-ShellReady refuses that until Clear-Host.
+        text = self.frame('codex-limited-live')
+        self.right(text)
+        leftover = text.rstrip('\n') + '\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nPS C:\\checkout> '
+        result = self.failover(after_stop=leftover)
+        self.assert_switched_to_claude(result)
+
+    def test_failover_off_is_refused(self):
+        self.right(self.frame('codex-limited-exited'))
+        self.assert_refused(self.failover(config={'failover': False}), '"failover" is false')
+
+    # --- B4: no bounce ---------------------------------------------------------------------
+
+    def test_a_target_with_a_recorded_limit_is_refused_until_the_human_clears_it(self):
+        self.right(self.frame('codex-limited-exited'))
+        self.assert_switched_to_claude(self.failover(processes=[]))
+        # Claude now hits its limit too: switching back to the still-limited Codex is refused.
+        self.right('PS C:\\checkout> ')
+        result = self.failover(processes=[])
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn('codex was recorded limited', result.stdout)
+        self.assertEqual('claude', self.state('implementer.json')['tool'])
+        # A rerun without any switch keeps the record (the settings record owns it, not the launch).
+        self.assertEqual(0, self.body().returncode)
+        self.assertIn('codex', self.state('implementer.json')['limits'])
+        self.right('PS C:\\checkout> ')             # that rerun started Claude; the human closes it
+        # The human says Codex has reset: an explicit -Implementer codex clears its record.
+        cleared = self.body('codex')
+        self.assertEqual(0, cleared.returncode, cleared.stdout + cleared.stderr)
+        self.assertEqual('codex', self.state('implementer.json')['tool'])
+        self.assertNotIn('limits', self.state('implementer.json'))
+
+    # --- entry and dry run ------------------------------------------------------------------
+
+    def test_entry_refuses_failover_with_a_chosen_tool_or_queue(self):
+        for extra in (['-Implementer', 'claude'], ['-NewSession'], ['-Queue', 'o/repo#7']):
+            with self.subTest(extra=extra):
+                result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                         '-Failover', *extra], env=self.env, cwd=ROOT, capture_output=True,
+                                        text=True, encoding='utf-8', errors='replace', timeout=20)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIn('-Failover picks the other tool itself', result.stdout)
+
+    def test_dry_run_describes_the_failover_and_acts_on_nothing(self):
+        self.cmd('gh', 'echo {"title":"fix-x","state":"OPEN"}\nexit /b 0')
+        before = self.state('implementer.json')
+        calls = len(self.calls())
+        # Run as from a plain terminal: no adoption of this test's (real) caller pane.
+        env = {k: v for k, v in self.env.items() if not k.startswith('AGWINTERM_')}
+        result = subprocess.run([PWSH, '-NoProfile', '-File', str(LIB / 'github-workbench.ps1'), 'o/repo#7',
+                                 '-DryRun', '-Failover'], env=env, cwd=ROOT, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=20)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn('then switch to claude', result.stdout)
+        self.assertEqual(before, self.state('implementer.json'))
+        self.assertEqual(calls, len(self.calls()))
+
+
+class AgentRoots(LauncherFixtures):
+    """#24: which process is the limited agent - the binary itself, found by this checkout's marks."""
+
+    def test_the_pane_frame_reaches_the_classifier_as_utf8_in_both_shells(self):
+        # r17 M3: Windows PowerShell pipes to native programs as US-ASCII by default.
+        frame = LIMIT_FRAMES / 'claude-limited-idle.txt'
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                command = (". ./lib/Workbench.ps1; $before = $OutputEncoding.WebName; "
+                           "$t = [IO.File]::ReadAllText(" + ps_quote(frame) + ", [Text.Encoding]::UTF8); "
+                           "$r = Get-PaneLimit $t claude; \"$($r.kind)|$($before -eq $OutputEncoding.WebName)\"")
+                result = subprocess.run([shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+                                        env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=30)
+                self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                self.assertEqual('limited|True', result.stdout.strip())
+
+    def test_failover_config_is_strictly_boolean(self):
+        for value, ok in ((False, True), (True, True), ('false', False), (0, False)):
+            with self.subTest(value=value):
+                self.config_path.write_text(json.dumps({'failover': value}), encoding='utf-8')
+                result = ps('. ./lib/Workbench.ps1; (Get-WorkbenchConfig).failover', env=self.env)
+                self.assertEqual(ok, result.returncode == 0, result.stdout + result.stderr)
+                if ok:
+                    self.assertEqual(str(value), result.stdout.strip())
+
+    def roots(self, tool, table, identity=None):
+        if identity:
+            path = self.checkout / '.workbench/state/implementer-claude.json'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({'sessionId': identity}), encoding='utf-8')
+        result = ps(". ./lib/Workbench.ps1; function Get-AgentProcesses { " + ps_quote(json.dumps(table)) +
+                    " | ConvertFrom-Json }; @(Find-AgentRoot " + ps_quote(self.checkout) + " '" + tool +
+                    "') | ForEach-Object { $_.ProcessId }", env=self.env)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        return [int(x) for x in result.stdout.split()]
+
+    def test_codex_root_skips_wrappers_and_children(self):
+        hub = str(self.checkout / '.workbench')
+        mark = f"shell_environment_policy.set.AI_HUB='{hub}'"
+        table = [dict(ProcessId=10, ParentProcessId=1, Name='pwsh.exe', CommandLine=f'pwsh -File pane-codex.ps1 {mark}'),
+                 dict(ProcessId=11, ParentProcessId=10, Name='cmd.exe', CommandLine=f'cmd /c codex.cmd {mark}'),
+                 dict(ProcessId=12, ParentProcessId=11, Name='node.exe', CommandLine=f'node codex.js {mark}'),
+                 dict(ProcessId=13, ParentProcessId=12, Name='codex.exe', CommandLine=f'codex.exe {mark}'),
+                 dict(ProcessId=14, ParentProcessId=13, Name='codex.exe', CommandLine=f'codex.exe helper {mark}'),
+                 dict(ProcessId=15, ParentProcessId=13, Name='codex-command-runner.exe', CommandLine=mark)]
+        self.assertEqual([13], self.roots('codex', table))
+
+    def test_claude_root_is_found_by_its_recorded_conversation(self):
+        sid = '77777777-7777-4777-8777-777777777777'
+        table = [dict(ProcessId=20, ParentProcessId=1, Name='pwsh.exe', CommandLine=f'pwsh -File pane-implementer-claude.ps1 --session-id {sid}'),
+                 dict(ProcessId=21, ParentProcessId=20, Name='claude.exe', CommandLine=f'claude.exe --disallowedTools x --resume {sid} "go"'),
+                 dict(ProcessId=22, ParentProcessId=1, Name='claude.exe', CommandLine='claude.exe --session-id 88888888-8888-4888-8888-888888888888')]
+        self.assertEqual([21], self.roots('claude', table, identity=sid))
+        self.assertEqual([], self.roots('claude', table[:1] + table[2:], identity=sid))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,8 @@
+● Bash(python -m unittest tests.test_limits)
+  ⎿  You've hit your session limit
+
+· Hullaballooing… (2m 30s · ↓ 4.9k tokens)
+────────────────────────────────────────────────────────────
+> 
+────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt

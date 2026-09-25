@@ -272,6 +272,29 @@ holding the message ID's publication lock.
 PR. It never approves its own PR and never force-pushes over commits you have reviewed. It never
 merges, unless you opted in for that checkout.
 
+### Usage limits: automatic failover
+
+When an agent hits its usage limit, **the loop now fails over by default**. The relay reads both
+panes every 30 s. It recognises an agent's own limit message by its position, as the last thing
+above an idle composer or right above the shell prompt after the agent exited. Text an agent
+merely printed does not count: a diff, a grep, test output or a file dump. When the relay sees it
+twice in a row, it tells the planner by mail and notifies you. When the limited agent is the
+implementer, the planner runs `github-workbench <issue> -Failover`, which:
+- takes an exited agent as it is. When the agent is still running, it stops it only when the pane
+  has not changed for 90 s, there is no `.git/index.lock`, and exactly one agent process belongs to
+  this checkout. It stops that process tree and never types into the agent;
+- records the limit in the checkout's settings, clears the pane, and starts the other tool there
+  through the `-Implementer` switch;
+- lets the planner hand the work over by mail (`wb.py handover` computes the open request).
+
+A tool with a recorded limit is never switched back to automatically. Once its limit has reset,
+clear it with `github-workbench <issue> -Implementer <tool>`. Codex's "Approaching rate limits"
+chooser is only reported; nobody answers it. The planner's own limit cannot be failed over: you
+get the notification, and the loop waits. Set `"failover": false` to have limits only reported.
+A queue's later members still start with the queue's tool; relaunch the queue with `-Implementer`
+to change that. The limit strings come from the installed binaries
+(`tests/fixtures/limits/`, with the command that extracted them).
+
 ### Auto-merge (opt-in)
 
 `github-workbench <issue> -AutoMerge`, `-Queue <spec> -AutoMerge`, or `"autoMerge": true` in
@@ -324,6 +347,7 @@ are trusted.
 | `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools |
 | `implementer` | `"codex"` | who runs the right pane (`"codex"` or `"claude"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
+| `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the other tool; `false` only reports |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout
@@ -335,7 +359,8 @@ lib/github-workbench.ps1    terminal detection, clone, session, split, relay
 lib/pane-claude.ps1         left pane: claude "/start-github-issue <issue>"
 lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer prompt
 lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/workbench-implementer <issue>"
-lib/relay.py                mail doorbell and PR watcher
+lib/relay.py                mail doorbell and PR watcher; spots usage limits in the agent panes
+lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude
 lib/wb.py                   opens those sessions for Claude with correct Windows paths

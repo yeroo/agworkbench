@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Two jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Three jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -16,8 +16,15 @@ Two jobs, one loop, one process per issue, running in its own visible agwinterm 
    after the saved server-time watch boundary. Older PRs first seen finished are ignored;
    observation survives restarts, and a fully drained PR is retired so a later run can continue.
 
+3. **Usage limits (#24).** Every `--limit-interval` seconds it reads both agent panes and asks
+   `limits.classify` whether the agent there has hit its usage limit. An episode seen on two
+   consecutive reads is mailed to the planner once (sender `relay`), with a blocked status and a
+   notification; mail to a limited implementer is held until the planner fails it over. Checks
+   stop once the PR is finished.
+
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
-relay itself polls the mailbox directory and the GitHub API, which cannot push to it.
+relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
+none of which can push to it.
 
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
@@ -45,12 +52,14 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
+import limits  # noqa: E402
 
 PR_FIELDS = "number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
+LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,11 @@ def now() -> float:
 
 def pause(seconds: float) -> None:
     time.sleep(seconds)
+
+
+def wall() -> float:
+    """Wall-clock seconds, for timestamps that must survive a restart (monotonic ones do not)."""
+    return time.time()
 
 
 @dataclass
@@ -256,7 +270,8 @@ class PrFetch:
 
 class Relay:
     def __init__(self, hub_dir: Path, peers: list[Peer], repo: str, branch: str,
-                 mail_interval: float, pr_interval: float, dry_run: bool = False):
+                 mail_interval: float, pr_interval: float, dry_run: bool = False,
+                 limit_interval: float = 30.0):
         os.environ["AI_HUB"] = str(hub_dir)
         import hub  # noqa: E402 - imported after AI_HUB is set so its paths point at this workbench
         hub.reload_paths()
@@ -267,6 +282,12 @@ class Relay:
         self.branch = branch
         self.mail_interval = mail_interval
         self.pr_interval = pr_interval
+        self.limit_interval = limit_interval
+        # Limit rows already on screen when this relay started (e.g. the old tool's message above
+        # the agent that replaced it): ignored until they leave the pane's tail.
+        self.limit_baseline: dict[str, set[str]] = {}
+        # True once the PR is finished: limit checks stop, so no limit may hold the final notices.
+        self.draining = False
         self.dry_run = dry_run
         self.state_file = hub_dir / "state" / "relay.json"
         self.stop_file = hub_dir / "state" / "relay.stop"
@@ -290,6 +311,14 @@ class Relay:
         if saved_pr and saved_pr.get('state') == 'OPEN' and 'seen_open' not in self.state:
             self.state['seen_open'] = [saved_pr['number']]
             changed = True
+        tools = {peer.box: peer.tool for peer in peers}
+        for box, episode in list(self.state.get('limits', {}).items()):
+            if tools.get(box) != episode.get('tool'):
+                # The box now runs another tool: the failover this episode asked for happened.
+                self.state['limits'].pop(box)
+                changed = True
+        if 'limits' in self.state and not self.state['limits']:
+            self.state.pop('limits')
         if changed and not self.dry_run:
             self._save()
         self.agmsg = HERE / "agmsg.py"
@@ -386,6 +415,96 @@ class Relay:
             self.log(f"cleared hold {peer.box} for {mid}; last reason: {entry.reason}")
         return entry
 
+    # usage limits (#24) -------------------------------------------------------------------------
+    def check_limits(self) -> None:
+        """Classify each pane; an episode seen on LIMIT_READS consecutive reads is announced once."""
+        import agw
+        episodes = dict(self.state.get('limits', {}))
+        changed = False
+        for peer in self.peers:
+            try:
+                text = agw.pane_text(peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.log(f"limit check: cannot read {peer.box}: {err}")
+                continue
+            found = limits.classify(text, peer.tool)
+            episode = episodes.get(peer.box)
+            if peer.box not in self.limit_baseline:
+                continuing = bool(found and episode and episode.get('line') == found.line)
+                self.limit_baseline[peer.box] = {found.line} if found and not continuing else set()
+                if self.limit_baseline[peer.box]:
+                    self.log(f"limit check: ignoring {peer.box}'s limit row already on screen at start: {found.line}")
+            baseline = self.limit_baseline[peer.box]
+            if found and found.line in baseline:
+                found = None
+            elif not found and baseline and not any(line in text for line in baseline):
+                baseline.clear()
+            if found:
+                tail = limits.tail_hash(text)
+                if episode and episode.get('kind') == found.kind:
+                    episode['hits'] = episode.get('hits', 0) + 1
+                    episode['misses'] = 0
+                    if episode.get('tail') != tail:
+                        episode.update(tail=tail, since=wall())
+                else:
+                    episode = episodes[peer.box] = {
+                        'kind': found.kind, 'line': found.line, 'tool': peer.tool,
+                        'firstSeen': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                        'since': wall(), 'tail': tail, 'hits': 1, 'misses': 0, 'announced': False}
+                episode['exited'] = found.exited
+                if episode['hits'] >= LIMIT_READS and not episode['announced']:
+                    if self.dry_run:
+                        self.log(f"[dry-run] would announce usage limit: {peer.box} ({peer.tool}) {found.kind}")
+                    else:
+                        self.announce_limit(peer, episode, text)
+                        episode['announced'] = True
+                changed = True
+            elif episode:
+                episode['misses'] = episode.get('misses', 0) + 1
+                if episode['misses'] >= LIMIT_READS:
+                    episodes.pop(peer.box)
+                    self.log(f"usage limit episode ended for {peer.box}")
+                changed = True
+        if changed:
+            if episodes:
+                self.state['limits'] = episodes
+            else:
+                self.state.pop('limits', None)
+            if not self.dry_run:
+                self._save()
+
+    def announce_limit(self, peer: Peer, episode: dict, text: str) -> None:
+        import agw
+        subject = f"usage limit: {peer.box} ({peer.tool}) {episode['kind']}"
+        rows = [row for row in text.splitlines() if row.strip()][-limits.WINDOW:]
+        if peer.box == 'claude':
+            step = ("The planner itself is limited, so nobody can act on this mail until it can: "
+                    "the human has been notified. The loop waits.")
+        elif episode['kind'] == 'warning':
+            step = ("The implementer shows a usage warning with a chooser. Never answer it: tell the "
+                    "human in one line and set blocked (start-github-issue.md, Usage limits).")
+        else:
+            step = ("The implementer has hit its usage limit"
+                    + (" and exited to a shell" if episode.get('exited') else "")
+                    + ". Follow start-github-issue.md, Usage limits: check the frame below, then fail "
+                    "over with `github-workbench.cmd <issue> -Failover` (Bash timeout 600000).")
+        body = "\n".join([f"Matched: {episode['line']}", f"Pane: {peer.box} ({peer.tool}) {peer.pane}",
+                           f"First seen: {episode['firstSeen']}", "", "Next step: " + step, "",
+                           "Last rows of the pane:", "", "```", *rows, "```"])
+        try:
+            self.hub.write_message(to='claude', sender='relay', kind='note', subject=subject, body=body)
+        except OSError as err:
+            self.log(f"could not file usage-limit mail: {err}")
+        self.log(f"ALERT {subject}: {episode['line']}")
+        try:
+            agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not set blocked status for {peer.box}: {err}")
+        try:
+            agw.notify(peer.pane, f"{subject}: {episode['line']}", title='workbench relay')
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not notify {peer.box}: {err}")
+
     def deliver_mail(self) -> None:
         import agw
         import peerchat
@@ -407,6 +526,11 @@ class Relay:
                 mid = message.get('id', path.stem)
                 if mid in announced or (self.holds.get((peer.box, mid)) and
                                        self.holds[(peer.box, mid)].clear_pending):
+                    continue
+                episode = self.state.get('limits', {}).get(peer.box)
+                if (episode and episode.get('kind') == 'limited' and episode.get('announced')
+                        and not self.draining):
+                    self.hold(peer, mid, 'usage limit')
                     continue
                 try:
                     if peer.tool == "claude" and is_busy(agw.pane_text(peer.pane)):
@@ -452,6 +576,7 @@ class Relay:
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)
+        self.state.pop('limits', None)      # the loop is over; nobody fails over any more
         self.log(f'retired finished PR #{number}; a restart can watch the next PR')
         if not self.dry_run:
             self._save()
@@ -669,16 +794,22 @@ class Relay:
         # Replayed mail might already be read. Still finish this saved watch without polling
         # GitHub again; the drain will immediately retire it if no delivery or reset remains.
         drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT if saved_terminal else None
+        self.draining = drain_deadline is not None
         if drain_deadline is not None:
             if self.dry_run:
                 self.log('[dry-run] saved PR is finished; no final mail filed')
                 return 0
             self.log('saved PR is finished; resuming final notice drain')
+        next_limit = 0.0
         while True:
             if self.stop_file.exists():
                 self.log("stop file found; exiting")
                 return 0
             published = self.flush_outbox()
+            if drain_deadline is None and now() >= next_limit:
+                # After a merge or close only the final notices matter; nobody fails over then.
+                next_limit = now() + self.limit_interval
+                self.check_limits()
             self.deliver_mail()
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()
@@ -706,6 +837,7 @@ class Relay:
                         self.log('[dry-run] PR is finished; no final mail filed')
                         return 0
                     drain_deadline = now() + TERMINAL_DRAIN_TIMEOUT
+                    self.draining = True
                     self.log('PR is finished; draining final notices before exit')
                     if not self.state.get('outbox'):
                         continue
@@ -726,6 +858,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--branch", required=True)
     parser.add_argument("--mail-interval", type=float, default=5.0)
     parser.add_argument("--pr-interval", type=float, default=60.0)
+    parser.add_argument("--limit-interval", type=float, default=30.0,
+                        help="seconds between usage-limit checks of each pane (#24)")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -740,7 +874,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     peers = peers_for(args)
     relay = Relay(Path(args.hub), peers, args.repo, args.branch, args.mail_interval,
-                  args.pr_interval, dry_run=args.dry_run)
+                  args.pr_interval, dry_run=args.dry_run, limit_interval=args.limit_interval)
     try:
         return relay.run()
     except KeyboardInterrupt:

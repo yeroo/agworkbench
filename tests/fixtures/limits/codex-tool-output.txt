@@ -1,0 +1,7 @@
+• Ran grep -rn "hit your usage limit" lib
+  └ lib/limits.py:40: You’ve hit your usage limit.
+    You’ve hit your usage limit.
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol high · 100% left · ~\source\workbench\repo-issue-7

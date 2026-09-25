@@ -1915,5 +1915,148 @@ class ClaudeImplementer(DeliveryFixture):
         self.assertEqual('half a line', self.r.holds[('codex', 'm1')].ambiguous_text)
 
 
+LIMIT_FIXTURES = Path(__file__).resolve().parent / 'fixtures' / 'limits'
+
+
+def limit_frame(name):
+    return (LIMIT_FIXTURES / f'{name}.txt').read_text(encoding='utf-8')
+
+
+class UsageLimits(DeliveryFixture):
+    """#24: the relay recognises a limited pane, tells the planner once, and holds its mail."""
+
+    def setUp(self):
+        super().setUp()
+        self.r.hub.write_message = Mock(return_value=Path('limit.md'))
+        self.clock = 1000.0
+        self.enterContext(patch.object(relay, 'wall', lambda: self.clock))
+        self.pane.return_value = limit_frame('codex-limited-live')
+        # A relay that was already up when the limit appeared; the startup baseline has its own test.
+        self.r.limit_baseline = {'codex': set(), 'claude': set()}
+
+    def check(self, frame=None, times=1):
+        if frame is not None:
+            self.pane.return_value = limit_frame(frame) if not frame.startswith('\n') else frame
+        for _ in range(times):
+            self.clock += 30
+            self.r.check_limits()
+
+    def mails(self):
+        return [c.kwargs for c in self.r.hub.write_message.call_args_list]
+
+    def test_two_reads_announce_one_mail_status_and_notification(self):
+        self.check()
+        self.assertEqual([], self.mails())
+        self.check()
+        self.assertEqual(1, len(self.mails()))
+        mail = self.mails()[0]
+        self.assertEqual(('claude', 'relay', 'note', 'usage limit: codex (codex) limited'),
+                         (mail['to'], mail['sender'], mail['kind'], mail['subject']))
+        self.assertIn("hit your usage limit", mail['body'])
+        self.assertIn('-Failover', mail['body'])
+        self.assertIn('Ask Codex to do anything', mail['body'])      # the frame's last rows
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id=self.peer.pane)
+        self.notify.assert_called_once()
+        self.check(times=3)
+        self.assertEqual(1, len(self.mails()))
+        episode = self.r.state['limits']['codex']
+        self.assertEqual(('limited', 'codex', True), (episode['kind'], episode['tool'], episode['announced']))
+
+    def test_the_episode_survives_a_restart_without_a_second_mail(self):
+        self.use_disk_state()
+        self.check(times=2)
+        self.restart_from_disk()
+        self.r.hub.write_message = Mock()
+        self.check(times=3)                          # the saved episode continues; no baseline
+        self.r.hub.write_message.assert_not_called()
+
+    def test_an_episode_ends_after_two_clean_reads_and_a_later_one_is_announced_again(self):
+        self.check(times=2)
+        self.check('codex-auto-switched')
+        self.assertIn('codex', self.r.state['limits'])
+        self.check('codex-auto-switched')
+        self.assertNotIn('limits', self.r.state)
+        self.check('codex-limited-live', times=2)
+        self.assertEqual(2, len(self.mails()))
+
+    def test_the_stable_since_time_follows_the_tail(self):
+        self.check(times=2)
+        since = self.r.state['limits']['codex']['since']
+        self.check()
+        self.assertEqual(since, self.r.state['limits']['codex']['since'])
+        self.check('codex-limited-reached')          # same kind, a different screen
+        self.assertGreater(self.r.state['limits']['codex']['since'], since)
+
+    def test_a_limited_peer_is_held_not_rung(self):
+        self.check(times=2)
+        self.tick(0)
+        self.send.assert_not_called()
+        self.assertEqual('usage limit', self.r.holds[('codex', 'm1')].reason)
+
+    def test_the_final_notices_are_not_held_for_a_limit_once_the_pr_is_finished(self):
+        # r17 m2: limit checks stop during the drain, so a limit must not hold its mail either.
+        self.check(times=2)
+        self.r.draining = True
+        self.tick(0)
+        self.send.assert_called_once()
+        self.r.state['pr'] = {'number': 7, 'state': 'MERGED'}
+        self.r.retire(7)
+        self.assertNotIn('limits', self.r.state)
+
+    def test_a_warning_is_announced_but_mail_is_not_held_for_it(self):
+        self.check('codex-warning-chooser', times=2)
+        self.assertEqual('usage limit: codex (codex) warning', self.mails()[0]['subject'])
+        self.assertIn('Never answer it', self.mails()[0]['body'])
+        self.pane.return_value = CODEX_IDLE
+        self.tick(0)
+        self.send.assert_called_once()
+
+    def test_a_limit_row_already_on_screen_at_start_is_ignored_until_it_leaves(self):
+        self.peer = relay.Peer('codex', 'claude', 'codex-pane')
+        self.r.peers = [self.peer]
+        self.r.limit_baseline = {}                   # this relay has just started
+        self.check('claude-limited-idle', times=3)
+        self.assertEqual([], self.mails())
+        self.check(CLAUDE_IDLE if CLAUDE_IDLE.startswith('\n') else '\n' + CLAUDE_IDLE)
+        self.check('claude-limited-idle', times=2)
+        self.assertEqual(['usage limit: codex (claude) limited'], [m['subject'] for m in self.mails()])
+
+    def test_a_tool_change_drops_the_old_episode_on_restart(self):
+        self.use_disk_state()
+        self.check(times=2)
+        previous = self.r
+        with patch.dict(os.environ), patch.object(hub, 'reload_paths'):
+            self.r = relay.Relay(previous.hub_dir, [relay.Peer('codex', 'claude', 'codex-pane')], previous.repo,
+                                 previous.branch, 5, 60)
+        self.assertNotIn('limits', self.r.state)
+
+    def test_the_planners_own_limit_only_alerts(self):
+        self.peer = relay.Peer('claude', 'claude', 'claude-pane')
+        self.r.peers = [self.peer]
+        self.r.limit_baseline['claude'] = set()
+        self.check('claude-limited-idle', times=2)
+        mail = self.mails()[0]
+        self.assertEqual('usage limit: claude (claude) limited', mail['subject'])
+        self.assertIn('The planner itself is limited', mail['body'])
+        self.notify.assert_called_once()
+
+    def test_dry_run_neither_mails_nor_saves(self):
+        self.r.dry_run = True
+        self.check(times=3)
+        self.assertEqual([], self.mails())
+        self.r._save.assert_not_called()
+        self.status.assert_not_called()
+
+    def test_unreadable_pane_is_skipped(self):
+        self.pane.side_effect = agw.CtlError('gone')
+        self.check(times=2)
+        self.assertEqual([], self.mails())
+
+    def test_cli_takes_a_limit_interval(self):
+        args = relay.build_parser().parse_args(['--hub', 'h', '--claude-pane', 'a', '--codex-pane', 'b', '--repo', 'o/r',
+                                                '--branch', 'x', '--limit-interval', '12'])
+        self.assertEqual(12.0, args.limit_interval)
+
+
 if __name__ == "__main__":
     unittest.main()

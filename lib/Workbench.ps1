@@ -12,6 +12,12 @@ class ImplementerConflict : System.Exception {
     ImplementerConflict([string] $Message) : base($Message) {}
 }
 
+class FailoverIncomplete : System.Exception {
+    # A failover that got past its point of no return (the limit recorded, or the agent stopped)
+    # but could not switch. Unlike a refusal, it did change something: exit 3.
+    FailoverIncomplete([string] $Message) : base($Message) {}
+}
+
 function Write-Step([string] $Text) { Write-LaunchLog step $Text; Write-Host "  $Text" -ForegroundColor DarkGray }
 function Write-Done([string] $Text) { Write-LaunchLog done $Text; Write-Host "  $Text" -ForegroundColor Green }
 
@@ -73,6 +79,11 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
             Write-Host "Implementer switch refused: $($failure.Exception.Message)" -ForegroundColor Yellow
             return $false
         }
+        if ($failure.Exception -is [FailoverIncomplete]) {
+            $script:Launch.ExitCode = 3
+            Write-Host "Failover incomplete: $($failure.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
         $script:Launch.ExitCode = 1
         # Logging must not turn an empty failed-clone target into a non-empty one.
         if ($script:LaunchLog -and -not $script:LaunchLog.Path -and $script:Launch.Checkout -and
@@ -102,14 +113,15 @@ function Get-WorkbenchConfig {
          implementer    who runs in the right pane: codex (default) or claude
          revmuxProfile  revmux profile for review rounds (default: comprehensive with codex,
                         claude-only with claude)
-         autoMerge      let the planner merge its own PR when every condition holds (default false) #>
+         autoMerge      let the planner merge its own PR when every condition holds (default false)
+         failover       switch the implementer to the other tool when it hits its usage limit (default true) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
-                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false }
+                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -120,6 +132,7 @@ function Get-WorkbenchConfig {
         throw "revmuxProfile in '$path' must be a revmux profile name (got '$($config.revmuxProfile)')"
     }
     if ($config.autoMerge -isnot [bool]) { throw "autoMerge in '$path' must be true or false (got '$($config.autoMerge)')" }
+    if ($config.failover -isnot [bool]) { throw "failover in '$path' must be true or false (got '$($config.failover)')" }
     return $config
 }
 
@@ -773,6 +786,8 @@ function Save-Implementer([string] $Checkout, $Resolved) {
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
+            # Recorded usage limits (#24) belong to the checkout, not to this launch: keep them.
+            if ($current.limits) { $record | Add-Member -NotePropertyName limits -NotePropertyValue $current.limits }
             if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile -and
                 $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
@@ -784,6 +799,181 @@ function Save-Implementer([string] $Checkout, $Resolved) {
 function Format-AutoMerge([bool] $Value) {
     if ($Value) { return 'on' }
     return 'off'
+}
+
+# --- usage-limit failover (#24) ---------------------------------------------------------------
+
+# Seconds. Tests shorten them; the planner's Bash call runs with a 600 s timeout for the fallback.
+$script:FailoverTiming = @{ Stable = 90; Confirm = 5; Sample = 90; Step = 10; ShellWait = 20 }
+
+function Get-ImplementerLimits([string] $Checkout) {
+    $limits = @{}
+    $path = Get-ImplementerStatePath $Checkout
+    if (-not (Test-Path -LiteralPath $path)) { return $limits }
+    try { $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json } catch { return $limits }
+    if ($data.limits) { foreach ($entry in $data.limits.PSObject.Properties) { $limits[$entry.Name] = $entry.Value } }
+    return $limits
+}
+
+function Set-ImplementerLimit([string] $Checkout, [string] $Tool, $Entry) {
+    # $Entry $null clears that tool's record (an explicit -Implementer <tool> by the human).
+    $path = Get-ImplementerStatePath $Checkout
+    if (-not (Test-Path -LiteralPath $path)) { if ($null -eq $Entry) { return }; throw "no settings record at '$path'" }
+    $data = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
+    $limits = [ordered]@{}
+    if ($data.limits) { foreach ($item in $data.limits.PSObject.Properties) { $limits[$item.Name] = $item.Value } }
+    if ($null -eq $Entry) {
+        if (-not $limits.Contains($Tool)) { return }
+        $limits.Remove($Tool)
+        Write-Step "implementer: cleared the recorded usage limit for $Tool"
+    } else { $limits[$Tool] = $Entry }
+    $data.PSObject.Properties.Remove('limits')
+    if ($limits.Count) { $data | Add-Member -NotePropertyName limits -NotePropertyValue ([pscustomobject]$limits) }
+    Write-AtomicJson $path $data
+}
+
+function Get-PaneLimit([string] $Text, [string] $Tool) {
+    # The relay's classifier, so the launcher and the relay can never disagree about a frame.
+    # Windows PowerShell pipes to native programs in $OutputEncoding, US-ASCII by default: every
+    # glyph and typographic apostrophe would reach limits.py as '?'. Pipe UTF-8 (no BOM) for this
+    # one call, as Invoke-Ctl does for the console. Windows PowerShell reads the GLOBAL variable
+    # for native pipes (a function-local assignment is ignored there), so set and restore that.
+    $previous = $global:OutputEncoding
+    try {
+        $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false
+        $json = $Text | & python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
+    } finally { $global:OutputEncoding = $previous }
+    if ($LASTEXITCODE -ne 0) { throw "limits.py could not classify the $Tool pane" }
+    return ($json | ConvertFrom-Json)
+}
+
+function Get-AgentProcesses {
+    # The process-table boundary; tests replace it.
+    return @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine)
+}
+
+function Stop-AgentTree([int] $ProcessId) {
+    # The stop boundary; tests replace it. The tree is the agent and its helpers, never the pane's shell.
+    & taskkill.exe /T /F /PID $ProcessId | Out-Null
+}
+
+function Find-AgentRoot([string] $Checkout, [string] $Tool) {
+    <# The limited agent's own executable, found by what only this checkout's launch put on its
+       command line. Wrappers (codex.cmd, node, the pane's pwsh) never match: the name must be the
+       agent binary itself, and a match whose parent also matched is not a root. #>
+    $processes = @(Get-AgentProcesses)
+    if ($Tool -eq 'codex') {
+        $needle = "shell_environment_policy.set.AI_HUB='" + (Join-Path $Checkout '.workbench') + "'"
+        $matched = @($processes | Where-Object { $_.Name -eq 'codex.exe' -and $_.CommandLine -and
+            $_.CommandLine.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+    } else {
+        $id = Get-RecordedClaudeSessionId $Checkout 'implementer'
+        if (-not $id) { return @() }
+        $pattern = '--(session-id|resume)[\s=]+"?' + [regex]::Escape($id)
+        $matched = @($processes | Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -match $pattern })
+    }
+    $ids = @($matched | ForEach-Object { $_.ProcessId })
+    return @($matched | Where-Object { $ids -notcontains $_.ParentProcessId })
+}
+
+function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, $Seen) {
+    <# A limited agent is idle, so its pane does not change. Use the relay's record when it has one
+       (the same tail for at least Stable seconds) plus one confirming read; otherwise sample the
+       pane for Sample seconds. Any change or any non-limit frame refuses. #>
+    $timing = $script:FailoverTiming
+    $relay = $null
+    $relayPath = Join-Path $Checkout '.workbench\state\relay.json'
+    if (Test-Path -LiteralPath $relayPath) {
+        try { $relay = (Get-Content -Raw -LiteralPath $relayPath | ConvertFrom-Json).limits.codex } catch { $relay = $null }
+    }
+    $nowSeconds = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+    $reads = @()
+    if ($relay -and $relay.kind -eq 'limited' -and $relay.tail -eq $Seen.tail -and $relay.since -and
+        ($nowSeconds - [double]$relay.since) -ge $timing.Stable) {
+        Write-LaunchLog failover "relay saw this frame unchanged for $([math]::Round($nowSeconds - [double]$relay.since))s; confirming once"
+        Start-Sleep -Milliseconds ([int]($timing.Confirm * 1000))
+        $reads = @(1)
+    } else {
+        Write-LaunchLog failover "no usable relay record; sampling the pane for $($timing.Sample)s"
+        $reads = @(1..([math]::Max(1, [math]::Ceiling($timing.Sample / [double]$timing.Step))))
+    }
+    foreach ($read in $reads) {
+        if ($reads.Count -gt 1) { Start-Sleep -Milliseconds ([int]($timing.Step * 1000)) }
+        $again = Get-PaneLimit (Invoke-Ctl session text --target $Pane) $Tool
+        if ($again.kind -ne 'limited' -or $again.tail -ne $Seen.tail) {
+            throw [ImplementerConflict]::new("failover refused: the $Tool pane changed while it was being checked; it is not idle at its limit")
+        }
+    }
+}
+
+function Invoke-Failover {
+    <# Stops a limited implementer (only when it is provably idle at its limit) or accepts an exited
+       one, records the limit, clears the pane, and returns the tool to switch to. A refusal is an
+       [ImplementerConflict] (exit 2) and happens before anything is stopped or written. A failure
+       after that point is a [FailoverIncomplete] (exit 3): the human relaunches with -Implementer. #>
+    param([string] $Checkout, $Config, $Tree)
+    if (-not $Config.failover) { throw [ImplementerConflict]::new('failover refused: "failover" is false in ~/.agworkbench.json') }
+    $saved = Get-SavedImplementerTool $Checkout
+    if (-not $saved) { throw [ImplementerConflict]::new('failover refused: this checkout has no recorded implementer') }
+    $target = 'claude'
+    if ($saved -eq 'claude') { $target = 'codex' }
+    $recorded = Get-ImplementerLimits $Checkout
+    if ($recorded.ContainsKey($target)) {
+        throw [ImplementerConflict]::new("failover refused: $target was recorded limited at $($recorded[$target].at) ('$($recorded[$target].line)'). Once it has reset, the human clears that with: github-workbench <issue> -Implementer $target")
+    }
+    $pane = $null
+    $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
+    if (Test-Path -LiteralPath $registryPath) {
+        try { $pane = (Get-Content -Raw -LiteralPath $registryPath | ConvertFrom-Json).agents.codex.pane } catch { $pane = $null }
+    }
+    if (-not $pane -or -not (Find-SessionByPane $Tree $pane)) {
+        throw [ImplementerConflict]::new("failover refused: the implementer pane '$pane' is not in the terminal")
+    }
+    $text = Invoke-Ctl session text --target $pane
+    $seen = Get-PaneLimit $text $saved
+    $lock = Join-Path $Checkout '.git\index.lock'
+    if (-not (Test-ShellReady $text)) {
+        if ($seen.kind -ne 'limited') {
+            throw [ImplementerConflict]::new("failover refused: the $saved pane is neither showing its own usage-limit message nor at a shell prompt")
+        }
+        Confirm-PaneStable $Checkout $pane $saved $seen
+        if (Test-Path -LiteralPath $lock) {
+            throw [ImplementerConflict]::new("failover refused: '$lock' exists, so a git command may be running; nothing was stopped")
+        }
+        $roots = @(Find-AgentRoot $Checkout $saved)
+        if ($roots.Count -ne 1) {
+            $list = ($roots | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '
+            throw [ImplementerConflict]::new("failover refused: expected exactly one $saved process for this checkout, found $($roots.Count)$(if ($list) { ": $list" }); nothing was stopped")
+        }
+        $rootId = [int]$roots[0].ProcessId
+        Write-Step "failover: stopping the limited $saved (process $rootId) - '$($seen.line)'"
+        Stop-AgentTree $rootId
+        $incomplete = "failover stopped $saved but could not switch"
+        $deadline = (Get-Date).AddSeconds($script:FailoverTiming.ShellWait)
+        while (@(Get-AgentProcesses | Where-Object { [int]$_.ProcessId -eq $rootId }).Count) {
+            if ((Get-Date) -ge $deadline) { throw [FailoverIncomplete]::new("${incomplete}: process $rootId is still running $($script:FailoverTiming.ShellWait)s after the stop") }
+            Start-Sleep -Milliseconds 200
+        }
+        # A force-stopped inline TUI runs no cleanup: its last frame (rules, footer) stays above the
+        # new prompt, which Test-ShellReady rightly refuses. Wait for the plain prompt row first;
+        # Clear-Host below then has to produce a clean shell.
+        if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait)) {
+            throw [FailoverIncomplete]::new("${incomplete}: the pane showed no shell prompt within $($script:FailoverTiming.ShellWait)s")
+        }
+        if (Test-Path -LiteralPath $lock) {
+            throw [FailoverIncomplete]::new("${incomplete}: '$lock' appeared while it was being stopped. It was not deleted: check the repository, then run github-workbench <issue> -Implementer $target")
+        }
+    } else { $incomplete = 'failover could not switch' }
+    $line = $seen.line
+    if (-not $line) { $line = '(the pane was already at a shell prompt)' }
+    Set-ImplementerLimit $Checkout $saved ([pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); line = $line })
+    # The old tool's limit text must not greet the new agent: its relay would read it as its own.
+    Invoke-Ctl session type "Clear-Host`n" --target $pane | Out-Null
+    if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
+        throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> -Implementer $target once it is")
+    }
+    Write-Step "failover: $saved -> $target"
+    return $target
 }
 
 function Get-ImplementerName([string] $Tool) {
@@ -1464,7 +1654,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
-          [string] $Implementer, $AutoMerge = $null)
+          [string] $Implementer, $AutoMerge = $null, [switch] $Failover)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -1544,6 +1734,13 @@ function Invoke-LauncherBody {
         }
         Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
+        if ($Failover) {
+            $target = 'claude'
+            if ($resolved.Tool -eq 'claude') { $target = 'codex' }
+            Write-Step "failover: would check the right pane, stop the limited $($resolved.Tool) only if it is idle at its limit (or accept a shell), record the limit, clear the pane, then switch to $target"
+            if (-not $config.failover) { Write-Step 'failover: would refuse: "failover" is false' }
+            if ((Get-ImplementerLimits $co.Dir).ContainsKey($target)) { Write-Step "failover: would refuse: $target has a recorded limit" }
+        }
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
         if ($resolved.Tool -ne 'codex') { $relayTool = " --implementer-tool $($resolved.Tool)" }
@@ -1559,10 +1756,18 @@ function Invoke-LauncherBody {
     }
     Invoke-WithCheckoutLock $co.Dir {
         # Decided before any pin, identity or registry change, so a refused switch changes nothing.
+        # (A -Failover that reaches its stop has changed something; its failures exit 3, not 2.)
         Set-LaunchStage implementer
+        if ($Failover) {
+            Set-LaunchStage failover
+            $Implementer = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
+            Set-LaunchStage implementer
+        }
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         Save-Implementer $co.Dir $resolved
+        # The human choosing a tool explicitly says its limit has reset (#24).
+        if ($Implementer -and -not $Failover) { Set-ImplementerLimit $co.Dir $Implementer $null }
         $script:Launch.ImplementerTool = $resolved.Tool
         $lines = & $implementerLines $resolved.Tool
         $codexLaunch = $lines.Launch
