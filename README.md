@@ -434,8 +434,17 @@ merges, unless you opted in for that checkout.
   itself close only once the planner has recorded `wb.py loop-state done`, the implementer has
   read its last mail, and both panes are unchanged for 30 s with empty composers and no
   `.git/index.lock`. It only ever touches this repository's workspace. Every step goes to
-  `.workbench/state/relay-close.log`. It never closes on a timeout: it alerts you instead. The
-  checkout stays on disk.
+  `.workbench/state/relay-close.log`. It never closes on a timeout: it alerts you instead.
+- **It deletes the checkout** (#41, config `cleanup`, default `merged`). Once the issue session is
+  closed, a detached `lib/cleanup.py after-close` waits (up to 10 minutes) until no `#N` session is
+  left in the repo's workspace, then deletes the clone, but only when it is safe: nothing
+  uncommitted, untracked or stashed, no linked worktree, no `.git/index.lock`, no launcher or queue
+  still using it, and every local commit on a remote-tracking ref or inside the merged PR's head.
+  Otherwise the checkout stays and the reason is logged. The delete renames the directory to
+  `<name>-issue-<N>.deleting-<ts>` first, which Windows refuses while anything holds a file or its
+  cwd inside it. Every decision goes to `<checkoutRoot>/.agworkbench-cleanup.log`; a refusal also
+  goes to the checkout's `relay-close.log`. `"cleanup": "build"` deletes only `target/`,
+  `node_modules/`, `bin/` and `obj/` directories holding no tracked file; `"off"` keeps everything.
 
 How the close proves each thing (#33):
 - **Agents:** every Claude the workbench launches (planner and implementer) starts with prompt
@@ -459,9 +468,32 @@ How the close proves each thing (#33):
 - **Members launched before this fix** still have suggestions on, so their relays keep holding the
   doorbell. Once such a loop has recorded `wb.py loop-state done`, close its sessions by hand.
 
-It does not decide plan disagreements for you, delete checkouts, or queue its own follow-ups. To
+It does not decide plan disagreements for you, delete an unmerged checkout, or queue its own follow-ups. To
 stop it, use `-NoAutonomous` on the checkout (read again at close time) or on the queue, a hold
 comment on the PR, or mail through revdiff.
+
+### Cleaning up checkouts
+
+Every issue gets a full clone under `checkoutRoot`, and a Rust or Node build can make one many GB.
+An autonomous loop deletes its own checkout after the merge (above). For every other checkout:
+
+```
+github-workbench -Cleanup -DryRun                 # candidate <path> <size> / keep <path>: <why> / skip <path>: <why>
+github-workbench -Cleanup                         # delete the candidates that pass the checks
+github-workbench -Cleanup -Repo yeroo/docxy -BuildOnly   # only their build outputs
+```
+
+A checkout is a candidate when its issue is closed, or its branch has a merged or closed PR and no
+open one. Each candidate gets the same checks as the autonomous delete, and the sweep refuses them
+all when the session tree cannot be read (run it inside agwinterm). Leftover `*.deleting-*`
+directories from an interrupted delete are removed. It exits 0, 1 when it kept a candidate for a
+safety reason, and 2 on a usage or GitHub error.
+
+**The queue's disk guard.** Before admitting a member, the conductor checks the free space on the
+drive of `checkoutRoot` against `minFreeGB` (default 20, in GiB as Explorer shows them; 0 turns it
+off). Below it the queue admits nothing, no member changes state, the queue file gets
+`diskPaused: "low disk: ..."`, and its session shows blocked with a notification. The next tick
+checks again and resumes when there is space.
 
 ### Usage limits: automatic failover
 
@@ -557,6 +589,8 @@ are trusted.
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "..."}}`, the private spec repos `-Triage` judges against (see Issue triage) |
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
+| `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
+| `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout
@@ -571,6 +605,7 @@ lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/wo
 lib/relay.py                mail doorbell and PR watcher; spots usage limits in the agent panes
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
 lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
+lib/cleanup.py              deletes finished checkouts: after an autonomous close, and -Cleanup (#41)
 lib/triage.py               priority labels for a product repo's issues, from its private spec repos (#34)
 lib/labelquery.py           the boolean label query behind -Queue 'where: ...' (#38)
 lib/helper_done.py          a helper session's completion marker (#33)
