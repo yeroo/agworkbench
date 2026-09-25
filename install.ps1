@@ -14,6 +14,7 @@
   Then the workbench itself:
     ~/.claude/commands/start-github-issue.md     the /start-github-issue slash command
     ~/.claude/commands/workbench-implementer.md  Claude's side of the loop when "implementer" is "claude"
+    ~/.claude/commands/triage-issue.md           the issue triage judgment (-Triage)
     ~/.codex/skills/workbench-implementer/       Codex's side of the loop
     this folder on your user PATH                so `github-workbench` works in cmd and PowerShell
     ~/.agworkbench.json                          created with defaults if it does not exist
