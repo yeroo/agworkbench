@@ -479,7 +479,7 @@ a clean-reviewed PR cannot merge yet itself. merge-check names each one:
 
 | line | what happens |
 |---|---|
-| `ci-pending:` | Required checks are still running (a check that never started counts too). `wb.py wait-ci` waits in the background, and the check runs again when CI is done. It never counts a head without any check yet as done: a repo with no CI at all is "done" only after 5 minutes of no checks. |
+| `ci-pending:` | Checks are still running, required or optional (a check that never started counts too); a failure is reported only once nothing runs. `wb.py wait-ci` waits in the background, and the check runs again when CI is done. It never counts a head without any check yet as done: a repo with no CI at all is "done" only after 5 minutes of no checks. |
 | `ci-failed:` | A required check failed. A GitHub Actions run is rerun once (`wb.py ci-rerun`). If it is still red, one fix round follows, with the failed jobs' log (`wb.py ci-log`) as evidence. If it is still red after that, it's yours. |
 | `behind:` / `conflict:` | An **UPDATE round**. The planner fetches, and the implementer merges exactly that base commit into the branch with `git merge --no-ff`: never a rebase, never a force-push, and nothing else in the merge. It runs the whole suite. `wb.py update-check` then proves the result is one merge commit of that base onto the reviewed head, with a clean tree. If `git show --remerge-diff` is empty, the merge is clean. If not, the resolution is reviewed like a fix. |
 | `ci-optional-failed:` and everything else | Final: the PR waits for you. |
