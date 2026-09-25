@@ -459,7 +459,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     repo, numbers, label = resolve_spec(expand_spec(spec, config_path()), repo, gh)
     matches = len(numbers)
     if watch and not label:
-        raise UsageError('-Watch requires a label spec')
+        raise UsageError('-Watch requires a label:, bugs or where: spec')
     root = Path(root or os.environ.get('AGWORKBENCH_QUEUE_ROOT', Path.home() / '.agworkbench/queues')).resolve()
     store = Store(root / (repo + '.json'))
     if parallel is not None and not 1 <= parallel <= 8:

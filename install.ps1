@@ -17,6 +17,7 @@
     ~/.claude/commands/triage-issue.md           the issue triage judgment (-Triage)
     ~/.codex/skills/workbench-implementer/       Codex's side of the loop
     this folder on your user PATH                so `github-workbench` works in cmd and PowerShell
+    github-workbench.ps1 in this folder           PowerShell's entry point (when it may run local scripts)
     ~/.agworkbench.json                          created with defaults if it does not exist
 
   Anything that installs software asks first, unless you pass -Yes.
@@ -131,6 +132,7 @@ foreach ($skill in Get-ChildItem -Directory (Join-Path $PSScriptRoot 'codex\skil
 }
 
 Add-UserPath $PSScriptRoot
+Install-PowerShellEntry $PSScriptRoot | Out-Null
 
 $configPath = Join-Path $HOME '.agworkbench.json'
 if (-not (Test-Path -LiteralPath $configPath)) {

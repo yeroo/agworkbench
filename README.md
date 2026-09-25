@@ -128,10 +128,16 @@ github-workbench -Queue "where: label IN [bug, regression] AND NOT 'needs design
   one watched spec. The same query spelled differently (case, spaces, quotes, redundant
   parentheses) counts as the same, but other logic does not, even if it is equivalent (`a AND b`
   vs `b AND a`, `label IN [a]` vs `a`), and neither does a `label:` spec.
-- **Windows PowerShell 5.1:** it strips double quotes from a program's arguments, so the launcher
-  hands the spec to the conductor through the environment (`AGWORKBENCH_QUEUE_SPEC`). Quotes arrive
-  exactly on both shells.
-A label spec, `bugs` or `label:X`, queues only issues nobody is handling yet. Each issue it leaves
+- **Quotes and your shell:** a `.cmd` (and Windows PowerShell 5.1 calling any program) splits an
+  argument at its inner double quotes. So `install.ps1` puts `github-workbench.ps1` next to
+  `github-workbench.cmd` and PowerShell (pwsh and 5.1) runs it instead: it hands your arguments over
+  intact, as JSON through the environment. Double-quoted labels inside a query then arrive exactly.
+  From **cmd.exe or Git Bash**, `github-workbench` is the `.cmd`: quote labels inside a query with
+  **single quotes** there (`-Queue "where: bug AND NOT 'needs design'"`). The same applies in
+  PowerShell when its execution policy does not allow local scripts (`Restricted`, `AllSigned`);
+  the installer then leaves the `.ps1` out and says so.
+
+A label spec (`bugs`, `label:X`) or a `where:` query queues only issues nobody is handling yet. Each issue it leaves
 out is printed as `#N skipped: <reason>`:
 - `pr`: an open pull request will close it, or an open PR is on its `issue-<N>-*` branch in this
   repo;
@@ -159,10 +165,10 @@ does not open revdiff automatically; run `wb.py human-review --base origin/main`
 context to open it on demand, or review on GitHub.
 
 Rerunning appends new issues without duplicates. Saved parallelism is preserved unless explicitly
-changed. A watched label is checked every five minutes; empty or temporarily failing scans keep
+changed. A watched spec (a label or a query) is checked every five minutes; empty or temporarily failing scans keep
 waiting. Without `-Watch`, the conductor exits after admission work finishes and writes a summary
 snapshot beside `~/.agworkbench/queues/<owner>/<repo>.json`. Per-issue review continues; rerun the
-queue to refresh its PR states. There is one watched label per queue. `-DryRun` resolves and shows
+queue to refresh its PR states. There is one watched spec per queue. `-DryRun` resolves and shows
 the proposed members without starting anything. `-Retry` repairs failed/incomplete launches using
 their saved checkout and conversation; ordinary reruns leave failures for the human to inspect.
 Queue state corruption is reported without resetting it. Restore a moved/deleted established

@@ -15,7 +15,7 @@
 
   Each issue gets its own full clone under ~/source/workbench, on branch issue-<n>-<slug>, and its
   own mailbox in .workbench/ inside that clone. Running it again for the same issue resumes.
-  Inside agwinterm, -Queue runs an issue list or watched label in separate sessions.
+  Inside agwinterm, -Queue runs an issue list, or a watched label or query, in separate sessions.
 
 .EXAMPLE
   github-workbench 42                     # issue 42 of the repo in the current directory
@@ -67,10 +67,65 @@ param(
     [switch] $Triage,
     [switch] $Retriage,
     [int] $Limit,
-    [switch] $Version
+    [switch] $Version,
+    [string] $ArgsEnv
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($ArgsEnv) {
+    # From the PowerShell entry point (github-workbench.ps1 next to the .cmd, #38): the caller's
+    # arguments as a JSON array in a one-off environment variable, bound here by name, exactly as
+    # typed - no command line in between that could split them or strip their quotes.
+    $raw = [Environment]::GetEnvironmentVariable($ArgsEnv)
+    Remove-Item -LiteralPath "Env:\$ArgsEnv" -ErrorAction SilentlyContinue
+    if ($PSBoundParameters.Count -ne 1 -or $null -eq $raw) {
+        Write-Host '-ArgsEnv is internal to the PowerShell entry point and takes no other arguments.' -ForegroundColor Yellow
+        exit 2
+    }
+    # A foreach statement, not the pipeline: 5.1's ConvertFrom-Json emits the array as one object.
+    $tokens = @()
+    foreach ($token in (ConvertFrom-Json $raw)) { $tokens += [string]$token }
+    $parameters = (Get-Command $PSCommandPath).Parameters
+    $named = @{}
+    $positional = @()
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $token = $tokens[$i]
+        if ($token -notmatch '^-([A-Za-z][A-Za-z0-9]*)(:(.*))?$') {
+            $positional += $token
+            continue
+        }
+        $given, $hasValue, $value = $Matches[1], [bool]$Matches[2], $Matches[3]
+        # PowerShell's own rule: a unique prefix of a parameter name (or an alias) names it.
+        $found = @($parameters.Values | Where-Object {
+                $_.Name -ne 'ArgsEnv' -and ($_.Name -like "$given*" -or @($_.Aliases | Where-Object { $_ -like "$given*" }))
+            })
+        $exact = @($found | Where-Object { $_.Name -eq $given -or $_.Aliases -contains $given })
+        if ($exact.Count -eq 1) { $found = $exact }
+        if ($found.Count -ne 1) {
+            $why = if ($found.Count) { 'is ambiguous' } else { 'is not a parameter' }
+            Write-Host "github-workbench: -$given $why" -ForegroundColor Yellow
+            exit 2
+        }
+        $parameter = $found[0]
+        if ($parameter.SwitchParameter) {
+            if ($hasValue -and $value -eq '' -and $i + 1 -lt $tokens.Count) { $i++; $value = $tokens[$i] }
+            $named[$parameter.Name] = if ($hasValue) { $value -notin @('False', '$false', '0') } else { $true }
+            continue
+        }
+        if (-not $hasValue -or $value -eq '') {
+            if ($i + 1 -ge $tokens.Count) {
+                Write-Host "github-workbench: -$($parameter.Name) needs a value" -ForegroundColor Yellow
+                exit 2
+            }
+            $i++
+            $value = $tokens[$i]
+        }
+        $named[$parameter.Name] = $value
+    }
+    & $PSCommandPath @named @positional
+    exit $LASTEXITCODE
+}
 . (Join-Path $PSScriptRoot 'Workbench.ps1')
 
 if ($Version) {
