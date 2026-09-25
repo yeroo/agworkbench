@@ -90,6 +90,8 @@ class TriageCase(unittest.TestCase):
 
     def git(self, *args, timeout=None):
         self.git_calls.append(args)
+        if '--show-toplevel' in args:
+            return done(0, args[args.index('--work-tree') + 1] + '\n')
         return done()
 
     def model(self, argv, cwd):
@@ -134,7 +136,8 @@ class Config(TriageCase):
                       {'triage': {PRODUCT: {'specRepos': []}}}, {'triage': {PRODUCT: {'specRepos': 'x/y'}}},
                       {'triage': {PRODUCT: {'specRepos': ['not a repo']}}},
                       {'triage': {PRODUCT: {'specRepos': [PROJECT, PROJECT.upper()]}}},
-                      {'triage': {PRODUCT: {'specRepos': [PROJECT], 'model': 'x; rm'}}}):
+                      {'triage': {PRODUCT: {'specRepos': [PROJECT], 'model': 'x; rm'}}},
+                      {'bugLabel': 'bug,regression', 'triage': {PRODUCT: {'specRepos': [PROJECT]}}}):
             with self.subTest(value=value), self.assertRaises(t.ConfigError):
                 t.load_config(self.write(value), PRODUCT)
 
@@ -164,9 +167,13 @@ class Facts(TriageCase):
         self.git_calls.clear()
         self.calls.clear()
         self.triage().run_once()
-        clone = str(self.folder / 'cache' / 'yeroo' / 'docxy-project-spec')
-        self.assertIn(('-C', clone, 'fetch', '--depth', '1', 'origin'), self.git_calls)
-        self.assertIn(('-C', clone, 'reset', '--hard', 'FETCH_HEAD'), self.git_calls)
+        clone = self.folder / 'cache' / 'yeroo' / 'docxy-project-spec'
+        pinned = ('--git-dir', str(clone / '.git'), '--work-tree', str(clone))
+        self.assertIn(pinned + ('fetch', '--depth', '1', 'origin'), self.git_calls)
+        self.assertIn(pinned + ('reset', '--hard', 'FETCH_HEAD'), self.git_calls)
+        self.assertIn(pinned + ('clean', '-fdx'), self.git_calls)
+        for args in self.git_calls:                  # r21: never git -C (discovery could reach an ancestor)
+            self.assertEqual('--git-dir', args[0])
         self.assertNotIn(('repo', 'clone'), [args[:2] for args, _ in self.calls])
 
     def test_a_damaged_cache_is_cloned_again_and_a_failed_fetch_stops_the_run(self):
@@ -178,10 +185,76 @@ class Facts(TriageCase):
         self.triage().run_once()
         self.assertIn(('repo', 'clone', PROJECT), [args[:3] for args, _ in self.calls])
         self.assertFalse((clone / 'stale.txt').exists())
-        self.git = lambda *args, timeout=None: done(1, '', 'network down') if 'fetch' in args else done()
+        self.git = lambda *args, timeout=None: (done(1, '', 'network down') if 'fetch' in args
+                                                else TriageCase.git(self, *args))
         self.calls.clear()
         self.assertEqual(t.FactsError.code, self.triage().run_once())
         self.assertEqual([], self.writes())
+
+    def test_a_git_dir_that_resolves_elsewhere_is_never_fetched_reset_or_cleaned(self):
+        # r21: an invalid .git must not let reset --hard / clean -fdx reach an ancestor repository.
+        self.triage().run_once()
+        seen = []
+
+        def git(*args, timeout=None):
+            seen.append(args)
+            if '--show-toplevel' in args:
+                return done(0, str(self.folder) + '\n')          # an ancestor, not the clone
+            return done()
+        self.git = git
+        self.calls.clear()
+        self.triage().run_once()
+        self.assertEqual([], [a for a in seen if {'fetch', 'reset', 'clean'} & set(a)])
+        self.assertIn(('repo', 'clone', PROJECT), [args[:3] for args, _ in self.calls])
+
+    def test_a_stalled_git_or_a_locked_cache_is_a_facts_error(self):
+        # r21: no traceback, nothing written, exit 4.
+        self.triage().run_once()
+
+        def stalled(*args, timeout=None):
+            if 'fetch' in args:
+                raise subprocess.TimeoutExpired('git', 300)
+            return self.__class__.git(self, *args, timeout=timeout)
+        self.git = stalled
+        self.calls.clear()
+        self.assertEqual(t.FactsError.code, self.triage().run_once())
+        self.assertEqual([], self.writes())
+        self.git = lambda *args, timeout=None: done(128)            # damaged: it must be replaced...
+        with patch.object(t, 'remove_tree', side_effect=PermissionError('locked file')):
+            self.assertEqual(t.FactsError.code, self.triage().run_once())   # ...but cannot be
+        self.assertTrue(any('cannot replace the spec cache' in line for line in self.out))
+
+    def test_no_readable_spec_repo_stops_the_run(self):
+        # r21 M3: a private repo the gh account cannot see looks exactly like a missing one.
+        self.missing = {PROJECT, WORD, EXCEL}
+        self.assertEqual(t.FactsError.code, self.triage().run_once())
+        self.assertEqual([], self.writes())
+        self.assertEqual([], self.model_calls)
+        self.assertTrue(any('none of the spec repos could be read' in line for line in self.out))
+
+    def test_the_model_reads_the_clones_under_their_locks(self):
+        # r21 m2: a watch session and the conductor's jobs share the cache.
+        from conductor import Lock, QueueError
+        busy = []
+        real = self.model
+
+        def model(argv, cwd):
+            for name in ('docxy-project-spec', 'docxy-word-spec'):
+                try:
+                    with Lock(self.folder / 'cache' / 'yeroo' / f'{name}.lock', timeout=0):
+                        busy.append(False)
+                except QueueError:
+                    busy.append(True)
+            return real(argv, cwd)
+        self.model = model
+        self.triage().run_once(numbers=[10])
+        self.assertEqual([True, True], busy)
+
+    def test_a_busy_cache_waits_then_fails_the_run(self):
+        from conductor import Lock
+        with patch.object(t, 'LOCK_WAIT', 0.1), Lock(self.folder / 'cache' / 'yeroo' / 'docxy-project-spec.lock'):
+            self.assertEqual(t.FactsError.code, self.triage().run_once())
+        self.assertTrue(any('the spec cache is busy' in line for line in self.out))
 
 
 class References(unittest.TestCase):
@@ -314,6 +387,27 @@ class Writing(TriageCase):
             self.assertIn(t.TRIAGE_MARKER, body)
         self.assertTrue(any('PRIVATE RATIONALE' in (body or '') for _, body in self.private()))
 
+    def test_the_private_log_is_written_before_anything_public(self):
+        # r21 m1: private log, then the label, then the comment.
+        self.triage().run_once(numbers=[100])
+        order = [('log' if PRODUCT not in args else args[1]) for args, _ in self.writes()]
+        self.assertEqual(['log', 'log', 'edit', 'comment'], order)          # create the log, comment, label, comment
+
+    def test_a_failed_private_log_writes_nothing_public(self):
+        self.failing = {('issue', 'create'): done(1, '', 'HTTP 502')}
+        self.assertEqual(1, self.triage().run_once(numbers=[100]))
+        self.assertEqual([], self.public())
+        self.assertTrue(any(line.startswith('#100: FAILED, nothing written') for line in self.out))
+
+    def test_a_failed_public_comment_after_the_label_is_a_partial_write(self):
+        self.failing = {('issue', 'comment', '100'): done(1, '', 'HTTP 502')}
+        results = {}
+        self.assertEqual(1, self.triage().run_once(numbers=[100], results=results))
+        self.assertIn('priority:P0', self.labels_written()[100])
+        self.assertEqual(dict(priority='P0', written=True), {k: results['100'][k] for k in ('priority', 'written')})
+        self.assertTrue(any(line.startswith('#100: labelled priority:P0, but the public comment failed')
+                            for line in self.out))
+
     def test_the_log_issue_is_created_once_in_the_first_spec_repo(self):
         self.answers = {10: answer('P2'), 12: answer('P2')}
         self.triage().run_once()
@@ -405,6 +499,24 @@ class Watch(TriageCase):
         self.assertIn(10, [n for n, *_ in self.model_calls])
 
 
+class WatchSession(TriageCase):
+    def test_a_manual_run_never_counts_toward_the_watch_give_up(self):
+        # r21: only -Watch counts failures and backs off.
+        self.product.append(issue(30, 'Unreferenced', created='2026-01-06'))
+        self.answers = {30: done(0, 'garbage')}
+        for _ in range(4):
+            self.triage().run_once(numbers=[30])
+        self.assertFalse((self.folder / 'state' / 'yeroo' / 'docxy.json').exists())
+
+    def test_nothing_in_one_scan_ends_the_watch(self):
+        notes, sleeps = [], []
+        triage = self.triage(notify=notes.append)
+        with patch.object(triage, 'run_once', side_effect=[OSError('disk gone'), t.ConfigError('claude is not on PATH'), 0]):
+            triage.watch(interval=300, sleep=sleeps.append, rounds=3)
+        self.assertEqual([300, t.STOP_PAUSE, 300], sleeps)
+        self.assertIn('scan failed: disk gone', notes[0])
+
+
 class HeadlessCall(TriageCase):
     def test_the_argv_is_read_only_and_pinned(self):
         self.config['model'] = 'sonnet'
@@ -452,6 +564,19 @@ class HeadlessCall(TriageCase):
         self.assertIn('"priority"', received[1])                             # the prompt, quotes and newlines intact
         self.assertIn('\n', received[1])
         self.assertIn('priority:P2', self.labels_written()[10])
+
+
+class Processes(unittest.TestCase):
+    def test_a_timeout_stops_the_child_tree(self):
+        with patch.object(t.subprocess, 'Popen') as spawn, patch.object(t.subprocess, 'run') as kill:
+            spawn.return_value.pid = 321
+            spawn.return_value.communicate.side_effect = [subprocess.TimeoutExpired('claude', 300), (b'', b'')]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                t.run(['claude', '-p', 'x'], timeout=300)
+        if os.name == 'nt':
+            self.assertEqual(['taskkill', '/PID', '321', '/T', '/F'], kill.call_args.args[0])
+        else:
+            spawn.return_value.kill.assert_called_once()
 
 
 class Priorities(unittest.TestCase):

@@ -220,9 +220,13 @@ Configure it locally in `~/.agworkbench.json`, never in the repo:
 **How it decides (`lib/triage.py`):**
 1. **The facts, without a model.** triage.py reads every configured spec repo that exists: its
    open issues and a shallow cached clone (`~/.agworkbench/spec-cache`). A repo that does not exist
-   is skipped with a note, so `docxy-excel-spec` joins once it exists. Any other failure (network,
-   auth, rate limit, clone) stops the run before anything is written. Judging without the specs
-   would put everything too low.
+   is skipped with a note, so `docxy-excel-spec` joins once it exists. GitHub answers a private
+   repo your gh account cannot see exactly like a missing one, so if **none** of the configured
+   spec repos can be read, the run stops (check `gh auth status`). Any other failure (network,
+   auth, rate limit, clone, a stalled fetch) stops the run before anything is written. Judging
+   without the specs would put everything too low. The cache is only ever touched through its own
+   `.git` (never git's discovery of a parent repo), and a per-repo lock keeps a `-Watch` session
+   and the queue's triage runs from re-syncing a clone while the model reads it.
 2. **References.** Only an exact reference in an open spec issue's title or body counts:
    `docxy#12`, `yeroo/docxy#12`, or the issue's URL. `docxy#120`, `docxy-word#12` and a bare `#12`
    do not, and spec comments are not scanned. A referenced **bug**, or an issue referenced by a
@@ -240,9 +244,11 @@ Configure it locally in `~/.agworkbench.json`, never in the repo:
      issue with nothing written; the others go on;
    - a usage-limit or auth failure stops the run.
 
-**Nothing private reaches the public repo.** The public issue gets its labels and one comment from
-a fixed template, for example `Triaged priority:P1 (user-facing UI/UX).`, carrying the planner
-marker. Capability ids, spec text, spec titles and links never appear there. The rationale goes to
+**Nothing private reaches the public repo.** The rationale is written to the private log first;
+then the public issue gets its labels and one comment from a fixed template, for example
+`Triaged priority:P1 (user-facing UI/UX).`, carrying the planner marker. If that comment fails
+after the label is on, the run says so (`labelled priority:P1, but the public comment failed`);
+the issue counts as triaged. Capability ids, spec text, spec titles and links never appear there. The rationale goes to
 a "Triage log" issue in the first spec repo that exists: one comment per decision, with the spec
 refs and any rule that changed the model's answer. The issue asked for a comment on the blocking
 spec issue; one log is less noise there.
@@ -251,8 +257,10 @@ spec issue; one log is less noise there.
 (default 20) per run. A label already there counts as triaged, including one you applied by hand.
 The labels are read again just before writing, so a label you add meanwhile wins. `-Retriage`
 also re-judges the labelled ones and replaces their label. `-Watch` opens a visible
-`#triage owner/repo` session that re-scans every 5 minutes. An issue that keeps failing there is
-retried with a growing delay, then left alone after 3 failures, with one notification.
+`#triage owner/repo` session that re-scans every 5 minutes; nothing that goes wrong in one scan
+ends it. An issue that keeps failing there is retried with a growing delay, then left alone after
+3 failures, with one notification. Only the watch counts failures: a manual or queue run always
+tries again.
 
 **The queue.** Pending members are admitted P0, then P1, then untriaged, then P2, then P3, oldest
 issue first within each. The conductor reads the labels for the whole repo on each refresh, and

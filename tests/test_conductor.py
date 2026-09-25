@@ -971,10 +971,17 @@ class PriorityOrder(unittest.TestCase):
 
         class Run:
             pid = 456
+            killed = False
+
+            def kill(self):
+                self.killed = True
+
+            def wait(self, timeout=None):
+                return None
 
             def poll(self):
                 code = case.exit_code.get(number)
-                if code == 0 and number in case.outcome:
+                if code is not None and number in case.outcome:
                     result.write_text(json.dumps({str(number): {'priority': case.outcome[number], 'written': True}}))
                 return code
         return dict(process=Run(), stream=io.BytesIO(), path=log, result=result, number=number, started=self.now)
@@ -1090,12 +1097,25 @@ class PriorityOrder(unittest.TestCase):
         self.exit_code[1] = None
         worker.tick()
         self.now += q.TRIAGE_JOB_TIMEOUT
+        job = worker.triage_job
         with patch.object(q.subprocess, 'run') as kill:
             kill.return_value = subprocess.CompletedProcess([], 0)
-            job = worker.triage_job
-            job['process'].wait = lambda timeout: None
             worker.tick()
         self.assertEqual('failed: timed out', self.member(1)['triageResult'])
+        if os.name == 'nt':                          # r21: the whole tree, claude -p included
+            self.assertEqual(['taskkill', '/PID', '456', '/T', '/F'], kill.call_args.args[0])
+        else:
+            self.assertTrue(job['process'].killed)
+
+    def test_a_partial_write_keeps_the_priority_it_wrote(self):
+        # r21 m1: the label was written but the comment failed (exit 1): the member ranks as labelled.
+        worker = self.triage_worker()
+        self.exit_code[1], self.outcome[1] = 1, 'P0'
+        worker.tick()
+        worker.tick()
+        self.assertEqual('P0', self.member(1)['priority'])
+        self.assertTrue(self.member(1)['triageResult'].startswith('failed'))
+        self.assertEqual([1], [x[0] for x in self.launches])
 
 
 class Specs(unittest.TestCase):

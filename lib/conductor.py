@@ -137,10 +137,7 @@ def run_gh(args, timeout=60):
     except subprocess.TimeoutExpired:
         # repo clone can have a git child; terminating just gh would leave it
         # writing into a checkout that a later Retry is about to repair.
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=30)
-        else:
-            process.kill()
+        triage.kill_tree(process)
         process.communicate(timeout=10)
         raise
     return subprocess.CompletedProcess(argv, process.returncode, out, err)
@@ -182,10 +179,11 @@ def resolve_spec(spec, hint=None, gh=gh_json):
 def bug_label(config):
     """`bugLabel` from the config (#28): the label `-Queue bugs` stands for. Default `bug`."""
     settings = read_json(config) if Path(config).exists() else {}
-    label = settings.get('bugLabel', 'bug')
-    if not isinstance(label, str) or not label.strip() or ',' in label:
-        raise UsageError(f'bugLabel in {config} must be a non-empty label name without a comma (got {label!r})')
-    return label.strip()
+    label = triage.bug_label_of(settings)             # one rule for -Queue bugs and -Triage (#34)
+    if label is None:
+        raise UsageError(f'bugLabel in {config} must be a non-empty label name without a comma '
+                         f'(got {settings.get("bugLabel")!r})')
+    return label
 
 
 def expand_spec(spec, config):
@@ -654,10 +652,7 @@ class Worker:
             if code is None and not timed_out:
                 continue
             if code is None:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=30)
-                else:
-                    process.kill()
+                triage.kill_tree(process)
                 process.wait(timeout=30)
             job['stream'].close()
             tail = '\n'.join(job['path'].read_text(encoding='utf-8', errors='replace').splitlines()[-20:])
@@ -737,7 +732,7 @@ class Worker:
                     if m['state'] == 'pending' and issue:
                         priority = triage.priority_of(issue.get('labels'))
                         # A label just written by this queue's triage may not be listed yet: keep it.
-                        if priority is not None or m.get('triageResult') != 'ok':
+                        if priority is not None or 'triageResult' not in m:
                             m['priority'] = priority
                         if isinstance(issue.get('createdAt'), str):
                             m['createdAt'] = issue['createdAt']
@@ -768,10 +763,7 @@ class Worker:
             if code is None and not timed_out:
                 return
             if code is None:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/PID', str(job['process'].pid), '/T', '/F'], capture_output=True, timeout=30)
-                else:
-                    job['process'].kill()
+                triage.kill_tree(job['process'])
                 job['process'].wait(timeout=30)
             job['stream'].close()
             self.triage_job = None
@@ -786,10 +778,11 @@ class Worker:
             with self.store.transaction() as data:
                 m = find_member(data, number)
                 if m is not None:
+                    # A label that was written counts, even when a later step of that run failed.
+                    if outcome.get('written') and outcome.get('priority') in triage.PRIORITIES:
+                        m['priority'] = outcome['priority']
                     if code == 0:
                         m['triageResult'] = 'ok'
-                        if outcome.get('priority') in triage.PRIORITIES:
-                            m['priority'] = outcome['priority']
                     else:
                         reason = 'timed out' if timed_out else f'exited {code}: {tail}'
                         m['triageResult'] = f'failed: {reason}'[:300]

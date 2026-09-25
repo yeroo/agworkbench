@@ -13,7 +13,9 @@ How a decision is made:
 1. Facts, no model. Every configured spec repo that exists is read in full: its open issues
    (title, body, labels) and a shallow cached clone (`~/.agworkbench/spec-cache`). A definite
    "not found" skips a spec repo with a note; any other failure stops the run before anything is
-   written (FactsError): judging without the specs would under-prioritise everything.
+   written (FactsError): judging without the specs would under-prioritise everything. GitHub answers
+   a private repo the gh account cannot read exactly like a missing one, so when NONE of the
+   configured spec repos resolves the run stops too (wrong account, or a token without access).
 2. An open spec issue that references the public issue (`<product>#N`, `<owner>/<product>#N`, or
    its URL; a bare `#N` never counts; comments are not scanned) is a deterministic P0 when the public
    issue is a bug or the spec issue is itself a bug mirror (title `bug:` or a `bug` label). For
@@ -31,6 +33,7 @@ The rationale goes to the "Triage log" issue in the first spec repo that exists.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -63,6 +66,7 @@ MODEL_TIMEOUT = 300
 GIVE_UP = 3             # watch: failures before an issue is left alone (one notification)
 BACKOFF = 300           # watch: seconds before the first retry, doubling
 STOP_PAUSE = 1800       # watch: after a usage-limit or auth stop
+LOCK_WAIT = 900         # how long a run waits for another run's hold on the spec cache
 
 # The whole public vocabulary: one comment per (priority, ux), nothing else ever reaches the public repo.
 REASONS = {
@@ -112,6 +116,10 @@ class IssueFailed(TriageError):
     """This issue only: nothing is written for it, the run goes on."""
 
 
+class PartialWrite(TriageError):
+    """The public label is written, but a later public step (the template comment) failed."""
+
+
 def priority_of(labels) -> str | None:
     """The priority an issue's labels give it (the highest if several), or None when untriaged."""
     found = []
@@ -129,6 +137,15 @@ def label_names(issue) -> list[str]:
 
 # --- processes -------------------------------------------------------------------------------------
 
+def kill_tree(process) -> None:
+    """Stop a child and everything it started (gh has git children, claude has its own tools).
+    Shared by the conductor's gh calls, launcher jobs and triage jobs."""
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=30)
+    else:
+        process.kill()
+
+
 def run(argv, *, timeout, cwd=None) -> subprocess.CompletedProcess:
     """Run with a deadline; on timeout kill the whole tree (gh and claude have children)."""
     process = subprocess.Popen([str(a) for a in argv], cwd=cwd, stdin=subprocess.DEVNULL,
@@ -136,10 +153,7 @@ def run(argv, *, timeout, cwd=None) -> subprocess.CompletedProcess:
     try:
         out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if os.name == 'nt':
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, timeout=30)
-        else:
-            process.kill()
+        kill_tree(process)
         process.communicate(timeout=10)
         raise
     return subprocess.CompletedProcess(argv, process.returncode, out.decode('utf-8', errors='replace'),
@@ -184,6 +198,15 @@ def config_path() -> Path:
     return Path(os.environ.get('AGWORKBENCH_CONFIG', Path.home() / '.agworkbench.json')).resolve()
 
 
+def bug_label_of(settings) -> str | None:
+    """`bugLabel` from the config, default `bug`; None when invalid (empty, not a string, or holding a
+    comma). The one rule for `-Queue bugs` and triage alike."""
+    label = (settings if isinstance(settings, dict) else {}).get('bugLabel', 'bug')
+    if not isinstance(label, str) or not label.strip() or ',' in label:
+        return None
+    return label.strip()
+
+
 def load_config(path: Path, product: str) -> dict:
     try:
         settings = json.loads(Path(path).read_text(encoding='utf-8-sig')) if Path(path).exists() else {}
@@ -205,10 +228,10 @@ def load_config(path: Path, product: str) -> dict:
     model = entry.get('model')
     if model is not None and (not isinstance(model, str) or not re.fullmatch(r'[\w.:\[\]-]+', model)):
         raise ConfigError(f'triage.{product}.model in {path} must be a model name')
-    label = settings.get('bugLabel', 'bug')
-    if not isinstance(label, str) or not label.strip():
-        raise ConfigError(f'bugLabel in {path} must be a non-empty label name')
-    return dict(specRepos=repos, model=model, bugLabel=label.strip())
+    label = bug_label_of(settings)
+    if label is None:
+        raise ConfigError(f'bugLabel in {path} must be a non-empty label name without a comma')
+    return dict(specRepos=repos, model=model, bugLabel=label)
 
 
 def state_root() -> Path:
@@ -349,22 +372,65 @@ class Triage:
             return False
         raise FactsError(f'{repo}: cannot tell whether it exists: {detail.strip()[:300]}')
 
+    def clone_path(self, repo: str) -> Path:
+        return self.cache / repo.split('/')[0] / repo.split('/')[1]
+
+    def locked(self, repos):
+        """Exclusive per-repo locks on the spec cache (sorted, so two runs never deadlock): held while
+        a clone is synced and while the model reads the clones. A watch session and the conductor's
+        triage jobs share the cache."""
+        from conductor import Lock, QueueError
+        stack = contextlib.ExitStack()
+        try:
+            for repo in sorted({r.casefold() for r in repos}):
+                owner, name = repo.split('/')
+                stack.enter_context(Lock(self.cache / owner / f'{name}.lock', timeout=LOCK_WAIT))
+        except (QueueError, OSError) as err:
+            stack.close()
+            raise FactsError(f'the spec cache is busy or unusable: {err}') from None
+        return stack
+
+    def git_ok(self, path: Path, *args, timeout=300) -> subprocess.CompletedProcess:
+        """git on the clone itself: the git dir and work tree are pinned, so an invalid `.git` can
+        never let discovery reach an ancestor repository."""
+        try:
+            return self.git('--git-dir', str(path / '.git'), '--work-tree', str(path), *args, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise FactsError(f'git {args[0]} timed out in {path}') from None
+        except OSError as err:
+            raise FactsError(f'git {args[0]} in {path}: {err}') from err
+
+    def usable_clone(self, path: Path) -> bool:
+        if not (path / '.git').is_dir():
+            return False
+        top = self.git_ok(path, 'rev-parse', '--show-toplevel', timeout=60)
+        if top.returncode:
+            return False
+        try:
+            return Path(top.stdout.strip()).resolve() == path.resolve()
+        except OSError:
+            return False
+
     def sync_clone(self, repo: str) -> Path:
-        path = self.cache / repo.split('/')[0] / repo.split('/')[1]
-        if (path / '.git').exists():
-            if self.git('-C', str(path), 'rev-parse', '--git-dir', timeout=60).returncode == 0:
-                fetched = self.git('-C', str(path), 'fetch', '--depth', '1', 'origin')
+        path = self.clone_path(repo)
+        with self.locked([repo]):
+            if self.usable_clone(path):
+                fetched = self.git_ok(path, 'fetch', '--depth', '1', 'origin')
                 if fetched.returncode:
                     raise FactsError(f'{repo}: fetching the spec cache failed: {fetched.stderr.strip()[:300]}')
-                if (self.git('-C', str(path), 'reset', '--hard', 'FETCH_HEAD', timeout=120).returncode == 0
-                        and self.git('-C', str(path), 'clean', '-fdx', timeout=120).returncode == 0):
+                if (self.git_ok(path, 'reset', '--hard', 'FETCH_HEAD', timeout=120).returncode == 0
+                        and self.git_ok(path, 'clean', '-fdx', timeout=120).returncode == 0):
                     return path
-            self.out(f'{repo}: the spec cache is damaged; cloning it again')
-        if path.exists():
-            remove_tree(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.gh_ok('repo', 'clone', repo, str(path), '--', '--depth', '1', what=f'cloning {repo}', timeout=600)
-        return path
+            if path.exists():
+                self.out(f'{repo}: the spec cache is damaged; cloning it again')
+            try:
+                if path.exists():
+                    remove_tree(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as err:
+                raise FactsError(f'{repo}: cannot replace the spec cache {path}: {err}') from err
+            self.gh_ok('repo', 'clone', repo, str(path), '--', '--depth', '1', what=f'cloning {repo}', timeout=600)
+            return path
 
     def gather(self) -> None:
         self.specs = []
@@ -374,6 +440,10 @@ class Triage:
                 continue
             issues = self.open_issues(repo)
             self.specs.append(dict(repo=repo, path=self.sync_clone(repo), issues=issues))
+        if self.config['specRepos'] and not self.specs:
+            raise FactsError('none of the spec repos could be read (' + ', '.join(self.config['specRepos']) +
+                             '). GitHub answers a private repo this gh account cannot see exactly like a missing '
+                             'one: check `gh auth status` and the token\'s access')
         self.log_number = None
         if self.specs:
             first = self.specs[0]
@@ -417,9 +487,12 @@ class Triage:
     def ask_model(self, issue: dict, refs: list[dict], floor: str | None) -> dict:
         if self.claude is None:
             self.claude = find_claude()
-        tmp = self.state / 'tmp'
-        tmp.mkdir(parents=True, exist_ok=True)
-        facts_dir = Path(tempfile.mkdtemp(prefix='facts-', dir=tmp))
+        try:
+            tmp = self.state / 'tmp'
+            tmp.mkdir(parents=True, exist_ok=True)
+            facts_dir = Path(tempfile.mkdtemp(prefix='facts-', dir=tmp))
+        except OSError as err:
+            raise IssueFailed(f'cannot write the facts file: {err}') from err
         try:
             known = {f"{repo}#{i['number']}".casefold(): f"{repo}#{i['number']}" for repo, i in self.spec_issues()}
             facts = dict(
@@ -435,19 +508,28 @@ class Triage:
                                                  labels=label_names(i))
                                             for i in s['issues'] if LOG_MARKER not in (i.get('body') or '')])
                            for s in self.specs])
-            facts_file = facts_dir / 'facts.json'
-            facts_file.write_text(json.dumps(facts, indent=2), encoding='utf-8')
-            argv = self.model_argv(facts_file)
+            try:
+                facts_file = facts_dir / 'facts.json'
+                facts_file.write_text(json.dumps(facts, indent=2), encoding='utf-8')
+                argv = self.model_argv(facts_file)
+            except OSError as err:
+                raise IssueFailed(f'cannot write the facts file: {err}') from err
             cwd = str(self.specs[0]['path']) if self.specs else str(facts_dir)
             try:
-                done = self.model(argv, cwd)
+                with self.locked([spec['repo'] for spec in self.specs]):      # nobody re-syncs what it reads
+                    done = self.model(argv, cwd)
+            except FactsError as err:
+                raise IssueFailed(str(err)) from None
             except subprocess.TimeoutExpired:
                 raise IssueFailed(f'the model timed out after {MODEL_TIMEOUT}s') from None
             except OSError as err:
                 raise IssueFailed(f'the model could not start: {err}') from err
             return validate(parse_model_output(done), known)
         finally:
-            remove_tree(facts_dir)
+            try:
+                remove_tree(facts_dir)
+            except OSError:
+                pass
 
     def model_argv(self, facts_file: Path) -> list[str]:
         home = self.state / 'claude'
@@ -468,8 +550,9 @@ class Triage:
 
     # writing ----------------------------------------------------------------------------------------
     def apply(self, issue: dict, decision: Decision, retriage: bool) -> bool:
-        """Labels and the template comment on the public issue, then the rationale on the private
-        log. False when the issue changed under us (closed, or labelled meanwhile)."""
+        """The rationale on the private log first, then the public label, then the template comment.
+        False when the issue changed under us (closed, or labelled meanwhile). A failure before the
+        label writes nothing public (IssueFailed); after it, it is a PartialWrite."""
         number = issue['number']
         current = self.gh_json('api', f'repos/{self.product}/issues/{number}', what=f'#{number}', error=IssueFailed)
         if current.get('state') != 'open':
@@ -490,17 +573,23 @@ class Triage:
                 args += ['--add-label', 'ux']
             elif retriage and any(name.casefold() == 'ux' for name in names):
                 args += ['--remove-label', 'ux']
-        self.gh_ok(*args, what=f'labelling #{number}', error=IssueFailed)
-        self.post(['issue', 'comment', str(number), '--repo', self.product],
-                  public_comment(decision.priority, decision.ux), what=f'commenting on #{number}')
         self.log_rationale(issue, decision)
+        self.gh_ok(*args, what=f'labelling #{number}', error=IssueFailed)
+        try:
+            self.post(['issue', 'comment', str(number), '--repo', self.product],
+                      public_comment(decision.priority, decision.ux), what=f'commenting on #{number}')
+        except IssueFailed as err:
+            raise PartialWrite(str(err)) from None
         return True
 
     def post(self, args, body, what):
-        tmp = self.state / 'tmp'
-        tmp.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.md', dir=tmp, delete=False) as handle:
-            handle.write(body)
+        try:
+            tmp = self.state / 'tmp'
+            tmp.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.md', dir=tmp, delete=False) as handle:
+                handle.write(body)
+        except OSError as err:
+            raise IssueFailed(f'{what}: {err}') from err
         try:
             return self.gh_ok(*args, '--body-file', handle.name, what=what, error=IssueFailed)
         finally:
@@ -543,10 +632,13 @@ class Triage:
 
     def save_failures(self, failures: dict) -> None:
         path = self.failures_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + '.tmp')
-        temporary.write_text(json.dumps({'failures': failures}, indent=2), encoding='utf-8')
-        os.replace(temporary, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + '.tmp')
+            temporary.write_text(json.dumps({'failures': failures}, indent=2), encoding='utf-8')
+            os.replace(temporary, path)
+        except OSError as err:
+            self.out(f'cannot save the failure counts: {err}')
 
     def select(self, issues, numbers, retriage, limit, watch):
         if numbers:
@@ -578,7 +670,8 @@ class Triage:
             self.out(f'NOT triaging: {err}')
             return FactsError.code
         failed = False
-        failures = self.failures()
+        # Failure counts and backoff belong to -Watch only: a manual or queue run always tries again.
+        failures = self.failures() if watch else {}
         for issue in self.select(issues, numbers, retriage, limit, watch):
             number = issue['number']
             try:
@@ -594,10 +687,18 @@ class Triage:
                 if results is not None:
                     results[str(number)] = dict(priority=decision.priority if written else None, written=written)
                 failures.pop(str(number), None)
-            except StopRun as err:
+            except PartialWrite as err:
+                failed = True
+                self.out(f'#{number}: labelled priority:{decision.priority}, but the public comment failed '
+                         f'(the rationale is in the private log): {err}')
+                failures.pop(str(number), None)          # it is labelled: triaged, not retried
+                if results is not None:
+                    results[str(number)] = dict(priority=decision.priority, written=True, error=str(err)[:300])
+            except (StopRun, ConfigError) as err:
                 self.out(f'#{number}: STOPPED: {err}')
-                self.save_failures(failures)
-                return StopRun.code
+                if watch:
+                    self.save_failures(failures)
+                return err.code
             except IssueFailed as err:
                 failed = True
                 self.out(f'#{number}: FAILED, nothing written: {err}')
@@ -608,15 +709,23 @@ class Triage:
                     self.notify(f'triage {self.product}#{number}: given up after {count} failures: {err}')
                 if results is not None:
                     results[str(number)] = dict(priority=None, written=False, error=str(err)[:300])
-        if not self.dry_run:
+        if watch and not self.dry_run:
             self.save_failures(failures)
         return 1 if failed else 0
 
-    def watch(self, interval=300, limit=20, sleep=time.sleep):
-        while True:
-            code = self.run_once(limit=limit, watch=True)
-            if code == StopRun.code:
-                self.notify(f'triage {self.product}: stopped (usage limit or auth); retrying in {STOP_PAUSE // 60} min')
+    def watch(self, interval=300, limit=20, sleep=time.sleep, rounds=None):
+        """The long-lived `#triage` session: nothing that goes wrong in one scan ends it."""
+        done = 0
+        while rounds is None or done < rounds:
+            done += 1
+            try:
+                code = self.run_once(limit=limit, watch=True)
+            except (TriageError, OSError, subprocess.SubprocessError) as err:
+                self.out(f'triage scan failed: {err}')
+                self.notify(f'triage {self.product}: scan failed: {err}')
+                code = getattr(err, 'code', None)
+            if code in (StopRun.code, ConfigError.code):
+                self.notify(f'triage {self.product}: stopped (usage limit, auth or setup); retrying in {STOP_PAUSE // 60} min')
                 sleep(STOP_PAUSE)
             else:
                 sleep(interval)
@@ -689,6 +798,9 @@ def main(argv=None) -> int:
     except TriageError as err:
         print(f'triage: {err}', file=sys.stderr)
         return err.code
+    except (OSError, subprocess.SubprocessError) as err:
+        print(f'triage: {err}', file=sys.stderr)
+        return FactsError.code
     except KeyboardInterrupt:
         return 130
 
