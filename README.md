@@ -315,6 +315,25 @@ merges, unless you opted in for that checkout.
   workspace. Every step goes to `.workbench/state/relay-close.log`. It never closes on a timeout: it
   alerts you instead. The checkout stays on disk.
 
+How the close proves each thing (#33):
+- **Agents:** every Claude the workbench launches (planner and implementer) starts with prompt
+  suggestions off (`CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, plus `--settings` pointing at
+  `.workbench/state/claude-settings.json`). Otherwise the greyed suggestion in an idle composer
+  makes it impossible to prove the composer empty: the relay would neither ring the agent nor
+  close its session. `claudeArgs` may not pass its own `--settings`; put your settings in
+  `~/.claude/settings.json`. An adopted Claude (your own session) needs
+  `"promptSuggestionEnabled": false` there too, and the relay's hold and close logs say so.
+- **Helpers:** revmux and revdiff write a completion marker (`.workbench/state/helpers/<pane>.done`,
+  holding what the pane showed) as their last act. A helper closes when its marker exists, the pane
+  shows the same rows plus at most its shell's bare prompt (nothing typed since), and it has been
+  unchanged for 30 s. Helpers close first, even while the agents are still busy.
+- **A relay that died:** the queue's conductor runs the same close for a merged member whose close
+  has been pending for 15 minutes and whose `#N relay` session is gone. While that relay is still
+  alive, the member is only flagged `closeStuck` in the queue file, because one closer at a time.
+  A close that cannot complete is refused and flagged, never forced.
+- **Members launched before this fix** still have suggestions on, so their relays keep holding the
+  doorbell. Once such a loop has recorded `wb.py loop-state done`, close its sessions by hand.
+
 It does not decide plan disagreements for you, delete checkouts, or queue its own follow-ups. To
 stop it, use `-NoAutonomous` on the checkout (read again at close time) or on the queue, a hold
 comment on the PR, or mail through revdiff.
@@ -410,6 +429,8 @@ lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer p
 lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/workbench-implementer <issue>"
 lib/relay.py                mail doorbell and PR watcher; spots usage limits in the agent panes
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
+lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
+lib/helper_done.py          a helper session's completion marker (#33)
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude
 lib/wb.py                   opens those sessions for Claude with correct Windows paths
