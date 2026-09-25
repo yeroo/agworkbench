@@ -986,5 +986,17 @@ class AutonomyProse(unittest.TestCase):
         self.assertIn('loop-state done --pr <P> --sha <sha>` as the very last step', text.split('## Phase 7')[1])
 
 
+class LoopEndProse(unittest.TestCase):
+    """#27 r18b: an implementer does not answer the end of the loop, so no unread reply blocks the close."""
+
+    def test_both_implementers_stop_without_replying(self):
+        root = Path(__file__).resolve().parent.parent
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+            with self.subTest(path=path):
+                text = ' '.join((root / path).read_text(encoding='utf-8').split())
+                self.assertIn('When mail says the loop is complete, or the relay reports the PR MERGED or CLOSED', text)
+                self.assertIn('do not reply', text)
+
+
 if __name__ == '__main__':
     unittest.main()

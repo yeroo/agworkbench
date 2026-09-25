@@ -82,6 +82,9 @@ Silence on a finding is not an answer. Reply `FIXED <short sha>` with the per-fi
 Human feedback arrives the same way, relayed by Claude. It is not up for dispute in the same way:
 if you think the human is wrong, say why once, clearly, and let Claude take it to them.
 
+When mail says the loop is complete, or the relay reports the PR MERGED or CLOSED, stop: do not
+reply. An unread reply would hold up the autonomous close (#27).
+
 ## HANDOVER - you replace another implementer mid-loop
 
 A mail with subject `HANDOVER` means the previous implementer (Codex or Claude) hit its usage
