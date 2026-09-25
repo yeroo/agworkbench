@@ -11,6 +11,11 @@
   wb.py follow-up file --source 27 --pr 30                        # file every unfiled follow-up (#27)
   wb.py loop-state done --pr 30 --sha <sha>                       # the planner's last act (#27)
   wb.py merge-check --pr 12 --head <sha>                          # read-only auto-merge gate (#23)
+  wb.py wait-ci --pr 12 --head <sha>                              # background: until CI on the head is done (#32)
+  wb.py update-check --reviewed <sha> --base <sha>                # an UPDATE round is one merge of the base (#32)
+  wb.py merge-round --pr 12 --kind update                         # count a proved round; refuse past the limit (#32)
+  wb.py ci-rerun --pr 12                                          # rerun the failed Actions jobs once (#32)
+  wb.py ci-log --pr 12                                            # the failed jobs' log for a FIX round (#32)
 
 Why a helper: Claude's shell is Git Bash, where $PWD is a POSIX path (/c/Users/...) that PowerShell
 cannot use, and quoting a PowerShell command inside a bash string inside an agwintermctl argument
@@ -211,9 +216,10 @@ def cmd_handover(args: argparse.Namespace) -> int:
 
 
 # --- merge-check (#23) -----------------------------------------------------------------------
-# Read-only and without a network of its own: state, reviews, holds and head are pure functions
-# over what one `gh pr view` (plus the PR's inline comments) returned; mail and relay read this
-# checkout's .workbench. The planner merges only on "ok". When in doubt, hold: fail closed.
+# Read-only: state, reviews, holds and head are pure functions over what one `gh pr view` (plus the
+# PR's inline comments) returned, and - only for the tested head in an UNSTABLE or BLOCKED state -
+# what `gh pr checks` (all, and --required) returned (#32); mail and relay read this checkout's
+# .workbench. The planner merges only on "ok". When in doubt, hold: fail closed.
 
 PLANNER_MARKER = "<!-- agworkbench:planner -->"
 NEGATION = r"(?:do[\s-]*not|don'?t|dont)[\s-]*"
@@ -243,18 +249,92 @@ def _when(item: dict) -> str:
     return item.get("submittedAt") or item.get("createdAt") or item.get("created_at") or ""
 
 
-def check_state(pr: dict) -> list[str]:
+# --- CI and the branch (#32) ----------------------------------------------------------------------
+# merge-check classifies what keeps a clean-reviewed PR from merging, so the planner can route the
+# ordinary cases itself: `ci-pending:` (wait-ci), `ci-failed:` (one rerun, then one FIX round),
+# `behind:` / `conflict:` (an UPDATE round). Everything else keeps the final `mergeable:` prefix.
+# CI comes from `gh pr checks`, whose `bucket` normalises check runs and status contexts alike.
+
+CHECK_FIELDS = "name,state,bucket,link,workflow"
+FAILED_BUCKETS = ("fail", "cancel")
+ROUND_LIMITS = {"update": 3, "conflict": 1, "ci-rerun": 1, "ci-fix": 1}
+RUN_LINK = re.compile(r"/actions/runs/(\d+)(?:/job/(\d+))?")
+
+
+def gh_checks(pr_ref: str, required: bool = False) -> list[dict]:
+    """`gh pr checks --json`: exit 1 (a check failed) and 8 (checks pending) still carry the JSON;
+    "no checks reported" is no checks, not an error."""
+    argv = ["gh", "pr", "checks", str(pr_ref), "--json", CHECK_FIELDS] + (["--required"] if required else [])
+    done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    out = (done.stdout or "").strip()
+    if done.returncode in (0, 1, 8) and out.startswith("["):
+        return [check for check in json.loads(out) if isinstance(check, dict)]
+    if "no checks reported" in (done.stderr or "") or "no required checks reported" in (done.stderr or ""):
+        return []
+    raise RuntimeError(f"gh pr checks failed: {(done.stderr or out).strip()[:300]}")
+
+
+def fetch_checks(pr_ref: str) -> dict:
+    return {"all": gh_checks(pr_ref), "required": {c.get("name") for c in gh_checks(pr_ref, required=True)}}
+
+
+def check_pending(check: dict) -> bool:
+    return check.get("bucket") == "pending" or str(check.get("state")).upper() in ("EXPECTED", "PENDING", "QUEUED",
+                                                                                   "IN_PROGRESS", "WAITING", "REQUESTED")
+
+
+def split_checks(checks: dict) -> tuple[list, list, list, list]:
+    """(considered, pending, failed, optional_failed). A failure counts among the required checks
+    when branch protection names any, else among every check that was not skipped. Pending counts
+    every check, required or not: GitHub keeps the merge state UNSTABLE until optional ones finish
+    too, so the PR waits for them (r22)."""
+    everything = checks.get("all") or []
+    required = checks.get("required") or set()
+    considered = [c for c in everything if c.get("name") in required] if required else \
+        [c for c in everything if c.get("bucket") != "skipping"]
+    pending = [c for c in everything if c.get("bucket") != "skipping" and check_pending(c)]
+    failed = [c for c in considered if c.get("bucket") in FAILED_BUCKETS]
+    optional_failed = [c for c in everything if required and c.get("name") not in required
+                       and c.get("bucket") in FAILED_BUCKETS]
+    return considered, pending, failed, optional_failed
+
+
+def classify_ci(checks: dict) -> list[str]:
+    """While anything is still running only `ci-pending:` is reported: a failure next to a running
+    job is judged once the run is over (its log and a rerun need a finished run - r22)."""
+    _, pending, failed, optional_failed = split_checks(checks)
+    if pending:
+        return [f"ci-pending: {len(pending)} check(s) still running ("
+                + ", ".join(c.get("name") or "?" for c in pending) + ") - start wb.py wait-ci"]
+    lines = []
+    lines += [f"ci-failed: {c.get('name')} {c.get('state')} {c.get('link') or ''}".rstrip() for c in failed]
+    lines += [f"ci-optional-failed: {c.get('name')} {c.get('state')} (not a required check; the human decides)"
+              for c in optional_failed]
+    return lines
+
+
+def check_state(pr: dict, checks: dict | None = None) -> list[str]:
     failures = []
     if pr.get("state") != "OPEN":
         failures.append(f"state: PR is {pr.get('state')}, not OPEN")
     mergeable = pr.get("mergeable")
+    status = pr.get("mergeStateStatus")
+    if mergeable == "CONFLICTING" or status == "DIRTY":
+        failures.append(f"conflict: GitHub says {mergeable}, merge state {status} - an UPDATE round")
+        return failures
+    if status == "BEHIND":
+        failures.append("behind: the branch is behind the base branch - an UPDATE round")
+        return failures
     if mergeable != "MERGEABLE":
         retry = " (retry in ~30s)" if mergeable == "UNKNOWN" else ""
         failures.append(f"mergeable: GitHub says {mergeable}{retry}")
-    status = pr.get("mergeStateStatus")
     if status != "CLEAN":
-        retry = " (retry in ~30s)" if status == "UNKNOWN" else ""
-        failures.append(f"mergeable: merge state is {status}, not CLEAN{retry}")
+        ci = classify_ci(checks) if checks is not None and status in ("UNSTABLE", "BLOCKED") else []
+        if ci:
+            failures += ci
+        else:
+            retry = " (retry in ~30s)" if status == "UNKNOWN" else ""
+            failures.append(f"mergeable: merge state is {status}, not CLEAN{retry}")
     return failures
 
 
@@ -359,8 +439,8 @@ def check_follow_ups(root: Path) -> list[str]:
     return failures
 
 
-def merge_failures(pr: dict, inline: list[dict], head: str, root: Path) -> list[str]:
-    return (check_state(pr) + check_reviews(pr) + check_labels_and_title(pr) + check_holds(pr, inline) +
+def merge_failures(pr: dict, inline: list[dict], head: str, root: Path, checks: dict | None = None) -> list[str]:
+    return (check_state(pr, checks) + check_reviews(pr) + check_labels_and_title(pr) + check_holds(pr, inline) +
             check_mail() + check_relay(root, int(pr.get("number") or 0)) + check_head(pr, head) +
             check_follow_ups(root))
 
@@ -524,10 +604,15 @@ def cmd_merge_check(args: argparse.Namespace) -> int:
     root = checkout()
     try:
         pr, inline = fetch_pr(args.pr)
+        checks = None
+        # CI is classified only for the tested head: checks of another commit mean nothing (#32).
+        if (pr.get("headRefOid") or "").lower() == args.head.lower() and pr.get("state") == "OPEN" \
+                and pr.get("mergeStateStatus") in ("UNSTABLE", "BLOCKED"):
+            checks = fetch_checks(args.pr)
     except (RuntimeError, ValueError, OSError) as err:
         print(f"gh: {err}")
         return 1
-    failures = merge_failures(pr, inline, args.head, root)
+    failures = merge_failures(pr, inline, args.head, root, checks)
     if failures:
         print("\n".join(failures))
         return 1
@@ -578,6 +663,257 @@ def cmd_wait_mail(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as err:
         print(f'wb: wait-mail: {err}', file=sys.stderr)
         return 2
+
+
+def ci_progress(checks: dict) -> tuple[str, str]:
+    """('waiting', why) before any check reported; ('running', why); ('done', summary)."""
+    everything = checks.get("all") or []
+    if not everything:
+        return "waiting", "no check has reported for this head yet"
+    considered, pending, failed, optional_failed = split_checks(checks)
+    if pending:
+        return "running", f"{len(pending)} check(s) running: " + ", ".join(c.get("name") or "?" for c in pending)
+    passed = len([c for c in considered if c.get("bucket") == "pass"])
+    summary = f"CI DONE: {passed} passed, {len(failed)} failed"
+    return "done", summary + (f", {len(optional_failed)} optional failed" if optional_failed else "")
+
+
+def cmd_wait_ci(args: argparse.Namespace) -> int:
+    """Wait in the background until CI on this head is finished (#32). 0 done, 3 timeout, 4 the head
+    changed or the PR is no longer open, 2 usage. A gh failure is retried, never taken as done."""
+    try:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", args.head or ""):
+            raise ValueError("--head needs the full 40-character SHA")
+        for name, value, low, high in (("--timeout", args.timeout, 0, 1440), ("--no-ci-grace", args.no_ci_grace, 0, 1440),
+                                       ("--interval", args.interval, 1, 3600)):
+            if not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"{name} must be between {low} and {high}")
+    except ValueError as err:
+        print(f"wb: wait-ci: {err}", file=sys.stderr)
+        return 2
+    started = now()               # the grace runs from the first sight of this head (#32 build note 1)
+    last = None
+    while True:
+        elapsed = now() - started
+        try:
+            view = gh_json("pr", "view", str(args.pr), "--json", "state,headRefOid")
+            if view.get("state") != "OPEN":
+                print(f"PR is {view.get('state')}, not OPEN")
+                return 4
+            if (view.get("headRefOid") or "").lower() != args.head.lower():
+                print(f"head changed: the PR head is {view.get('headRefOid')}, not {args.head}")
+                return 4
+            state, text = ci_progress(fetch_checks(str(args.pr)))
+        except (RuntimeError, ValueError, OSError) as err:
+            state, text = "error", f"gh failed, retrying: {err}"
+        if state == "done":
+            print(text)
+            return 0
+        if state == "waiting" and elapsed >= args.no_ci_grace * 60:
+            print(f"CI DONE: no CI reported for this head in {args.no_ci_grace:g} minutes")
+            return 0
+        if text != last:
+            print(text, flush=True)
+            last = text
+        if elapsed >= args.timeout * 60:
+            print(f"CI still not done after {args.timeout:g} minutes")
+            return 3
+        pause(min(args.interval, max(1.0, args.timeout * 60 - elapsed)))
+
+
+def git_out(root: Path, *args: str) -> str:
+    done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if done.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {(done.stderr or done.stdout).strip()[:300]}")
+    return done.stdout
+
+
+def cmd_update_check(args: argparse.Namespace) -> int:
+    """After `UPDATED <sha>` (#32): HEAD must be exactly one new commit, a merge of the pinned base
+    into the reviewed head, and the tree clean. Prints `update: clean` (git's own merge, nothing
+    added) or `update: conflict` (a non-empty remerge-diff: resolved conflicts or anything else
+    added in the merge - review it like a fix)."""
+    for name in ("reviewed", "base"):
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", getattr(args, name) or ""):
+            print(f"wb: update-check --{name} needs a full 40-character SHA", file=sys.stderr)
+            return 2
+    root = checkout()
+    reviewed, base = args.reviewed.lower(), args.base.lower()
+    try:
+        head = git_out(root, "rev-parse", "HEAD").strip()
+        parents = git_out(root, "rev-list", "--parents", "-n", "1", "HEAD").split()[1:]
+        extra = git_out(root, "rev-list", "HEAD", f"^{reviewed}", f"^{base}").split()
+        dirty = git_out(root, "status", "--porcelain", "--untracked-files=no").strip()
+        failures = []
+        if len(parents) != 2:
+            failures.append(f"HEAD {head[:12]} is not a merge commit ({len(parents)} parent(s)); "
+                            "the update must be `git merge --no-ff <base sha>`, never a rebase")
+        else:
+            if parents[0] != reviewed:
+                failures.append(f"the merge's first parent is {parents[0][:12]}, not the reviewed head {reviewed[:12]}")
+            if parents[1] != base:
+                failures.append(f"the merge's second parent is {parents[1][:12]}, not the base {base[:12]} from the UPDATE mail")
+        if extra != [head]:
+            failures.append(f"{len(extra)} new commit(s) besides the base's; exactly one (the merge) is allowed")
+        if dirty:
+            failures.append("the working tree has uncommitted changes")
+        if failures:
+            print("\n".join(f"update-check: {line}" for line in failures))
+            return 1
+        remerge = git_out(root, "show", "--remerge-diff", "--format=", "HEAD").strip()
+    except (RuntimeError, OSError) as err:
+        print(f"update-check: {err}")
+        return 1
+    if remerge:
+        print(f"update: conflict - review the resolution: git show --remerge-diff {head}")
+    else:
+        print(f"update: clean - git's own merge of {base[:12]} into {reviewed[:12]}, nothing added")
+    return 0
+
+
+def rounds_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "merge-rounds.json"
+
+
+def cmd_merge_round(args: argparse.Namespace) -> int:
+    """Count one proved round of a kind for this PR (#32); refuse beyond its limit (exit 1: the
+    human's). The counts reset when the PR number changes."""
+    root = checkout()
+    number = int(str(args.pr).rsplit("/", 1)[-1]) if re.fullmatch(r"(?:.*/)?\d+", str(args.pr)) else None
+    if number is None:
+        print("wb: merge-round --pr needs a PR number or URL", file=sys.stderr)
+        return 2
+    path = rounds_path(root)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        record = {}
+    if not isinstance(record, dict) or record.get("pr") != number:
+        record = {"pr": number}
+    limit, count = ROUND_LIMITS[args.kind], int(record.get(args.kind) or 0)
+    if count >= limit:
+        print(f"{args.kind}: the limit of {limit} round(s) for PR #{number} is reached - this goes to the human")
+        return 1
+    record[args.kind] = count + 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+    print(f"{args.kind} round {count + 1} of {limit} for PR #{number}")
+    return 0
+
+
+def failed_actions_runs(checks: dict) -> tuple[list[tuple[str, str | None, dict]], list[dict]]:
+    """([(run id, job id, check)] for failed GitHub Actions checks, [failed checks from other CI])."""
+    _, _, failed, _ = split_checks(checks)
+    runs, external = [], []
+    for check in failed:
+        match = RUN_LINK.search(check.get("link") or "")
+        if match:
+            runs.append((match[1], match[2], check))
+        else:
+            external.append(check)
+    return runs, external
+
+
+def cmd_ci_log(args: argparse.Namespace) -> int:
+    """The failing CI log for a FIX round (#32): the last lines of each failed job, in a file under
+    .workbench/review/ that the FIX mail points at."""
+    root = checkout()
+    try:
+        runs, external = failed_actions_runs(fetch_checks(str(args.pr)))
+    except (RuntimeError, ValueError, OSError) as err:
+        print(f"gh: {err}")
+        return 1
+    if not runs and not external:
+        print("no failed checks")
+        return 1
+    parts, fetched = [], 0
+    for run, job, check in runs:
+        argv = ["gh", "run", "view", run, "--log-failed"] + (["--job", job] if job else [])
+        done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        header = f"=== {check.get('name')} ({check.get('workflow') or 'Actions'}) - {check.get('link')}\n"
+        if done.returncode != 0:
+            parts.append(header + f"(gh run view failed: {(done.stderr or done.stdout or '').strip()[:300]})")
+            continue
+        fetched += 1
+        parts.append(header + "\n".join((done.stdout or "").splitlines()[-args.lines:]))
+    for check in external:
+        parts.append(f"=== {check.get('name')} {check.get('state')} - external CI, no log here: {check.get('link')}")
+    folder = root / ".workbench" / "review"
+    folder.mkdir(parents=True, exist_ok=True)
+    k = 1
+    while (folder / f"ci-r{k}.log").exists():
+        k += 1
+    path = folder / f"ci-r{k}.log"
+    path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+    print(path)
+    if runs and not fetched:
+        print("no job log could be fetched - it is not evidence yet; retry ci-log", file=sys.stderr)
+        return 2
+    return 0
+
+
+RERUN_SHOWS_WITHIN = 120.0     # seconds for a started rerun's checks to show as pending
+
+
+def round_used(root: Path, pr: str, kind: str) -> bool:
+    try:
+        record = json.loads(rounds_path(root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    number = int(str(pr).rsplit("/", 1)[-1]) if re.fullmatch(r"(?:.*/)?\d+", str(pr)) else None
+    return isinstance(record, dict) and record.get("pr") == number and int(record.get(kind) or 0) >= ROUND_LIMITS[kind]
+
+
+def cmd_ci_rerun(args: argparse.Namespace) -> int:
+    """One rerun of the failed GitHub Actions jobs before a FIX round (#32). Exit 0: the rerun
+    started, is counted, and its checks show as pending (so wait-ci cannot read the old results).
+    Exit 1 (refused): the rerun is used, or nothing can be rerun (external CI) - go to a FIX round.
+    Exit 2 (operational, retry ci-rerun): gh failed, or no rerun started; nothing is counted. After
+    `rerun started`, exit 2 only means its checks did not show within RERUN_SHOWS_WITHIN - run wait-ci."""
+    root = checkout()
+    if round_used(root, args.pr, "ci-rerun"):
+        print(f"ci-rerun: the limit of {ROUND_LIMITS['ci-rerun']} round(s) is reached - go to a FIX round with wb.py ci-log")
+        return 1
+    try:
+        runs, external = failed_actions_runs(fetch_checks(str(args.pr)))
+    except (RuntimeError, ValueError, OSError) as err:
+        print(f"gh: {err} - retry ci-rerun")
+        return 2
+    if not runs:
+        print("nothing to rerun: " + (", ".join(c.get("name") or "?" for c in external) or "no failed checks")
+              + " - go to a FIX round with wb.py ci-log")
+        return 1
+    started = []
+    for run in dict.fromkeys(run for run, _, _ in runs):
+        done = subprocess.run(["gh", "run", "rerun", run, "--failed"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+        print(f"rerun {run}: " + ("started" if done.returncode == 0 else f"failed: {(done.stderr or '').strip()[:200]}"))
+        if done.returncode == 0:
+            started.append(run)
+    if not started:
+        print("no rerun started; nothing counted - retry ci-rerun")
+        return 2
+    if cmd_merge_round(argparse.Namespace(pr=args.pr, kind="ci-rerun")) != 0:
+        return 1
+    # Until GitHub re-queues them, `gh pr checks` still shows the old failed results (r22 m1).
+    deadline = now() + RERUN_SHOWS_WITHIN
+    while True:
+        try:
+            showing = [c for c in fetch_checks(str(args.pr))["all"]
+                       if check_pending(c) and (RUN_LINK.search(c.get("link") or "") or [None, None])[1] in started]
+        except (RuntimeError, ValueError, OSError):
+            showing = []
+        if showing:
+            print(f"rerun started: {len(showing)} check(s) pending again - start wb.py wait-ci")
+            return 0
+        if now() >= deadline:
+            print(f"rerun started, but its checks did not show as pending within {RERUN_SHOWS_WITHIN:.0f}s - "
+                  "run wb.py wait-ci, then merge-check")
+            return 2
+        pause(10)
 
 
 def main() -> int:
@@ -635,6 +971,29 @@ def main() -> int:
     p.add_argument('--timeout', type=float, default=55, metavar='MIN', help='timeout, 0..1440 minutes (default: 55)')
     p.add_argument('--interval', type=float, default=10, metavar='SEC', help='poll interval, >0..3600 seconds (default: 10)')
     p.set_defaults(func=cmd_wait_mail)
+    p = subs.add_parser("wait-ci", help="wait in the background until CI on the tested head is done (#32)")
+    p.add_argument("--pr", required=True)
+    p.add_argument("--head", required=True, help="the full SHA pushed")
+    p.add_argument("--timeout", type=float, default=90, metavar="MIN", help="default 90 minutes")
+    p.add_argument("--no-ci-grace", type=float, default=5, metavar="MIN",
+                   help="done with no CI when no check reported for this long (default 5)")
+    p.add_argument("--interval", type=float, default=60, metavar="SEC", help="poll interval (default 60)")
+    p.set_defaults(func=cmd_wait_ci)
+    p = subs.add_parser("update-check", help="prove an UPDATE round is one merge of the pinned base (#32)")
+    p.add_argument("--reviewed", required=True, help="the reviewed head's full SHA")
+    p.add_argument("--base", required=True, help="the base SHA named in the UPDATE mail")
+    p.set_defaults(func=cmd_update_check)
+    p = subs.add_parser("merge-round", help="count one proved merge round; refuse beyond its limit (#32)")
+    p.add_argument("--pr", required=True)
+    p.add_argument("--kind", required=True, choices=sorted(ROUND_LIMITS))
+    p.set_defaults(func=cmd_merge_round)
+    p = subs.add_parser("ci-log", help="write the failed CI jobs' logs for a FIX round (#32)")
+    p.add_argument("--pr", required=True)
+    p.add_argument("--lines", type=int, default=150)
+    p.set_defaults(func=cmd_ci_log)
+    p = subs.add_parser("ci-rerun", help="rerun the failed Actions jobs once, counted (#32)")
+    p.add_argument("--pr", required=True)
+    p.set_defaults(func=cmd_ci_rerun)
     args = parser.parse_args()
     try:
         return args.func(args)

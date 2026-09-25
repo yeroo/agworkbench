@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
@@ -486,12 +487,18 @@ class MergeCheck(unittest.TestCase):
     # --- (a) GitHub's merge state --------------------------------------------------------------
 
     def test_only_open_mergeable_clean_passes(self):
-        for status in ('UNSTABLE', 'BLOCKED', 'BEHIND', 'DIRTY', 'UNKNOWN', 'HAS_HOOKS'):
+        for status in ('UNSTABLE', 'BLOCKED', 'UNKNOWN', 'HAS_HOOKS'):
             with self.subTest(status=status):
                 lines = self.failures(clean_pr(mergeStateStatus=status))
                 self.assertEqual([f'mergeable: merge state is {status}, not CLEAN' +
                                   (' (retry in ~30s)' if status == 'UNKNOWN' else '')], lines)
-        self.assertIn('mergeable: GitHub says CONFLICTING', self.failures(clean_pr(mergeable='CONFLICTING')))
+        # #32: the branch cases are routed, not final.
+        self.assertEqual(['behind: the branch is behind the base branch - an UPDATE round'],
+                         self.failures(clean_pr(mergeStateStatus='BEHIND')))
+        self.assertEqual(['conflict: GitHub says MERGEABLE, merge state DIRTY - an UPDATE round'],
+                         self.failures(clean_pr(mergeStateStatus='DIRTY')))
+        self.assertEqual(['conflict: GitHub says CONFLICTING, merge state CLEAN - an UPDATE round'],
+                         self.failures(clean_pr(mergeable='CONFLICTING')))
         self.assertIn('mergeable: GitHub says UNKNOWN (retry in ~30s)', self.failures(clean_pr(mergeable='UNKNOWN')))
         self.assertIn('state: PR is MERGED, not OPEN', self.failures(clean_pr(state='MERGED')))
 
@@ -639,6 +646,393 @@ class MergeCheck(unittest.TestCase):
         self.assertNotIn('ok\n', self.out.getvalue())
 
 
+def check(name, bucket, state=None, link=None, workflow='CI'):
+    return dict(name=name, bucket=bucket, state=state or {'pass': 'SUCCESS', 'fail': 'FAILURE', 'pending': 'IN_PROGRESS',
+                                                            'skipping': 'SKIPPED', 'cancel': 'CANCELLED'}[bucket],
+                link=link or f'https://github.com/o/r/actions/runs/9{len(name)}/job/5{len(name)}', workflow=workflow)
+
+
+def remove_tree(path):
+    """rmtree that also removes git's read-only object files on Windows."""
+    def writable(function, target, *_):
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable)
+    else:
+        shutil.rmtree(path, onerror=writable)
+
+
+def scratch(case, prefix):
+    """A temporary folder outside the checkout, removed after the test - and proved removed."""
+    folder = Path(tempfile.mkdtemp(prefix=prefix))
+    case.addCleanup(lambda: case.assertFalse(folder.exists(), f'{folder} was left behind'))
+    case.addCleanup(remove_tree, folder)             # cleanups run last-in first-out: removal, then the check
+    return folder
+
+
+class MergeReadiness(unittest.TestCase):
+    """#32: merge-check routes the ordinary cases (CI pending or failed, behind, conflict); wait-ci,
+    update-check, merge-round, ci-log and ci-rerun keep the routing in code."""
+
+    def setUp(self):
+        self.folder = scratch(self, 'wb-ready-')
+        self.state = self.folder / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
+        hub.reload_paths()
+        (self.state / 'relay.json').write_text(json.dumps({'seen_open': [7]}), encoding='utf-8')
+        self.out = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.out))
+
+    def classify(self, status, checks, required=()):
+        return wb.check_state(clean_pr(mergeStateStatus=status), {'all': checks, 'required': set(required)})
+
+    # --- classification -------------------------------------------------------------------------------
+
+    def test_pending_and_failed_checks_are_routed(self):
+        self.assertEqual(['ci-pending: 2 check(s) still running (build, lint) - start wb.py wait-ci'],
+                         self.classify('UNSTABLE', [check('build', 'pending'), check('lint', 'pending', 'QUEUED'),
+                                                    check('docs', 'pass')]))
+        self.assertEqual(['ci-failed: build FAILURE https://github.com/o/r/actions/runs/95/job/55'],
+                         self.classify('UNSTABLE', [check('build', 'fail'), check('docs', 'pass')]))
+        self.assertEqual([], [line for line in self.classify('UNSTABLE', [check('e2e', 'skipping'), check('b', 'fail')])
+                              if 'e2e' in line])                              # skipped checks never count
+
+    def test_required_checks_decide_and_an_optional_failure_is_final(self):
+        lines = self.classify('UNSTABLE', [check('build', 'pass'), check('codecov/patch', 'fail')], required=['build'])
+        self.assertEqual(['ci-optional-failed: codecov/patch FAILURE (not a required check; the human decides)'], lines)
+        lines = self.classify('BLOCKED', [check('build', 'pending', 'EXPECTED'), check('codecov/patch', 'pending')],
+                              required=['build'])
+        self.assertEqual(['ci-pending: 2 check(s) still running (build, codecov/patch) - start wb.py wait-ci'], lines)
+        self.assertEqual(['ci-failed: build CANCELLED https://github.com/o/r/actions/runs/95/job/55'],
+                         self.classify('BLOCKED', [check('build', 'cancel')], required=['build']))
+
+    def test_a_running_optional_check_is_waited_for(self):
+        # r22 M1: GitHub keeps UNSTABLE until optional checks finish too.
+        lines = self.classify('UNSTABLE', [check('build', 'pass'), check('lint-docs', 'pending')], required=['build'])
+        self.assertEqual(['ci-pending: 1 check(s) still running (lint-docs) - start wb.py wait-ci'], lines)
+        state, text = wb.ci_progress({'all': [check('build', 'pass'), check('lint-docs', 'pending')], 'required': {'build'}})
+        self.assertEqual(('running', '1 check(s) running: lint-docs'), (state, text))
+
+    def test_nothing_failed_is_reported_while_anything_runs(self):
+        # r22 m4: a failed job next to running ones is judged when the run is over.
+        lines = self.classify('UNSTABLE', [check('build', 'fail'), check('test', 'pending'), check('cov', 'fail')],
+                              required=['build', 'test'])
+        self.assertEqual(['ci-pending: 1 check(s) still running (test) - start wb.py wait-ci'], lines)
+
+    def test_blocked_or_unstable_without_ci_trouble_stays_final(self):
+        for status, checks in (('BLOCKED', [check('build', 'pass')]), ('UNSTABLE', []), ('BLOCKED', [])):
+            with self.subTest(status=status, checks=len(checks)):
+                self.assertEqual([f'mergeable: merge state is {status}, not CLEAN'], self.classify(status, checks))
+
+    def run_check(self, pr, checks, head=HEAD):
+        fetch = self.enterContext(patch.object(wb, 'fetch_checks', return_value=checks))
+        with patch.object(wb, 'fetch_pr', return_value=(pr, [])), \
+                patch.object(sys, 'argv', ['wb.py', 'merge-check', '--pr', '7', '--head', head]):
+            return wb.main(), fetch
+
+    def test_merge_check_reads_ci_only_for_the_tested_head_and_when_it_matters(self):
+        code, fetch = self.run_check(clean_pr(mergeStateStatus='UNSTABLE'),
+                                     {'all': [check('build', 'pending')], 'required': set()})
+        self.assertEqual(1, code)
+        self.assertIn('ci-pending: 1 check(s)', self.out.getvalue())
+        fetch.assert_called_once_with('7')
+        self.out.truncate(0)
+        code, fetch = self.run_check(clean_pr(mergeStateStatus='UNSTABLE', headRefOid='b' * 40),
+                                     {'all': [check('build', 'pending')], 'required': set()})
+        fetch.assert_not_called()                                              # another head: no CI verdict
+        self.assertNotIn('ci-', self.out.getvalue())
+        self.assertIn('head: the PR head is', self.out.getvalue())
+        code, fetch = self.run_check(clean_pr(), {'all': [], 'required': set()})
+        fetch.assert_not_called()
+        self.assertEqual(0, code)
+
+    def test_gh_pr_checks_exit_codes(self):
+        body = json.dumps([check('build', 'pending')])
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            return results.pop(0)
+        for results, expected in (([subprocess.CompletedProcess([], 8, body, '')], 1),
+                                  ([subprocess.CompletedProcess([], 1, body, '')], 1),
+                                  ([subprocess.CompletedProcess([], 1, '', 'no checks reported on the x branch')], 0),
+                                  ([subprocess.CompletedProcess([], 1, '', "no required checks reported on the 'x' branch")], 0)):
+            with self.subTest(results=results), patch.object(wb.subprocess, 'run', side_effect=fake):
+                self.assertEqual(expected, len(wb.gh_checks('7', required='required' in results[0].stderr)))
+        self.assertEqual(['gh', 'pr', 'checks', '7', '--json', 'name,state,bucket,link,workflow'], calls[0])
+        self.assertEqual('--required', calls[-1][-1])
+        with patch.object(wb.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'HTTP 502')):
+            with self.assertRaises(RuntimeError):
+                wb.gh_checks('7')
+
+    # --- wait-ci --------------------------------------------------------------------------------------
+
+    def wait_ci(self, verdicts, *extra, view=None):
+        clock = [0.0]
+        self.enterContext(patch.object(wb, 'now', lambda: clock[0]))
+        self.enterContext(patch.object(wb, 'pause', lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+        views = view or (lambda: {'state': 'OPEN', 'headRefOid': HEAD})
+        self.enterContext(patch.object(wb, 'gh_json', side_effect=lambda *args: views()))
+
+        def checks(pr):
+            value = verdicts.pop(0) if len(verdicts) > 1 else verdicts[0]
+            if isinstance(value, Exception):
+                raise value
+            return {'all': value, 'required': set()}
+        self.enterContext(patch.object(wb, 'fetch_checks', side_effect=checks))
+        with patch.object(sys, 'argv', ['wb.py', 'wait-ci', '--pr', '7', '--head', HEAD, *extra]):
+            return wb.main(), clock[0]
+
+    def test_wait_ci_waits_for_ci_to_start_then_to_finish(self):
+        code, _ = self.wait_ci([[], [check('build', 'pending')], [check('build', 'pending')],
+                                [check('build', 'pass'), check('lint', 'fail')]])
+        self.assertEqual(0, code)
+        lines = self.out.getvalue().strip().splitlines()
+        self.assertEqual(['no check has reported for this head yet', '1 check(s) running: build',
+                          'CI DONE: 1 passed, 1 failed'], lines)                    # one line per change
+
+    def test_wait_ci_with_no_ci_at_all_ends_after_the_grace(self):
+        code, elapsed = self.wait_ci([[]], '--no-ci-grace', '5')
+        self.assertEqual(0, code)
+        self.assertGreaterEqual(elapsed, 300)
+        self.assertIn('CI DONE: no CI reported for this head in 5 minutes', self.out.getvalue())
+
+    def test_wait_ci_never_takes_a_gh_failure_for_done(self):
+        code, elapsed = self.wait_ci([RuntimeError('HTTP 502')] * 12 + [[check('build', 'pass')]], '--no-ci-grace', '5')
+        self.assertEqual(0, code)
+        self.assertIn('CI DONE: 1 passed, 0 failed', self.out.getvalue())
+        self.assertGreater(elapsed, 300)                                       # past the grace, yet not "no CI"
+
+    def test_wait_ci_timeout_head_change_and_usage(self):
+        code, _ = self.wait_ci([[check('build', 'pending')]], '--timeout', '10')
+        self.assertEqual(3, code)
+        self.out.truncate(0)
+        code, _ = self.wait_ci([[check('build', 'pending')]], view=lambda: {'state': 'OPEN', 'headRefOid': 'b' * 40})
+        self.assertEqual(4, code)
+        code, _ = self.wait_ci([[]], view=lambda: {'state': 'MERGED', 'headRefOid': HEAD})
+        self.assertEqual(4, code)
+        with patch.object(sys, 'argv', ['wb.py', 'wait-ci', '--pr', '7', '--head', 'abc']), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, wb.main())
+
+    # --- merge-round ----------------------------------------------------------------------------------
+
+    def merge_round(self, pr, kind):
+        with patch.object(sys, 'argv', ['wb.py', 'merge-round', '--pr', str(pr), '--kind', kind]):
+            return wb.main()
+
+    def test_rounds_are_counted_per_kind_and_per_pr(self):
+        self.assertEqual([0, 0, 0, 1], [self.merge_round(7, 'update') for _ in range(4)])
+        self.assertEqual([0, 1], [self.merge_round(7, 'conflict') for _ in range(2)])
+        self.assertEqual([0, 1], [self.merge_round(7, 'ci-rerun') for _ in range(2)])
+        self.assertEqual([0, 1], [self.merge_round('https://github.com/o/r/pull/7', 'ci-fix') for _ in range(2)])
+        self.assertIn('the limit of 1 round(s) for PR #7 is reached - this goes to the human', self.out.getvalue())
+        self.assertEqual(0, self.merge_round(8, 'conflict'))                   # a new PR starts again
+        self.assertEqual({'pr': 8, 'conflict': 1}, json.loads((self.state / 'merge-rounds.json').read_text()))
+
+    # --- ci-log and ci-rerun --------------------------------------------------------------------------
+
+    def gh_boundary(self, checks, rerun_fails=False, view_fails=False, requeue_after=0, checks_fail=False):
+        """gh at the process boundary. After a rerun starts, its checks show as pending again after
+        `requeue_after` polls (None: never). A fake clock drives ci-rerun's wait for that."""
+        calls, reran, polls = [], set(), [0]
+        clock = [0.0]
+        self.enterContext(patch.object(wb, 'now', lambda: clock[0]))
+        self.enterContext(patch.object(wb, 'pause', lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:3] == ['pr', 'checks']:
+                if checks_fail:
+                    return subprocess.CompletedProcess(argv, 1, '', 'HTTP 502')
+                current = checks
+                if reran and '--required' not in argv:
+                    polls[0] += 1
+                    if requeue_after is not None and polls[0] > requeue_after:
+                        current = [dict(c, bucket='pending', state='QUEUED')
+                                   if (wb.RUN_LINK.search(c['link']) or [None, None])[1] in reran else c for c in checks]
+                return subprocess.CompletedProcess(argv, 1, json.dumps([] if '--required' in argv else current), '')
+            if argv[1:3] == ['run', 'view']:
+                if view_fails:
+                    return subprocess.CompletedProcess(argv, 1, '', 'run 11 is still in progress; logs will be available when it is complete')
+                return subprocess.CompletedProcess(argv, 0, '\n'.join(f'line {i}' for i in range(400)), '')
+            if argv[1:3] == ['run', 'rerun']:
+                if rerun_fails:
+                    return subprocess.CompletedProcess(argv, 1, '', 'HTTP 403')
+                reran.add(argv[3])
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            raise AssertionError(argv)
+        self.enterContext(patch.object(wb.subprocess, 'run', side_effect=fake))
+        return calls
+
+    def test_ci_log_writes_the_tail_of_each_failed_job(self):
+        calls = self.gh_boundary([check('build', 'fail', link='https://github.com/o/r/actions/runs/11/job/22'),
+                                  check('ext', 'fail', 'ERROR', link='https://ci.example/b/1'), check('ok', 'pass')])
+        with patch.object(sys, 'argv', ['wb.py', 'ci-log', '--pr', '7']):
+            self.assertEqual(0, wb.main())
+        path = self.folder / '.workbench/review/ci-r1.log'
+        text = path.read_text(encoding='utf-8')
+        self.assertIn(['gh', 'run', 'view', '11', '--log-failed', '--job', '22'], calls)
+        self.assertIn('line 399', text)
+        self.assertNotIn('line 249\n', text)                                   # the last 150 lines only
+        self.assertIn('ext ERROR - external CI, no log here: https://ci.example/b/1', text)
+        with patch.object(sys, 'argv', ['wb.py', 'ci-log', '--pr', '7']):
+            wb.main()
+        self.assertTrue((self.folder / '.workbench/review/ci-r2.log').exists())
+
+    def test_ci_log_never_passes_a_gh_error_off_as_the_log(self):
+        # r22 m3
+        self.gh_boundary([check('build', 'fail', link='https://github.com/o/r/actions/runs/11/job/22')], view_fails=True)
+        with patch.object(sys, 'argv', ['wb.py', 'ci-log', '--pr', '7']), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(2, wb.main())
+        text = (self.folder / '.workbench/review/ci-r1.log').read_text(encoding='utf-8')
+        self.assertIn('(gh run view failed: run 11 is still in progress', text)
+        self.assertIn('no job log could be fetched', err.getvalue())
+
+    def test_ci_rerun_once_then_the_fix_round(self):
+        calls = self.gh_boundary([check('build', 'fail', link='https://github.com/o/r/actions/runs/11/job/22'),
+                                  check('test', 'fail', link='https://github.com/o/r/actions/runs/11/job/23')],
+                                 requeue_after=2)
+        with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
+            self.assertEqual(0, wb.main())
+            self.assertIn('rerun started: 2 check(s) pending again - start wb.py wait-ci', self.out.getvalue())
+            self.assertEqual(1, wb.main())                                     # the one rerun is used
+        self.assertEqual([['gh', 'run', 'rerun', '11', '--failed']], [c for c in calls if c[1:3] == ['run', 'rerun']])
+
+    def test_ci_rerun_counts_nothing_unless_a_rerun_started(self):
+        # r22 M2: exit 2 is operational (retry), 1 is only a refusal; the round is spent only on a start.
+        failed = [check('build', 'fail', link='https://github.com/o/r/actions/runs/11/job/22')]
+        for kwargs in ({'rerun_fails': True}, {'checks_fail': True}):
+            with self.subTest(**kwargs):
+                self.gh_boundary(failed, **kwargs)
+                with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
+                    self.assertEqual(2, wb.main())
+                self.assertFalse((self.state / 'merge-rounds.json').exists())
+        self.assertIn('retry ci-rerun', self.out.getvalue())
+
+    def test_ci_rerun_waits_until_the_old_results_are_gone(self):
+        # r22 m1: wait-ci must never read the failed results the rerun is replacing.
+        self.gh_boundary([check('build', 'fail', link='https://github.com/o/r/actions/runs/11/job/22')], requeue_after=None)
+        with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
+            self.assertEqual(2, wb.main())
+        self.assertIn('rerun started, but its checks did not show as pending within 120s', self.out.getvalue())
+        self.assertEqual({'pr': 7, 'ci-rerun': 1}, json.loads((self.state / 'merge-rounds.json').read_text()))
+
+    def test_a_used_rerun_is_refused_before_any_gh_call(self):
+        (self.state / 'merge-rounds.json').write_text(json.dumps({'pr': 7, 'ci-rerun': 1}), encoding='utf-8')
+        calls = self.gh_boundary([check('build', 'fail')])
+        with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
+            self.assertEqual(1, wb.main())
+        self.assertEqual([], calls)
+
+    def test_external_ci_cannot_be_rerun(self):
+        self.gh_boundary([check('ext', 'fail', 'ERROR', link='https://ci.example/b/1')])
+        with patch.object(sys, 'argv', ['wb.py', 'ci-rerun', '--pr', '7']):
+            self.assertEqual(1, wb.main())
+        self.assertIn('nothing to rerun: ext - go to a FIX round', self.out.getvalue())
+        self.assertFalse((self.state / 'merge-rounds.json').exists())         # no round spent
+
+
+class UpdateCheck(unittest.TestCase):
+    """#32: an UPDATE round is exactly one merge of the pinned base into the reviewed head (real git)."""
+
+    def setUp(self):
+        self.repo = scratch(self, 'wb-update-')     # a git repo: never inside the checkout (r22b)
+        (self.repo / '.workbench').mkdir(parents=True)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.repo / '.workbench')}))
+        self.out = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.out))
+        self.git('init', '-q', '-b', 'main')
+        (self.repo / '.gitignore').write_text('.workbench/\n')
+        self.write('a.txt', 'one\ntwo\nthree\n')
+        self.commit('base')
+        self.git('checkout', '-q', '-b', 'issue')
+        self.write('b.txt', 'feature\n')
+        self.commit('feature')
+        self.reviewed = self.sha('HEAD')
+        self.git('checkout', '-q', 'main')
+
+    def git(self, *args, check=True):
+        return subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                               '-c', 'core.autocrlf=false', *args], capture_output=True, text=True, check=check)
+
+    def write(self, name, text):
+        (self.repo / name).write_text(text, encoding='utf-8', newline='\n')
+
+    def commit(self, message):
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', message)
+
+    def sha(self, ref):
+        return self.git('rev-parse', ref).stdout.strip()
+
+    def check(self, base):
+        with patch.object(sys, 'argv', ['wb.py', 'update-check', '--reviewed', self.reviewed, '--base', base]):
+            return wb.main()
+
+    def main_moves(self, text='one\nTWO\nthree\n'):
+        self.write('a.txt', text)
+        self.commit('main moves')
+        base = self.sha('HEAD')
+        self.git('checkout', '-q', 'issue')
+        return base
+
+    def test_a_clean_merge_is_clean(self):
+        base = self.main_moves()
+        self.git('merge', '--no-ff', '-q', '-m', 'update', base)
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: clean', self.out.getvalue())
+
+    def test_a_resolved_conflict_is_a_conflict(self):
+        base = self.main_moves()
+        self.write('a.txt', 'one\nzwei\nthree\n')                              # the issue changed the same line
+        self.commit('issue edit')
+        self.reviewed = self.sha('HEAD')
+        self.git('merge', '--no-ff', '-q', '-m', 'update', base, check=False)
+        self.write('a.txt', 'one\nzwei/TWO\nthree\n')
+        self.commit('resolve')
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: conflict - review the resolution: git show --remerge-diff', self.out.getvalue())
+
+    def test_an_edit_slipped_into_a_clean_merge_is_a_conflict(self):
+        # r22 m5: the merge itself needs no resolution; only the extra edit makes it non-empty.
+        base = self.main_moves()                                               # the reviewed head from setUp
+        merged = self.git('merge', '--no-ff', '--no-commit', base, check=False)
+        self.assertEqual(0, merged.returncode, merged.stdout + merged.stderr)  # a clean merge
+        self.assertEqual('one\nTWO\nthree\n', (self.repo / 'a.txt').read_text(encoding='utf-8'))
+        self.write('b.txt', 'feature, quietly changed\n')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'update')
+        self.assertEqual(0, self.check(base))
+        self.assertIn('update: conflict', self.out.getvalue())
+
+    def test_anything_but_one_merge_of_the_pinned_base_is_refused(self):
+        base = self.main_moves()
+        self.git('rebase', '-q', base)                                          # a rebase: no merge commit
+        self.assertEqual(1, self.check(base))
+        self.assertIn('is not a merge commit', self.out.getvalue())
+        self.git('reset', '-q', '--hard', self.reviewed)
+        self.git('merge', '--no-ff', '-q', '-m', 'update', base)
+        self.write('c.txt', 'extra\n')
+        self.commit('an extra commit')                                         # smuggled work
+        self.out.truncate(0)
+        self.assertEqual(1, self.check(base))
+        self.assertIn('exactly one (the merge) is allowed', self.out.getvalue())
+        self.git('reset', '-q', '--hard', 'HEAD~1')
+        self.write('b.txt', 'uncommitted\n')
+        self.out.truncate(0)
+        self.assertEqual(1, self.check(base))
+        self.assertIn('uncommitted changes', self.out.getvalue())
+        self.git('checkout', '-q', '--', 'b.txt')
+        self.out.truncate(0)
+        self.assertEqual(1, self.check(self.sha('main~1')))                     # not the base the mail named
+        self.assertIn('not the base', self.out.getvalue())
+        self.assertEqual(0, self.check(base))
+
+
 class Settings(unittest.TestCase):
     def setUp(self):
         self.folder = Path(__file__).resolve().parent.parent / ('test wb settings ' + uuid.uuid4().hex)
@@ -758,6 +1152,32 @@ class AutoMergeProse(unittest.TestCase):
                        'new head with the whole suite re-run on it']:
             self.assertIn(needle, auto)
         self.assertLess(auto.index('Wait for the relay first'), auto.index('merge-check --pr <N> --head <full sha>'))
+
+    def test_the_routed_failures_are_in_the_auto_merge_branch_only(self):
+        # #32
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        auto = ' '.join(text.split('### Auto-merge')[1].split('### The human')[0].split())
+        for needle in ['Only here, in the auto-merge branch', '| `ci-pending:` |', 'wb.py" wait-ci --pr <N> --head <full sha>',
+                       'was **killed** (low memory) means "rerun merge-check", never "CI done"',
+                       '| `ci-failed:` | Reported only once nothing is running', 'wb.py ci-rerun --pr <N>',
+                       'counted only when a rerun started', 'Exit 2 is operational: retry ci-rerun',
+                       'required or optional', 'wb.py ci-log --pr <N>', '--kind ci-fix',
+                       '| `behind:` / `conflict:` |', '`UPDATE <default> <base sha>`', 'git merge --no-ff <base sha>',
+                       '**never rebase, never force-push**', 'wb.py" update-check --reviewed <reviewed head sha> --base <base sha>',
+                       '`update: clean`', '`update: conflict`', '--kind update', '--kind conflict', 'CANNOT-RESOLVE',
+                       'never `--force` or `--force-with-lease`', '`ci-optional-failed:`, `head:`, `state:`, `mergeable:`']:
+            self.assertIn(needle, auto)
+        self.assertNotIn('UPDATE <default>', text.split('### The human')[1])
+
+    def test_both_implementers_know_update(self):
+        for path in ('claude/commands/workbench-implementer.md', 'codex/skills/workbench-implementer/SKILL.md'):
+            with self.subTest(path=path):
+                text = ' '.join((Path(__file__).resolve().parent.parent / path).read_text(encoding='utf-8').split())
+                for needle in ['## UPDATE - bring the branch up to date', '`git merge --no-ff <base sha>`',
+                               '**Never rebase, never `git pull`, never amend, squash or force-push**',
+                               'Add nothing else to the merge commit', 'Reply `UPDATED <sha>`',
+                               '`git merge --abort` and reply `CANNOT-RESOLVE <why>`', 'update-check']:
+                    self.assertIn(needle, text)
 
     def test_implementer_never_merges(self):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/workbench-implementer.md').read_text(encoding='utf-8')

@@ -327,7 +327,38 @@ on, you merge only when **all** of these hold:
 
    **Retryable failures:** `relay:` (wait for the relay's mail), `mail:` (read and handle the mail),
    and a merge state of `UNKNOWN` ("retry in ~30s", run once more after about 30 seconds). Handle
-   them, then check again. Every other failure is final for this head.
+   them, then check again.
+
+   **Routed failures (#32)** - the ordinary reasons a clean-reviewed PR is not mergeable yet. Only
+   here, in the auto-merge branch; without auto-merge they are reported like any other failure.
+
+   | merge-check line | what you do |
+   |---|---|
+   | `ci-pending:` | Any check still running, required or optional (merge-check reports nothing else about CI until all are done). Start `python "$AGWORKBENCH/lib/wb.py" wait-ci --pr <N> --head <full sha>` in the background (it is not a mail waiter; keep your one mail waiter too) and end your turn. When it ends: exit 0 (`CI DONE`) - run merge-check again; exit 4 (head changed / PR not open) - stop and look; exit 3 (timeout) - the human's. A wait-ci that was **killed** (low memory) means "rerun merge-check", never "CI done". |
+   | `ci-failed:` | Reported only once nothing is running. A GitHub Actions check: `wb.py ci-rerun --pr <N>` (once; counted only when a rerun started). Exit 0: wait-ci, then merge-check. Exit 2 is operational: retry ci-rerun, or, when it says `rerun started`, run wait-ci. Still `ci-failed:`, or ci-rerun exits 1 (external CI, or the rerun is used): `wb.py merge-round --pr <N> --kind ci-fix`, then `wb.py ci-log --pr <N>` (exit 2: no job log could be fetched yet - retry it) and a `FIX r<K>` round whose evidence is the log file it wrote; after the fix, the whole suite, push, wait-ci, merge-check. Still red, or merge-round refuses: the human's. |
+   | `behind:` / `conflict:` | An UPDATE round, below. |
+   | `ci-optional-failed:`, `head:`, `state:`, `mergeable:`, and every other line | Final for this head: the human's. |
+
+   **An UPDATE round.** Run `git fetch origin` (the implementer may have no network) and note
+   `git rev-parse origin/<default>` - the base SHA. Mail the implementer `UPDATE <default> <base sha>`:
+   merge exactly that SHA into the issue branch with `git merge --no-ff <base sha>` (never `git pull`,
+   **never rebase, never force-push**), resolve any conflicts, run the whole suite, and reply
+   `UPDATED <sha>` or `CANNOT-RESOLVE <why>`. On `UPDATED`, prove it before anything else:
+
+   ```bash
+   python "$AGWORKBENCH/lib/wb.py" update-check --reviewed <reviewed head sha> --base <base sha>
+   ```
+
+   It refuses anything but one merge commit of that base onto the reviewed head, with a clean tree
+   (exit 1: the human's). It prints `update: clean` (git's own merge, nothing added) or
+   `update: conflict` (a non-empty `git show --remerge-diff`: read that diff like a fix - resolved
+   conflicts and anything else added in the merge). Then count it:
+   `wb.py merge-round --pr <N> --kind update` for clean, `--kind conflict` for conflict. A refusal
+   (the fourth clean catch-up, or a second conflict) or `CANNOT-RESOLVE` goes to the human. Push with
+   a plain `git push` (never `--force` or `--force-with-lease`; a rejected push means the remote
+   moved - a new round), then wait-ci and merge-check with the new head.
+
+   Every other failure is final for this head.
 
    **Check again after any event that could change the verdict**, such as the hold's author lifting
    it, or a fix round pushing a new head with the whole suite re-run on it. Run the auto-merge check
