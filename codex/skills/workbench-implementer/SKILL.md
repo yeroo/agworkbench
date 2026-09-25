@@ -85,6 +85,23 @@ if you think the human is wrong, say why once, clearly, and let Claude take it t
 When mail says the loop is complete, or the relay reports the PR MERGED or CLOSED, stop: do not
 reply. An unread reply would hold up the autonomous close (#27).
 
+## UPDATE - bring the branch up to date (auto-merge, #32)
+
+`UPDATE <default> <base sha>` means the PR fell behind or conflicts with the default branch. The
+planner has fetched; merge exactly the SHA it names:
+
+1. `git merge --no-ff <base sha>` - a merge commit on top of the reviewed commits. **Never rebase,
+   never `git pull`, never amend, squash or force-push**: the reviewed commits must stay exactly as
+   they are.
+2. Resolve any conflicts, keeping both sides' intent. Add nothing else to the merge commit: no fixes,
+   no refactors. Anything that is not a conflict resolution belongs in a later round.
+3. Run the whole suite on the merge.
+4. Reply `UPDATED <sha>` with the suite's result and, for each conflicted file, what you kept. If
+   you cannot resolve it safely, `git merge --abort` and reply `CANNOT-RESOLVE <why>`.
+
+Claude checks the merge (`wb.py update-check`) before it pushes: a second commit, a rebase or a
+dirty tree is refused.
+
 ## HANDOVER - you replace another implementer mid-loop
 
 A mail with subject `HANDOVER` means the previous implementer (Codex or Claude) hit its usage

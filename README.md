@@ -474,6 +474,21 @@ words fail safe: "I'll wait for CI" holds too. The merge is `gh pr merge --merge
 --match-head-commit <sha>`, so GitHub refuses it if anything was pushed after the tests ran. A
 comment on the PR then states each checked condition.
 
+**Keeping the PR mergeable (#32).** With auto-merge on, the planner handles the ordinary reasons
+a clean-reviewed PR cannot merge yet itself. merge-check names each one:
+
+| line | what happens |
+|---|---|
+| `ci-pending:` | Required checks are still running (a check that never started counts too). `wb.py wait-ci` waits in the background, and the check runs again when CI is done. It never counts a head without any check yet as done: a repo with no CI at all is "done" only after 5 minutes of no checks. |
+| `ci-failed:` | A required check failed. A GitHub Actions run is rerun once (`wb.py ci-rerun`). If it is still red, one fix round follows, with the failed jobs' log (`wb.py ci-log`) as evidence. If it is still red after that, it's yours. |
+| `behind:` / `conflict:` | An **UPDATE round**. The planner fetches, and the implementer merges exactly that base commit into the branch with `git merge --no-ff`: never a rebase, never a force-push, and nothing else in the merge. It runs the whole suite. `wb.py update-check` then proves the result is one merge commit of that base onto the reviewed head, with a clean tree. If `git show --remerge-diff` is empty, the merge is clean. If not, the resolution is reviewed like a fix. |
+| `ci-optional-failed:` and everything else | Final: the PR waits for you. |
+
+Only the required checks count when branch protection names any; otherwise every check that ran
+counts. The limits are kept in code (`wb.py merge-round`, per PR): 3 clean catch-ups, 1 conflict
+round, 1 CI rerun and 1 CI fix round. Anything beyond them, or `CANNOT-RESOLVE` from the
+implementer, goes to you. Without auto-merge none of this runs: the lines are only reported.
+
 If any condition fails, the reasons go on the PR and in chat, and the PR waits for you as usual.
 The choice is saved per checkout like the implementer: a rerun without the switch keeps it,
 `-NoAutoMerge` turns it off (even while the agents are running), and a queue saves either switch and
