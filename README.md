@@ -97,6 +97,40 @@ github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous
 ```
 
 **`-Queue bugs`** is `label:<bugLabel>`, with `bugLabel` in `~/.agworkbench.json`, default `bug`.
+
+**`-Queue 'where: <query>'`** selects open issues with a boolean label query (#38):
+
+```powershell
+github-workbench -Queue 'where: bug AND priority IN [P0, P1] AND NOT wontfix' -Repo yeroo/docxy -Autonomous -Triage
+github-workbench -Queue 'where: (bug OR follow-up) AND priority NOT IN [P2, P3]' -Repo yeroo/docxy
+github-workbench -Queue "where: label IN [bug, regression] AND NOT 'needs design'" -Repo yeroo/docxy
+```
+
+- **Operators:** `NOT` binds tighter than `AND`, which binds tighter than `OR`. Parentheses
+  override that: `bug AND (priority IN [P0] OR ux)` is not `bug AND priority IN [P0] OR ux` (the
+  second also takes every `ux` issue). There is no implicit AND: `bug wontfix` is an error.
+- **Membership:** `KEY IN [a, b]` means the issue has the label `KEY:a` or `KEY:b`, exactly and
+  case-insensitively, which fits `priority:P0`. The key `label` means the bare names:
+  `label IN [bug, regression]` is `bug OR regression`. `NOT IN` is the negation, so it also takes
+  issues with no such label at all: `priority NOT IN [P2, P3]` includes the untriaged ones, and an
+  unknown key under `NOT IN` matches everything.
+- **Labels:** a bare label is letters, digits and `: - _ . /`. Anything else is quoted with `"..."`
+  or `'...'`, and a backslash escapes the next character: `"good first issue"`, `'c++'`, `"🐛"`. A
+  label spelled `and`, `or`, `not` or `in` must be quoted too. Keywords and labels match in any
+  case.
+- **Evaluation:** the query is evaluated locally over every open issue of the repo, PRs excluded,
+  from one paginated listing. The usual rules then apply: the skip reasons, priority order,
+  `-Triage` and `-DryRun`. `-DryRun` also prints the query in canonical form and the number of
+  matches.
+- **Errors:** a malformed query prints the column and what was expected, and exits 2 before
+  anything is read or written.
+- **`-Watch`:** the query is the watched spec and is re-evaluated on each rescan. The queue keeps
+  one watched spec. The same query spelled differently (case, spaces, quotes, redundant
+  parentheses) counts as the same, but other logic does not, even if it is equivalent (`a AND b`
+  vs `b AND a`, `label IN [a]` vs `a`), and neither does a `label:` spec.
+- **Windows PowerShell 5.1:** it strips double quotes from a program's arguments, so the launcher
+  hands the spec to the conductor through the environment (`AGWORKBENCH_QUEUE_SPEC`). Quotes arrive
+  exactly on both shells.
 A label spec, `bugs` or `label:X`, queues only issues nobody is handling yet. Each issue it leaves
 out is printed as `#N skipped: <reason>`:
 - `pr`: an open pull request will close it, or an open PR is on its `issue-<N>-*` branch in this
@@ -532,6 +566,7 @@ lib/relay.py                mail doorbell and PR watcher; spots usage limits in 
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
 lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
 lib/triage.py               priority labels for a product repo's issues, from its private spec repos (#34)
+lib/labelquery.py           the boolean label query behind -Queue 'where: ...' (#38)
 lib/helper_done.py          a helper session's completion marker (#33)
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude

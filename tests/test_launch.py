@@ -1315,7 +1315,8 @@ class QueueEntry(LauncherFixtures):
                               parallel=1, watch=False, yes=False, label=None, owner=None, members=[member]))
         self.entry_lib = self.temp / 'queue entry'
         self.entry_lib.mkdir()
-        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py', 'triage.py']:
+        for name in ['github-workbench.ps1', 'conductor.py', 'agw.py', 'hub.py', 'closer.py', 'limits.py', 'triage.py',
+                     'labelquery.py']:
             shutil.copyfile(LIB / name, self.entry_lib / name)
         self.overrides = (
             "\nfunction Get-IssueInfo { return @{title='fix-x';state='OPEN'} }\n"
@@ -1340,17 +1341,39 @@ class QueueEntry(LauncherFixtures):
         with self.store.transaction() as data:
             data['members'][0].update(state='launching', token=self.token, result=None)
 
-    def test_queue_bugs_reaches_the_conductor_unchanged(self):
-        # #28: `bugs` is resolved by the conductor, so the launcher passes it through as a spec.
-        args_file = self.temp / 'conductor-args.txt'
-        self.cmd('python', f'echo %* > "{args_file}"')
-        result = subprocess.run([PWSH, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'),
-                                 '-Queue', 'bugs', '-Repo', 'o/repo', '-Watch', '-Autonomous'],
+    def conductor_start(self, spec, *extra, shell=PWSH):
+        """Run the launcher with a python stub that records its argv and the spec variable."""
+        dump = self.temp / 'conductor-start.json'
+        dump.unlink(missing_ok=True)
+        (self.temp / 'dump_start.py').write_text(
+            'import json, os, sys\n'
+            f'json.dump({{"args": sys.argv[1:], "spec": os.environ.get("AGWORKBENCH_QUEUE_SPEC")}}, '
+            f'open(r"{dump}", "w", encoding="utf-8"))\n', encoding='utf-8')
+        self.cmd('python', f'"{sys.executable}" "{self.temp / "dump_start.py"}" %*')
+        result = subprocess.run([shell, '-NoProfile', '-File', str(self.entry_lib / 'github-workbench.ps1'),
+                                 '-Queue', spec, '-Repo', 'o/repo', *extra],
                                 env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=45)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        args = args_file.read_text(encoding='utf-8', errors='replace')
-        self.assertIn('start --spec bugs --repo o/repo --watch', args)
-        self.assertIn('--autonomous', args)
+        return json.loads(dump.read_text(encoding='utf-8'))
+
+    def test_queue_bugs_reaches_the_conductor_unchanged(self):
+        # #28: `bugs` is resolved by the conductor, so the launcher passes it through as a spec.
+        seen = self.conductor_start('bugs', '-Watch', '-Autonomous')
+        self.assertEqual(['start', '--spec-env', '--repo', 'o/repo', '--watch'], seen['args'][1:6])
+        self.assertIn('--autonomous', seen['args'])
+        self.assertEqual('bugs', seen['spec'])
+
+    def test_a_query_spec_reaches_the_conductor_exactly_under_both_shells(self):
+        # #38: 5.1 strips double quotes from a native argument; the spec goes through the environment.
+        import labelquery
+        spec = r'''where: label IN [bug, "a, b [c]"] AND NOT "needs design" AND 'it\'s' OR "q\"x" OR "back\\slash" OR "a & b"'''
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            with self.subTest(shell=shell):
+                seen = self.conductor_start(spec, shell=shell)
+                self.assertEqual(spec, seen['spec'])
+                self.assertNotIn(spec, seen['args'])
+                self.assertEqual(labelquery.parse(spec[6:]), labelquery.parse(seen['spec'][6:]))
+                self.assertFalse(any('AGWORKBENCH_QUEUE_SPEC' in arg for arg in seen['args']))
 
     def launcher(self, *args, shell=PWSH):
         args_file = self.temp / 'python-args.txt'

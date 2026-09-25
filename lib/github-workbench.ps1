@@ -36,6 +36,9 @@
 .EXAMPLE
   github-workbench -Queue bugs -Repo yeroo/docxy -Autonomous -Triage   # P0 first; untriaged triaged first
 .EXAMPLE
+  github-workbench -Queue 'where: bug AND priority IN [P0, P1] AND NOT wontfix' -Repo yeroo/docxy
+  github-workbench -Queue "where: label IN [bug, regression] AND NOT 'needs design'" -Repo yeroo/docxy
+.EXAMPLE
   github-workbench -Triage -Repo yeroo/docxy            # label every untriaged open issue priority:P0..P3
   github-workbench -Triage -Repo yeroo/docxy -Watch     # and keep doing it for new ones, in its own session
   github-workbench -Retriage -Repo yeroo/docxy -DryRun  # re-judge the labelled ones too; print, write nothing
@@ -116,7 +119,9 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
         Write-Host 'Queue requires agwinterm, a spec and Parallel 1..8; Issue/NewSession/NoRelay/internal member options cannot be combined with it.'
         exit 2
     }
-    $queueArgs = @((Join-Path $script:Lib 'conductor.py'), 'start', '--spec', $Queue)
+    # The spec travels in the environment, not argv: Windows PowerShell 5.1 strips the double quotes
+    # out of a native argument, and a query quotes labels (#38).
+    $queueArgs = @((Join-Path $script:Lib 'conductor.py'), 'start', '--spec-env')
     if ($Repo) { $queueArgs += @('--repo', $Repo) }
     if ($PSBoundParameters.ContainsKey('Parallel')) { $queueArgs += @('--parallel', "$Parallel") }
     if ($Watch) { $queueArgs += '--watch' }
@@ -133,8 +138,14 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
         Write-Host '-Retriage and -Limit belong to -Triage without -Queue; a queue triages each untriaged member once.' -ForegroundColor Yellow
         exit 2
     }
-    & python @queueArgs
-    exit $LASTEXITCODE
+    $env:AGWORKBENCH_QUEUE_SPEC = $Queue
+    try {
+        & python @queueArgs
+        $code = $LASTEXITCODE
+    } finally {
+        Remove-Item Env:\AGWORKBENCH_QUEUE_SPEC -ErrorAction SilentlyContinue
+    }
+    exit $code
 }
 if ($Triage -or $Retriage) {
     # Issue triage (#34): lib/triage.py labels the repo's open issues priority:P0..P3.
@@ -166,7 +177,7 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $PSBoun
 if (-not $Issue) {
     Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
-    Write-Host "       (<spec> is a list like 3,4,5, label:<name>, or bugs = label:<bugLabel>)"
+    Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
     Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-Watch]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
