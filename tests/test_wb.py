@@ -2,8 +2,10 @@
 
 import contextlib
 import io
+import json
 import os
 import shutil
+import subprocess
 import sys
 import unittest
 import uuid
@@ -378,6 +380,293 @@ class RevmuxProfile(unittest.TestCase):
             with self.subTest(text=text):
                 self.save(text)
                 self.assertIn("-Profile 'comprehensive'", self.run_round())
+
+
+HEAD = 'a' * 40
+MARK = wb.PLANNER_MARKER
+
+
+def clean_pr(**changes):
+    pr = dict(number=7, url='https://github.com/o/r/pull/7', state='OPEN', mergeable='MERGEABLE',
+              mergeStateStatus='CLEAN', reviewDecision='', headRefOid=HEAD, reviews=[], comments=[])
+    pr.update(changes)
+    return pr
+
+
+def comment(body, when, who='yeroo'):
+    return {'body': body, 'createdAt': when, 'author': {'login': who}}
+
+
+class MergeCheck(unittest.TestCase):
+    """#23: the read-only auto-merge gate. Conditions are pure; one test covers the gh wiring."""
+
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb merge ' + uuid.uuid4().hex)
+        self.state = self.folder / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.addCleanup(hub.reload_paths)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench'), 'AI_BOX': 'claude'}))
+        hub.reload_paths()
+        self.seen([7])
+        self.out = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.out))
+
+    def seen(self, numbers):
+        (self.state / 'relay.json').write_text(json.dumps({'seen_open': numbers}), encoding='utf-8')
+
+    def mail(self, sender, folder=''):
+        box = self.folder / '.workbench/inbox/claude' / folder
+        box.mkdir(parents=True, exist_ok=True)
+        (box / f'm-{sender}.md').write_text(f'---\nid: m-{sender}\nfrom: {sender}\nto: claude\nsubject: note\n---\nbody\n',
+                                            encoding='utf-8')
+
+    def failures(self, pr=None, inline=(), head=HEAD):
+        return wb.merge_failures(pr or clean_pr(), list(inline), head, self.folder)
+
+    def run_check(self, *args, fetched=None):
+        fetch = patch.object(wb, 'fetch_pr', return_value=fetched or (clean_pr(), []))
+        with fetch, patch.object(sys, 'argv', ['wb.py', 'merge-check', *args]):
+            return wb.main()
+
+    # --- the verdict ------------------------------------------------------------------------------
+
+    def test_every_condition_holding_prints_ok(self):
+        self.assertEqual([], self.failures())
+        self.assertEqual(0, self.run_check('--pr', '7', '--head', HEAD))
+        self.assertEqual('ok', self.out.getvalue().strip())
+
+    def test_failures_exit_1_one_prefixed_line_each(self):
+        self.seen([])
+        code = self.run_check('--pr', '7', '--head', HEAD,
+                              fetched=(clean_pr(state='CLOSED', headRefOid='b' * 40), []))
+        self.assertEqual(1, code)
+        lines = self.out.getvalue().strip().splitlines()
+        self.assertEqual(['state:', 'relay:', 'head:'], [line.split()[0] for line in lines])
+        self.assertNotIn('ok', lines)
+
+    def test_head_is_required_and_must_be_a_full_sha(self):
+        for head in ([], ['--head', 'abc1234'], ['--head', 'g' * 40]):
+            with self.subTest(head=head), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    code = self.run_check('--pr', '7', *head)
+                except SystemExit as exit_:
+                    code = exit_.code
+                self.assertEqual(2, code)
+        self.assertNotIn('ok', self.out.getvalue())
+
+    # --- (a) GitHub's merge state --------------------------------------------------------------
+
+    def test_only_open_mergeable_clean_passes(self):
+        for status in ('UNSTABLE', 'BLOCKED', 'BEHIND', 'DIRTY', 'UNKNOWN', 'HAS_HOOKS'):
+            with self.subTest(status=status):
+                lines = self.failures(clean_pr(mergeStateStatus=status))
+                self.assertEqual([f'mergeable: merge state is {status}, not CLEAN' +
+                                  (' (retry in ~30s)' if status == 'UNKNOWN' else '')], lines)
+        self.assertIn('mergeable: GitHub says CONFLICTING', self.failures(clean_pr(mergeable='CONFLICTING')))
+        self.assertIn('mergeable: GitHub says UNKNOWN (retry in ~30s)', self.failures(clean_pr(mergeable='UNKNOWN')))
+        self.assertIn('state: PR is MERGED, not OPEN', self.failures(clean_pr(state='MERGED')))
+
+    # --- (b) reviews ------------------------------------------------------------------------------
+
+    def test_changes_requested_blocks_until_that_reviewer_approves(self):
+        request = {'state': 'CHANGES_REQUESTED', 'body': '', 'submittedAt': '2026-09-24T10:00:00Z', 'author': {'login': 'ann'}}
+        approve = dict(request, state='APPROVED', submittedAt='2026-09-24T11:00:00Z')
+        self.assertEqual(['review: ann requested changes (2026-09-24T10:00:00Z)'],
+                         self.failures(clean_pr(reviews=[request])))
+        self.assertEqual([], self.failures(clean_pr(reviews=[approve, request])))
+        self.assertEqual(['review: the review decision is CHANGES_REQUESTED'],
+                         self.failures(clean_pr(reviewDecision='CHANGES_REQUESTED')))
+
+    # --- (c) holds --------------------------------------------------------------------------------
+
+    def test_a_hold_from_the_author_login_blocks_unless_the_planner_marked_it(self):
+        hold = comment('please hold, I want to look', '2026-09-24T10:00:00Z', who='yeroo')
+        lines = self.failures(clean_pr(comments=[hold]))
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].startswith('hold: yeroo at 2026-09-24T10:00:00Z: "please hold'), lines)
+        marked = comment('please hold, I want to look\n' + MARK, '2026-09-24T10:00:00Z')
+        self.assertEqual([], self.failures(clean_pr(comments=[marked])))
+
+    def test_holds_do_not_expire_and_only_a_later_unmarked_lift_releases_them(self):
+        hold = comment("don't merge yet", '2026-09-01T00:00:00Z')      # long before any later commit
+        self.assertTrue(self.failures(clean_pr(comments=[hold])))
+        lift = comment('go ahead', '2026-09-24T12:00:00Z')
+        self.assertEqual([], self.failures(clean_pr(comments=[lift, hold])))
+        early_lift = comment('resume', '2026-08-01T00:00:00Z')
+        self.assertTrue(self.failures(clean_pr(comments=[hold, early_lift])))
+        planner_lift = comment('go ahead\n' + MARK, '2026-09-24T12:00:00Z')
+        self.assertTrue(self.failures(clean_pr(comments=[hold, planner_lift])))
+
+    def test_hold_word_matching(self):
+        # r16 M1: bodies are normalised (apostrophes, emphasis, whitespace, case) before matching.
+        for body, holds in [('hold', True), ('Please WAIT', True), ('do not merge', True), ('dont merge', True),
+                            ("don't merge", True), ('Don\u2019t merge this yet', True), ('Don\u02bct merge', True),
+                            ('do not\nmerge', True), ('do not  merge', True), ('Do **not** merge', True),
+                            ('do-not-merge', True), ('DO NOT MERGE', True), ('waiting on legal', True),
+                            ('`wip`', True), ('unhold', False), ('household threshold', False),
+                            ('wipe the cache', False), ('hold, then go ahead', True),
+                            # r16 M2: negated lifts are holds
+                            ("don't go ahead", True), ('do not resume', True), ("don't unhold", True)]:
+            with self.subTest(body=body):
+                self.assertEqual(holds, bool(self.failures(clean_pr(comments=[comment(body, '2026-09-24T10:00:00Z')]))))
+
+    def test_only_the_hold_author_lifts_it_with_a_bare_directive(self):
+        # r16 M2
+        hold = comment('hold', '2026-09-24T10:00:00Z', who='yeroo')
+        for lift, released in [(comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo'), True),
+                               (comment('@claude resume.', '2026-09-24T11:00:00Z', who='yeroo'), True),
+                               (comment('Unhold please!', '2026-09-24T11:00:00Z', who='yeroo'), True),
+                               (comment('go ahead', '2026-09-24T11:00:00Z', who='ann'), False),
+                               (comment('I will resume reviewing tomorrow', '2026-09-24T11:00:00Z', who='yeroo'), False),
+                               (comment('go ahead and rename X first', '2026-09-24T11:00:00Z', who='yeroo'), False),
+                               (comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo[bot]'), False)]:
+            with self.subTest(lift=lift['body'], who=lift['author']['login']):
+                self.assertEqual(not released, bool(self.failures(clean_pr(comments=[hold, lift]))))
+        both = [hold, comment('wait', '2026-09-24T10:30:00Z', who='ann'),
+                comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo')]
+        lines = self.failures(clean_pr(comments=both))
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].startswith('hold: ann at'), lines)
+        bot_hold = comment('hold', '2026-09-24T10:00:00Z', who='ci[bot]')
+        self.assertTrue(self.failures(clean_pr(comments=[bot_hold, comment('go ahead', '2026-09-24T11:00:00Z', who='ci[bot]')])))
+
+    def test_labels_title_and_description_can_hold(self):
+        # r16 m3
+        for name in ('do-not-merge', 'DO NOT MERGE', 'on hold', 'WIP'):
+            with self.subTest(label=name):
+                self.assertEqual([f"label: the PR is labelled '{name}'"], self.failures(clean_pr(labels=[{'name': name}])))
+        self.assertEqual([], self.failures(clean_pr(labels=[{'name': 'enhancement'}])))
+        self.assertTrue(self.failures(clean_pr(title='[WIP] auto-merge'))[0].startswith('hold: the PR title'))
+        described = clean_pr(body='Do not merge until #24 lands', author={'login': 'yeroo'})
+        self.assertTrue(self.failures(described)[0].startswith('hold: yeroo at PR description'))
+        self.assertEqual([], self.failures(clean_pr(body='Do not merge until #24 lands\n' + MARK)))
+        lifted = dict(described, comments=[comment('go ahead', '2026-09-24T11:00:00Z', who='yeroo')])
+        self.assertEqual([], self.failures(lifted))
+
+    def test_review_bodies_and_inline_comments_can_hold(self):
+        review = {'state': 'COMMENTED', 'body': 'hold', 'submittedAt': '2026-09-24T10:00:00Z', 'author': {'login': 'yeroo'}}
+        self.assertTrue(self.failures(clean_pr(reviews=[review])))
+        inline = {'body': 'wait - this breaks X', 'created_at': '2026-09-24T10:00:00Z', 'user': {'login': 'yeroo'}}
+        self.assertTrue(self.failures(inline=[inline]))
+
+    # --- (d) relay, (e) mail, head ------------------------------------------------------------
+
+    def test_unread_human_or_github_mail_blocks(self):
+        self.mail('codex')
+        self.assertEqual([], self.failures())
+        self.mail('human', folder='read')
+        self.assertEqual([], self.failures())
+        for sender in ('human', 'github'):
+            with self.subTest(sender=sender):
+                self.mail(sender)
+                self.assertTrue(any(line.startswith(f'mail: unread from {sender}') for line in self.failures()))
+
+    def test_an_unreadable_unread_message_fails_closed(self):
+        # r16 m1
+        self.mail('human')
+        with patch.object(hub, 'parse_message', side_effect=UnicodeDecodeError('utf-8', b'x', 0, 1, 'bad')):
+            lines = self.failures()
+        self.assertEqual(1, len(lines))
+        self.assertTrue(lines[0].startswith('mail: cannot read unread message m-human.md'), lines)
+        with patch.object(hub, 'parse_message', side_effect=FileNotFoundError('moved')):
+            self.assertEqual([], self.failures())
+
+    def test_the_relay_must_have_seen_the_pr_open(self):
+        self.seen([6])
+        self.assertEqual(["relay: the relay has not recorded PR #7 as seen open yet - wait for its 'PR is open' "
+                          "mail, then check again"], self.failures())
+        (self.state / 'relay.json').unlink()
+        self.assertTrue(self.failures())
+
+    def test_the_tested_head_must_be_the_pr_head(self):
+        self.assertTrue(self.failures(head='b' * 40)[0].startswith('head: the PR head is ' + HEAD))
+        self.assertEqual([], self.failures(head=HEAD.upper()))
+
+    # --- the gh boundary ------------------------------------------------------------------------
+
+    def test_one_view_and_the_inline_comments_are_fetched(self):
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            payload = clean_pr() if argv[1:3] == ['pr', 'view'] else [[{'body': 'a'}], [{'body': 'b'}]]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), '')
+        with patch.object(wb.subprocess, 'run', side_effect=fake):
+            pr, inline = wb.fetch_pr('7')
+        self.assertEqual(['gh', 'pr', 'view', '7', '--json', wb.PR_FIELDS], calls[0])
+        self.assertEqual(['gh', 'api', 'repos/o/r/pulls/7/comments', '--paginate', '--slurp'], calls[1])
+        self.assertEqual(2, len(calls))
+        self.assertEqual([{'body': 'a'}, {'body': 'b'}], inline)
+        for field in ('headRefOid', 'mergeStateStatus', 'reviewDecision', 'reviews', 'comments',
+                      'labels', 'title', 'body', 'author'):
+            self.assertIn(field, wb.PR_FIELDS)
+
+    def test_a_gh_failure_is_not_ok(self):
+        failed = subprocess.CompletedProcess([], 1, '', 'HTTP 502')
+        with patch.object(wb.subprocess, 'run', return_value=failed), \
+                patch.object(sys, 'argv', ['wb.py', 'merge-check', '--pr', '7', '--head', HEAD]):
+            self.assertEqual(1, wb.main())
+        self.assertIn('gh: ', self.out.getvalue())
+        self.assertNotIn('ok\n', self.out.getvalue())
+
+
+class Settings(unittest.TestCase):
+    def setUp(self):
+        self.folder = Path(__file__).resolve().parent.parent / ('test wb settings ' + uuid.uuid4().hex)
+        (self.folder / '.workbench/state').mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.folder)
+        self.enterContext(patch.dict(os.environ, {'AI_HUB': str(self.folder / '.workbench')}))
+
+    def printed(self, record=None):
+        if record is not None:
+            (self.folder / '.workbench/state/implementer.json').write_text(record, encoding='utf-8')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), patch.object(sys, 'argv', ['wb.py', 'settings']):
+            self.assertEqual(0, wb.main())
+        return out.getvalue().strip()
+
+    def test_defaults_and_records(self):
+        self.assertEqual('implementer=codex revmuxProfile=comprehensive autoMerge=false', self.printed())
+        # a #20 record has no autoMerge key: off
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=false',
+                         self.printed('{"tool": "claude", "revmuxProfile": "claude-only"}'))
+        self.assertEqual('implementer=claude revmuxProfile=claude-only autoMerge=true',
+                         self.printed('{"tool": "claude", "revmuxProfile": "claude-only", "autoMerge": true}'))
+        self.assertIn('autoMerge=false', self.printed('{"tool": "codex", "autoMerge": "true"}'))
+
+
+class AutoMergeProse(unittest.TestCase):
+    """#23: the planner's conditions and the implementer's exclusion are in the prose."""
+
+    def test_planner_phase_6_and_rules(self):
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        phase6 = text.split('## Phase 6')[1].split('## Phase 7')[0]
+        for needle in ['wb.py" settings', 'autoMerge=true', 'wb.py" merge-check --pr <N> --head <full sha>',
+                       '--match-head-commit <full sha>', 'None is deferred', 'three-round cap',
+                       'whole suite passed on the PR head', 'If any condition fails, do not merge',
+                       'UNKNOWN', 'go ahead']:
+            self.assertIn(needle, ' '.join(phase6.split()) if ' ' in needle else phase6)
+        rules = text.split('## Rules')[1]
+        self.assertIn('**Never merge** unless auto-merge is on for this checkout', rules)
+        self.assertIn('Never approve your own PR', rules)
+        self.assertIn(wb.PLANNER_MARKER, text)
+        self.assertIn('ends with the planner marker line', text.split('## Phase 5')[1].split('## Phase 6')[0])
+
+    def test_phase_6_waits_for_the_relay_and_rechecks(self):
+        # r16 M3
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text(encoding='utf-8')
+        auto = ' '.join(text.split('### Auto-merge')[1].split('### The human')[0].split())
+        for needle in ['**Wait for the relay first.**', "`PR #N is open` mail from `github`",
+                       '**Retryable failures:** `relay:`', '`mail:` (read and handle the mail)', '`UNKNOWN`',
+                       'Every other failure is final for this head', '**Check again after any event',
+                       'new head with the whole suite re-run on it']:
+            self.assertIn(needle, auto)
+        self.assertLess(auto.index('Wait for the relay first'), auto.index('merge-check --pr <N> --head <full sha>'))
+
+    def test_implementer_never_merges(self):
+        text = (Path(__file__).resolve().parent.parent / 'claude/commands/workbench-implementer.md').read_text(encoding='utf-8')
+        self.assertIn("is the planner's act, never yours", text)
 
 
 if __name__ == '__main__':

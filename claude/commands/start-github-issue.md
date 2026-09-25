@@ -12,12 +12,23 @@ it first, and what comes back is a located disagreement or a checked fact.
 
 | who | does | cannot |
 |---|---|---|
-| you | intake, the plan, review, GitHub (push, PR, comments), talking to the human | merge, approve your own PR |
+| you | intake, the plan, review, GitHub (push, PR, comments), talking to the human | merge (unless auto-merge is on - Phase 6), approve your own PR |
 | Codex | critiques the plan, implements, commits, fixes review findings | reach the network or GitHub, touch the terminal |
 | the relay | rings a pane when mail arrives; watches the PR; ends the loop on merge | decide anything |
 | the human | reviews (revdiff or GitHub), approves, **merges** | - |
 
-The loop ends when the human has approved **and merged** the PR. Not before.
+The loop ends when the human has approved **and merged** the PR. Not before. With auto-merge on
+for this checkout, you may merge it yourself once every condition in Phase 6 holds.
+
+**Mark everything you post on GitHub.** Every PR body, PR comment and review reply you write ends
+with this line:
+
+```
+<!-- agworkbench:planner -->
+```
+
+You post with the human's own account, so GitHub cannot tell your words from theirs. The marker is
+how `wb.py merge-check` does: any body without it is treated as the human's.
 
 ## When the implementer is Claude
 
@@ -201,10 +212,62 @@ gh pr create --repo <owner/repo> --base <default> --title "<title>" --body-file 
 ```
 
 The body: what changed and why, `Closes #<N>`, how it was tested, and the review record - rounds
-run, findings fixed, findings disputed and why. The relay notices the PR on its next check and
+run, findings fixed, findings disputed and why. It ends with the planner marker line. The relay notices the PR on its next check and
 watches it from then on.
 
 ## Phase 6 - the human's review
+
+### Auto-merge (only when this checkout has it on)
+
+`python "$AGWORKBENCH/lib/wb.py" settings` prints `autoMerge=true` only when the human turned it on
+(`-AutoMerge` or `"autoMerge": true`). Otherwise skip this section: merging is the human's. With it
+on, you merge only when **all** of these hold:
+
+1. **The review is clean.** The last revmux round's findings are all fixed and verified, or disputed
+   with evidence. None is deferred, and it is within the three-round cap. A round that ended with
+   open findings goes to the human instead.
+2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
+   after the push) and the test count.
+3. **merge-check says `ok`.** It checks, read-only: the PR is OPEN, MERGEABLE and CLEAN; no review
+   requests changes; no hold label, title, description, comment, review or line comment that you
+   did not mark (`hold`, `wait`, `waiting`, `wip`, `do not merge` and their spellings; a hold is
+   lifted only by its own author, later, with a comment that is just `go ahead`, `resume` or
+   `unhold`); you have no unread mail from `human` or `github`; the relay has seen the PR open; and
+   the PR head is the tested SHA.
+
+   **Wait for the relay first.** After opening the PR, keep the background waiter and end your turn
+   until the relay's `PR #N is open` mail from `github` arrives. Read it, and any other unread mail,
+   and only then run:
+
+   ```bash
+   python "$AGWORKBENCH/lib/wb.py" merge-check --pr <N> --head <full sha>
+   ```
+
+   **Retryable failures:** `relay:` (wait for the relay's mail), `mail:` (read and handle the mail),
+   and a merge state of `UNKNOWN` ("retry in ~30s", run once more after about 30 seconds). Handle
+   them, then check again. Every other failure is final for this head.
+
+   **Check again after any event that could change the verdict**, such as the hold's author lifting
+   it, or a fix round pushing a new head with the whole suite re-run on it. Run the auto-merge check
+   for the new head.
+
+On `ok`, merge exactly that commit, then say so in the PR and in chat:
+
+```bash
+gh pr merge <N> --merge --delete-branch --match-head-commit <full sha>
+gh pr comment <N> --body-file .workbench/merge-note.md
+```
+
+The note states each condition as a checked fact: "Merged automatically (auto-merge is on for this
+checkout): review clean after <K> revmux round(s); whole suite green on <sha> (<count> tests);
+merge-check ok." It ends with the planner marker line. The relay then reports the merge, and Phase 7
+runs as for a human merge. In queue mode, report `loop-state pr-open` first, as below.
+
+If any condition fails, do not merge. Post merge-check's failure lines (or which of conditions 1-2
+failed) verbatim on the PR, with the marker, repeat them in chat, and continue with the human's
+review below.
+
+### The human's review
 
 In queue mode, run `python "$AGWORKBENCH/lib/wb.py" loop-state pr-open --pr <url>` before ending
 the turn, set `wb.py status idle`, and keep the background waiter. Do not open revdiff automatically.
@@ -241,8 +304,11 @@ human what they want next. In queue mode first run
 
 ## Rules
 
-- **Never merge, never approve your own PR, never force-push** over commits the human has reviewed.
-  Merging is the human's act; the loop exists to get to the point where they choose to.
+- **Never merge** unless auto-merge is on for this checkout and every Phase 6 condition holds,
+  with `merge-check` saying `ok` for the exact commit you merge. **Never approve your own PR, never
+  force-push** over commits the human has reviewed. Otherwise merging is the human's act; the loop
+  exists to get to the point where they choose to.
+- Every PR body, PR comment and review reply you post ends with the planner marker line.
 - Never answer a prompt, chooser or dialog in Codex's pane, and never type into it.
 - Long-running tools - revmux, builds, test suites that take minutes - run in visible agwinterm
   sessions, never hidden in a background shell. The human must be able to see and stop them.

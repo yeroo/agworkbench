@@ -268,8 +268,44 @@ decision and the PR update time to distinguish repeated changes. Windows publish
 atomically using a hard link or a no-replace rename; replay repairs an incomplete header while
 holding the message ID's publication lock.
 
-**Nobody merges but you.** Claude may push the branch and open the PR; it never approves its own PR,
-never merges, never force-pushes over commits you have reviewed.
+**Nobody merges but you, unless you turn on auto-merge.** Claude may push the branch and open the
+PR. It never approves its own PR and never force-pushes over commits you have reviewed. It never
+merges, unless you opted in for that checkout.
+
+### Auto-merge (opt-in)
+
+`github-workbench <issue> -AutoMerge`, `-Queue <spec> -AutoMerge`, or `"autoMerge": true` in
+`~/.agworkbench.json` lets the planner merge its own PR. It does so only when all of these hold:
+- the last review round is clean, with every finding fixed or disputed with evidence and none
+  deferred;
+- the whole suite passed on the PR's head commit;
+- `wb.py merge-check --pr <N> --head <sha>` prints `ok`.
+
+That check is read-only. It requires:
+- the PR is open, mergeable and `CLEAN` (`UNKNOWN` is retried once);
+- no review requests changes;
+- there is no unread mail from you (`human`) or from GitHub;
+- the relay has seen the PR open;
+- the PR head is the tested commit;
+- **no hold**: a label (`do-not-merge`, `hold`, `wip`), the title, or any unmarked description,
+  comment, review or line comment containing `hold`, `wait`, `waiting`, `wip`, or `do not merge` in
+  any spelling (`don't`, `dont`, `do-not-merge`, typographic apostrophes, markdown emphasis, any
+  case) holds the PR at any age. So does a negated lift like "don't go ahead". A hold is lifted only
+  by **its own author**, later, with a comment that is nothing but `go ahead`, `resume` or `unhold`
+  (optionally `@someone` first, `please` or `!` after). Bots never lift a hold.
+
+Claude posts with your GitHub account, so it ends everything it writes on GitHub with
+`<!-- agworkbench:planner -->`. merge-check treats every body without that marker as yours. Hold
+words fail safe: "I'll wait for CI" holds too. The merge is `gh pr merge --merge --delete-branch
+--match-head-commit <sha>`, so GitHub refuses it if anything was pushed after the tests ran. A
+comment on the PR then states each checked condition.
+
+If any condition fails, the reasons go on the PR and in chat, and the PR waits for you as usual.
+The choice is saved per checkout like the implementer: a rerun without the switch keeps it,
+`-NoAutoMerge` turns it off (even while the agents are running), and a queue saves either switch and
+passes it to the members it launches from then on. To stop a member that is already running, rerun
+`github-workbench <n> -NoAutoMerge` for its checkout. The conductor never merges; a member's planner does, and the queue then
+records the member as merged.
 
 The per-issue clone gets a Codex trust entry in `~/.codex/config.toml` — the same entry Codex
 writes when you answer "Yes" to its trust prompt — because the relay will not answer that prompt
@@ -288,6 +324,7 @@ are trusted.
 | `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools |
 | `implementer` | `"codex"` | who runs the right pane (`"codex"` or `"claude"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude |
+| `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout
 
