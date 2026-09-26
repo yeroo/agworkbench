@@ -66,7 +66,8 @@ all stop you exactly as they do without autonomy.
   - this issue's session;
   - itself.
 
-  It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout.
+  It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout alone:
+  only unread implementer mail is overridden after the wait.
 
 ## When the implementer is Claude
 

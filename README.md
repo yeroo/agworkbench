@@ -431,10 +431,14 @@ merges, unless you opted in for that checkout.
 - **It closes the sessions.** After a MERGED PR, never a closed one, the relay first closes the
   issue's revmux and review sessions that have finished, each on its own evidence (below), whatever
   the agents are doing; a running revdiff stays open and is named. The issue session and the relay
-  itself close only once the planner has recorded `wb.py loop-state done`, the implementer has
-  read its last mail, and both panes are unchanged for 30 s with empty composers and no
-  `.git/index.lock`. It only ever touches this repository's workspace. Every step goes to
-  `.workbench/state/relay-close.log`. It never closes on a timeout: it alerts you instead.
+  itself close only once the planner has recorded `wb.py loop-state done`, the planner has read
+  all its mail, and both panes are unchanged for 30 s with empty composers and no
+  `.git/index.lock`. The implementer's unread mail works differently (#44). The relay's own
+  `PR #N MERGED` notice and anything sent after the merge, such as the planner's "loop complete"
+  note, never hold the close. Older unread implementer mail holds it for 10 minutes; then the
+  close goes ahead and logs the ids. It only ever touches this repository's workspace. Every step
+  goes to `.workbench/state/relay-close.log`. Nothing else is overridden on a timeout: it alerts
+  you instead.
 - **It deletes the checkout** (#41, config `cleanup`, default `merged`). Once the issue session is
   closed, a detached `lib/cleanup.py after-close` waits (up to 10 minutes) until no `#N` session is
   left in the repo's workspace, then deletes the clone, but only when it is safe: nothing
@@ -461,10 +465,15 @@ How the close proves each thing (#33):
   pane showed). A helper closes when its marker exists, no shell is live in its pane, the pane shows
   exactly the marker's rows, and it has been unchanged for 30 s. Helpers close first, even while the
   agents are still busy. A helper session opened the old way, inside a shell, is left for you.
-- **A relay that died:** the queue's conductor runs the same close for a merged member whose close
-  has been pending for 15 minutes and whose `#N relay` session is gone. While that relay is still
-  alive, the member is only flagged `closeStuck` in the queue file, because one closer at a time.
-  A close that cannot complete is refused and flagged, never forced.
+- **A relay that died or gave up:** the queue's conductor runs the same close for a merged member
+  whose close has been pending for 15 minutes and whose `#N relay` session is gone. While that
+  relay is still alive, the member is only flagged `closeStuck` in the queue file, because one
+  closer at a time. A queue member's relay whose close gives up after its 10-minute wait hands it
+  over (#44), but only while the queue's conductor is running. It keeps `close_pending` in
+  `relay.json`, records `close_handoff` and closes its own session. The conductor stays up for that
+  close and retries it once, with a fresh wait. Without a running conductor (a queue that is not
+  watching finishes once its last member has a PR), the relay alerts you and leaves its session
+  open, as before. A close that cannot complete is refused and flagged, never forced.
 - **Members launched before this fix** still have suggestions on, so their relays keep holding the
   doorbell. Once such a loop has recorded `wb.py loop-state done`, close its sessions by hand.
 
