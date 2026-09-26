@@ -43,10 +43,36 @@ UNITTEST_FAILED_RE = re.compile(r"^FAILED \(([^)]*)\)\s*$")
 UNITTEST_OK_RE = re.compile(r"^OK(?: \([^)]*\))?\s*$")
 COUNT_FAILED_RE = re.compile(r"\b(\d+) failed\b")
 COUNT_ERRORS_RE = re.compile(r"\b(\d+) errors?\b")
+# cmd.exe reparses a `/c` line: these would pipe, chain, redirect, expand or unbalance quotes (#45 r3).
+CMD_META = '&|<>^%!"()'
 
 
 def log_path(hub: Path, label: str) -> Path:
     return Path(hub) / "review" / f"suite-{label}.log"
+
+
+def resolve_program(argv: list[str]) -> str:
+    """argv[0] found on PATH, PATHEXT honoured (so `npm` finds npm.cmd); as given when not found."""
+    return shutil.which(argv[0]) or argv[0]
+
+
+def is_shim(program: str) -> bool:
+    return os.name == "nt" and program.lower().endswith((".cmd", ".bat"))
+
+
+def shim_refusal(argv: list[str]) -> str | None:
+    """Why argv cannot run: a `.cmd`/`.bat` runs through cmd.exe, which reparses its arguments, and no
+    escaping is reliable there (`^` is literal inside quotes, `%` cannot be escaped on a /c line).
+    So an argument with a cmd metacharacter is refused, never escaped. None when argv may run."""
+    if not argv or argv[0].lower().endswith(".ps1") or not is_shim(resolve_program(argv)):
+        return None
+    for arg in argv[1:]:
+        found = "".join(sorted({char for char in arg if char in CMD_META}))
+        if found:
+            return (f"argument {arg!r} contains cmd metacharacters ({found}), and {Path(argv[0]).name} is a "
+                    f".cmd/.bat that runs through cmd.exe; wrap the command yourself, e.g. "
+                    f"-- pwsh -NoProfile -Command ...")
+    return None
 
 
 def command_for(argv: list[str]) -> list[str] | str:
@@ -59,11 +85,15 @@ def command_for(argv: list[str]) -> list[str] | str:
         return [shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
     if not argv:
         return []
-    resolved = shutil.which(argv[0]) or argv[0]
-    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+    resolved = resolve_program(argv)
+    if is_shim(resolved):
+        refusal = shim_refusal(argv)
+        if refusal:
+            raise ValueError(refusal)
         comspec = os.environ.get("COMSPEC") or "cmd.exe"
-        # /s: cmd strips exactly the outer quotes and runs the rest as written, so each argument keeps
-        # the Windows quoting list2cmdline gives it.
+        # /s: cmd strips the outer quotes and then parses the rest itself - pipes, `&`, `%VAR%` and all.
+        # Safe only because shim_refusal refused every argument with a cmd metacharacter; spaces are
+        # safe inside the quotes list2cmdline adds.
         return f'{subprocess.list2cmdline([comspec])} /d /s /c "{subprocess.list2cmdline([resolved, *argv[1:]])}"'
     return [resolved, *argv[1:]]
 
@@ -173,7 +203,9 @@ def run(argv: list[str], log: Path, echo) -> tuple[int | None, str]:
         return code, "".join(parts)
 
 
-def result_subject(label: str, code: int | None, failures: int | None) -> str:
+def result_subject(label: str, code: int | None, failures: int | None, refused: bool = False) -> str:
+    if refused:
+        return f"suite {label}: FAILED (did not start: cmd metacharacters in an argument)"
     if code is None:
         return f"suite {label}: FAILED (did not finish)"
     detail = f"exit {code}" + (f", {failures} failure{'s' if failures != 1 else ''}" if failures is not None else "")
@@ -221,13 +253,19 @@ def main(argv: list[str] | None = None) -> int:
     log = log_path(hub, args.label)
     print(f"suite {args.label}: {subprocess.list2cmdline(command)}", flush=True)
     code, failures = None, None
-    try:
-        code, text = run(command, log, echo_to_pane)
-        failures = count_failures(text)
-    except Exception as err:  # noqa: BLE001 - the result must still be mailed and the marker written
-        text = f"run_helper: {type(err).__name__}: {err}"
+    refusal = shim_refusal(command)
+    if refusal:
+        # wb.py suite refuses this before opening the session; this is the defence for a direct call.
+        text = f"run_helper: did not start: {refusal}"
         print(text, flush=True)
-    subject = result_subject(args.label, code, failures)
+    else:
+        try:
+            code, text = run(command, log, echo_to_pane)
+            failures = count_failures(text)
+        except Exception as err:  # noqa: BLE001 - the result must still be mailed and the marker written
+            text = f"run_helper: {type(err).__name__}: {err}"
+            print(text, flush=True)
+    subject = result_subject(args.label, code, failures, refused=bool(refusal))
     print(f"\n{subject}; log: {log}", flush=True)
     try:
         mid = post_result(hub, args.to, subject, command, code, failures, log, text)

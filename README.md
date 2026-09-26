@@ -599,7 +599,9 @@ hooks rewrite it on every turn.
 **Suites and builds finish visibly.** `wb.py suite --label <sha7> -- <command>` runs a long command
 in its own `#N suite <label>` session in direct mode (`lib/run_helper.py`). The command runs with
 no shell: its first word is found on PATH, a `.ps1` runs under pwsh, and a `.cmd` or `.bat` shim
-(npm, yarn, gradlew, mvn) runs through `cmd /d /s /c`. The helper waits for the command, not for
+(npm, yarn, gradlew, mvn) runs through `cmd /d /s /c`. Because cmd.exe reparses those arguments, one
+containing a cmd metacharacter (`& | < > ^ % ! " ( )`) is refused before the session opens; wrap such a
+command yourself, e.g. `-- pwsh -NoProfile -Command "..."`. The helper waits for the command, not for
 processes it left behind: once the command exits, output still held open by a child (a build server,
 a detached test server) is read for 5 s and then left unread. Its output goes to the pane and, as UTF-8 without a BOM, to
 `.workbench/review/suite-<label>.log`, even when the command writes UTF-16. When it ends, it mails

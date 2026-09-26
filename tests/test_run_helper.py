@@ -114,19 +114,43 @@ class Wrapper(unittest.TestCase):
         self.assertEqual('suite abc1234: FAILED (did not finish)', mail['subject'])
         self.assertIn('could not start', mail['body'])
 
-    @unittest.skipUnless(sys.platform == 'win32', '.cmd shims are Windows')
-    def test_a_cmd_shim_on_path_runs_with_its_arguments(self):
-        # r2 G1: npm, yarn, gradlew, mvn are .cmd/.bat shims that Popen cannot start directly.
+    def shim_path(self):
+        """A `dumpargs.cmd` shim on PATH, in a directory whose name has a space."""
         shims = self.folder / 'shim bin'
-        shims.mkdir()
+        shims.mkdir(exist_ok=True)
         (shims / 'dumpargs.cmd').write_text(
             f'@"{sys.executable}" -c "import sys, json; print(json.dumps(sys.argv[1:]))" %*\r\n',
             encoding='utf-8')
-        with patch.dict(os.environ, {'PATH': str(shims) + os.pathsep + os.environ['PATH']}):
+        return patch.dict(os.environ, {'PATH': str(shims) + os.pathsep + os.environ['PATH']})
+
+    @unittest.skipUnless(sys.platform == 'win32', '.cmd shims are Windows')
+    def test_a_cmd_shim_on_path_runs_with_its_arguments(self):
+        # r2 G1: npm, yarn, gradlew, mvn are .cmd/.bat shims that Popen cannot start directly.
+        with self.shim_path():
             self.assertEqual(0, self.run_wrapper('dumpargs', 'a b', 'plain', 'x=1'))
         log = (self.hub_dir / 'review' / 'suite-abc1234.log').read_text(encoding='utf-8')
         self.assertEqual(['a b', 'plain', 'x=1'], json.loads(log.splitlines()[0]))
         self.assertEqual('suite abc1234: passed (exit 0)', self.mails()[0]['subject'])
+
+    @unittest.skipUnless(sys.platform == 'win32', '.cmd shims are Windows')
+    def test_cmd_metacharacters_on_a_shim_are_refused_not_run(self):
+        # r3 H1: cmd reparses a /c line - `|` would pipe, `&` chain, `%PATH%` expand.
+        for bad in ('a|b', 'x&y', '%PATH%', 'say "hi"', '(x)', 'a^b', 'go!', 'in<f', 'out>f'):
+            with self.subTest(bad=bad), self.shim_path():
+                shutil.rmtree(self.hub_dir, ignore_errors=True)
+                self.hub_dir.mkdir()
+                self.screen.truncate(0)
+                self.screen.seek(0)
+                self.assertEqual(1, self.run_wrapper('dumpargs', 'ok', bad))
+                self.assertFalse((self.hub_dir / 'review' / 'suite-abc1234.log').exists())   # nothing ran
+                [mail] = self.mails()
+                self.assertEqual('suite abc1234: FAILED (did not start: cmd metacharacters in an argument)',
+                                 mail['subject'])
+                self.assertIn(f'did not start: argument {bad!r} contains cmd metacharacters', mail['body'])
+                self.assertIn('-- pwsh -NoProfile -Command', mail['body'])
+                self.assertIsNone(self.marker()['exit'])
+        with self.assertRaises(ValueError), self.shim_path():
+            run_helper.command_for(['dumpargs', 'a|b'])
 
     def test_a_missing_bare_command_still_mails(self):
         self.assertEqual(1, self.run_wrapper('no-such-command-xyz', '--version'))
@@ -157,10 +181,12 @@ class Wrapper(unittest.TestCase):
 
     def test_arguments_reach_the_child_unchanged(self):
         # G4: argv, no shell - spaces and quotes survive.
-        self.run_wrapper(sys.executable, '-c', 'import sys, json; print(json.dumps(sys.argv[1:]))',
-                         'a b', 'it\'s "quoted"', '$HOME')
+        # r3 H1: cmd metacharacters are fine on a non-shim - no cmd.exe is involved.
+        args = ['a b', 'it\'s "quoted"', '$HOME', 'a|b', 'x&y', '%PATH%', '(x)^!<>']
+        self.run_wrapper(sys.executable, '-c', 'import sys, json; print(json.dumps(sys.argv[1:]))', *args)
         log = (self.hub_dir / 'review' / 'suite-abc1234.log').read_text(encoding='utf-8')
-        self.assertEqual(['a b', 'it\'s "quoted"', '$HOME'], json.loads(log.splitlines()[0]))
+        self.assertEqual(args, json.loads(log.splitlines()[0]))
+        self.assertIsNone(run_helper.shim_refusal([sys.executable, *args]))
 
 
 class Pieces(unittest.TestCase):
@@ -243,6 +269,23 @@ class SuiteCommand(unittest.TestCase):
         self.assertIn('--to codex', self.opened.call_args.args[2])
         self.suite('--label', 'x', '--to', 'claude', '--', 'python')
         self.assertIn('--to claude', self.opened.call_args.args[2])
+
+    @unittest.skipUnless(sys.platform == 'win32', '.cmd shims are Windows')
+    def test_cmd_metacharacters_on_a_shim_are_refused_before_the_session_opens(self):
+        # r3 H1
+        shims = self.folder / 'shims'
+        shims.mkdir()
+        (shims / 'npmish.cmd').write_text('@exit /b 0\r\n', encoding='utf-8')
+        with patch.dict(os.environ, {'PATH': str(shims) + os.pathsep + os.environ['PATH']}):
+            for bad in ('a|b', 'x&y'):
+                with self.subTest(bad=bad), self.assertRaises(SystemExit) as refused:
+                    self.suite('--label', 'x', '--', 'npmish', 'test', bad)
+                self.assertIn(f"argument {bad!r} contains cmd metacharacters", str(refused.exception))
+                self.assertIn('wrap the command yourself, e.g. -- pwsh -NoProfile -Command', str(refused.exception))
+            self.opened.assert_not_called()
+            self.assertEqual(0, self.suite('--label', 'x', '--', 'npmish', 'run', 'a b'))
+            self.assertEqual(0, self.suite('--label', 'x', '--', 'python', '-c', 'print(1)', 'a|b', 'x&y'))
+        self.assertEqual(2, self.opened.call_count)
 
     def test_bad_labels_and_missing_commands_are_refused(self):
         for argv in (('--label', 'a;b', '--', 'python'), ('--label', 'ok'), ('--label', 'ok', '--')):

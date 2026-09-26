@@ -123,6 +123,10 @@ def cmd_suite(args: argparse.Namespace) -> int:
     if not command:
         raise SystemExit("wb: suite needs a command after --, e.g. wb.py suite --label abc1234 -- python -m unittest")
     # The session does not inherit this pane's environment, so the recipient is resolved here.
+    import run_helper
+    refusal = run_helper.shim_refusal(command)
+    if refusal:
+        raise SystemExit(f"wb: suite refused: {refusal}")
     to = args.to or os.environ.get("AI_BOX") or "claude"
     if not hub.BOX_RE.fullmatch(to):
         raise SystemExit(f"wb: --to is not a mailbox name: {to!r}")
@@ -1014,7 +1018,8 @@ def main() -> int:
     p.add_argument("--to", help="the mailbox the result goes to (default: AI_BOX, else claude)")
     p.add_argument("command", nargs=argparse.REMAINDER,
                    help="-- then the command and its arguments; no shell: the first word is found on PATH, "
-                        "a .ps1 runs under pwsh, a .cmd/.bat (npm, gradlew) through cmd /d /s /c")
+                        "a .ps1 runs under pwsh, a .cmd/.bat (npm, gradlew) through cmd /d /s /c - so its "
+                        "arguments may not contain cmd metacharacters (& | < > ^ %% ! \" ( )): they are refused")
     p.set_defaults(func=cmd_suite)
     p = subs.add_parser("human-review", help="open revdiff for the human, selected")
     p.add_argument("--base", required=True, help="e.g. origin/main")
