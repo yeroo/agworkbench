@@ -72,7 +72,10 @@ mail with subject `IMPLEMENT plan vK` arrives.
   you report. Tests are part of the change: each acceptance criterion gets a test that fails
   without it.
 - Run the project's tests and linters locally. Say what you could not run and why; never skip
-  something silently.
+  something silently. A suite that takes more than a few minutes goes through
+  `python "$AGWORKBENCH/lib/wb.py" suite --label <sha7> -- <command>` (its result is mailed to your box
+  from `helper`), or runs in the foreground. Never use a private background watcher: an idle pane with
+  a hidden job looks like a stalled loop to the relay.
 - **Never push.** The planner pushes after review.
 
 Then reply (kind `answer`, subject `IMPLEMENTED <short sha>`): what you changed, the commits, the

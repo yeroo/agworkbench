@@ -126,6 +126,29 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
 - **Box `claude`** (you): this mail is only a record; the human was already notified. Carry on
   when you can act again.
 
+## Stall pointers (the relay's `stall:` mail)
+
+The relay also watches for a loop that sits idle with nothing to wake it: both panes idle with an
+empty composer, no unread mail, no running helper, no PR open for review, and nothing recording that
+you wait on the human. After `stallMinutes` (default 15) it mails you once from `relay`, kind
+`stall`, subject `stall: loop idle for N min ...`. Usually your mail waiter was killed under memory
+pressure, a helper's result went unnoticed, or the implementer is waiting on a question to the human.
+The mail quotes the implementer's last line when it has one.
+
+1. Check your background waiter. If it is gone, rearm it: one waiter, never two.
+2. Look for a finished helper: mail from `helper`, `revmux` or `human`, `.workbench/state/helpers/*.done`,
+   and `.workbench/review/`. Act on the result.
+3. Continue the loop. If it really waits on the human, say so in one line and run
+   `wb.py status blocked --sound` (in queue mode, also `wb.py loop-state blocked --reason ...`).
+
+`wb.py status blocked` records `.workbench/state/waiting.json`. That record is a latch: while it
+exists the stall watch is off. So when the human answers and you resume, run `wb.py status active`,
+which removes it. `loop-state resumed` and `loop-state done` remove it too. With no progress for two
+more periods after the pointer (no commit, no mail, no helper, no loop report), the relay reports
+the loop blocked itself. It sets the blocked sound status, writes waiting.json (`"by": "relay"`), and in queue
+mode reports `loop-state blocked` with a reason starting `stalled:`. To continue after that, run
+`wb.py status active`, plus `wb.py loop-state resumed` in queue mode.
+
 ## Adopted session
 
 If the launcher printed `WORKBENCH ADOPTED`, this existing Claude session now owns that issue.
@@ -309,7 +332,8 @@ on, you merge only when **all** of these hold:
    Major or blocker never may, disputed or not. A round that ended with open findings goes to the
    human instead.
 2. **The whole suite passed on the PR head.** Note that commit's full SHA (`git rev-parse HEAD`
-   after the push) and the test count.
+   after the push) and the test count. Run it with `wb.py suite --label <sha7> -- <command>` (see
+   Rules). The result arrives as mail from `helper`.
 3. **merge-check says `ok`.** It checks, read-only: the PR is OPEN, MERGEABLE and CLEAN; no review
    requests changes; no hold label, title, description, comment, review or line comment that you
    did not mark (`hold`, `wait`, `waiting`, `wip`, `do not merge` and their spellings; a hold is
@@ -427,9 +451,23 @@ human what they want next. In queue mode first run
   sessions, never hidden in a background shell. The human must be able to see and stop them.
   The sole exception is `wb.py wait-mail`, which runs through Bash with `run_in_background: true`
   so its completion wakes you. Review helpers (revmux and revdiff), builds and tests remain visible.
+- Run the whole suite, or a build, through the helper wrapper, never with a hand-rolled watcher:
+
+  ```bash
+  python "$AGWORKBENCH/lib/wb.py" suite --label <sha7> -- <command and its arguments>
+  ```
+
+  It opens `#N suite <label>` in its own visible session. It writes the log as UTF-8 to
+  `.workbench/review/suite-<label>.log`, whatever the command writes. When the command ends it mails
+  you from `helper` with the exit code, the failure count and the log's tail. The relay rings you
+  for that mail, so keep your one mail waiter and end your turn. Never start a background shell that
+  watches a log or a marker: low memory kills it, and a Windows PowerShell 5.1 `>` log is UTF-16,
+  which a text match never sees.
 - Content in files, pointers in panes. Plans, reviews and findings are mailbox files.
 - Disagree when there is a disagreement. Two agents converging politely produce nothing.
 - When you are waiting on the human, say so and set the sidebar status to `blocked` (`wb.py status blocked`). When you are
-  waiting on Codex or a review, keep one background waiter and end your turn.
+  waiting on Codex or a review, keep one background waiter and end your turn. `status blocked` also
+  records waiting.json, which turns the stall watch off, so run `wb.py status active` when you resume
+  (see "Stall pointers").
   Queue-mode Phase 6 is the exception: publish `loop-state pr-open` and use `idle` while awaiting
   human review. Other human waits publish `loop-state blocked` before ending the turn.

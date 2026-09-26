@@ -573,6 +573,36 @@ writes when you answer "Yes" to its trust prompt — because the relay will not 
 for you, and the loop would otherwise stop on it for every new issue. Only clones this tool creates
 are trusted.
 
+### Stalls: the relay notices a loop that went quiet
+
+A loop can sit idle with nothing to wake it. The planner's background mail waiter may be killed
+under memory pressure, a helper may finish with nobody watching its result, or the implementer may
+stop to ask you a question. Each of these looks exactly like a loop waiting correctly. So on the same
+30 s reads the relay also watches for a **stall**. A loop is stalled when both agent panes are
+provably idle (no turn running, an empty composer), no mail is unread, and no helper is running.
+It is not stalled when it is done, when it records that it waits on you (`wb.py status blocked`
+writes `.workbench/state/waiting.json`; loop.json `blocked` or `pr-open`), or when a PR is open for
+your review (outside auto-merge). A helper without its completion marker counts as running while its pane
+changes. After two periods of silence it no longer does, and the pointer names it. Your revdiff always counts.
+
+- After `stallMinutes` (default 15) the relay mails the planner one pointer (from `relay`, kind
+  `stall`). The pointer quotes the implementer's last line.
+- After two more periods with no progress, and both panes idle for a whole period, it reports the
+  loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
+  a reason starting `stalled:` in queue mode.
+- Progress resets the clock: a commit, any mail, a helper starting or finishing, a loop report.
+
+It only mails, and it never answers a prompt. The sidebar status is not used: agwinterm's agent
+hooks rewrite it on every turn.
+
+**Suites and builds finish visibly.** `wb.py suite --label <sha7> -- <command>` runs a long command
+in its own `#N suite <label>` session in direct mode (`lib/run_helper.py`). The command runs with
+no shell, and a `.ps1` runs under pwsh. Its output goes to the pane and, as UTF-8 without a BOM, to
+`.workbench/review/suite-<label>.log`, even when the command writes UTF-16. When it ends, it mails
+the result to the caller's box from `helper`: exit code, failure count, and the log's tail. Its last act is to write a completion marker with both, so
+the autonomous close can close it. revmux and revdiff rounds that fail also mail the planner
+("ended without a report") instead of ending silently.
+
 ## Configuration
 
 `~/.agworkbench.json` (created by the installer; all keys optional):
@@ -591,6 +621,7 @@ are trusted.
 | `autonomous` | `false` | full autonomy: merge, file follow-up issues, close the sessions after the merge; implies `autoMerge` |
 | `cleanup` | `"merged"` | after an autonomous close: `merged` deletes the checkout when it is safe, `build` deletes only its build outputs, `off` keeps it (see Cleaning up checkouts) |
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
+| `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout
@@ -602,13 +633,14 @@ lib/github-workbench.ps1    terminal detection, clone, session, split, relay
 lib/pane-claude.ps1         left pane: claude "/start-github-issue <issue>"
 lib/pane-codex.ps1          right pane: codex, sandboxed, with the implementer prompt
 lib/pane-implementer-claude.ps1  right pane with implementer=claude: claude "/workbench-implementer <issue>"
-lib/relay.py                mail doorbell and PR watcher; spots usage limits in the agent panes
+lib/relay.py                mail doorbell and PR watcher; spots usage limits and stalls in the agent panes
 lib/limits.py               recognises an agent's own usage-limit message in a pane frame (#24)
 lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
 lib/cleanup.py              deletes finished checkouts: after an autonomous close, and -Cleanup (#41)
 lib/triage.py               priority labels for a product repo's issues, from its private spec repos (#34)
 lib/labelquery.py           the boolean label query behind -Queue 'where: ...' (#38)
 lib/helper_done.py          a helper session's completion marker (#33)
+lib/run_helper.py           a long command (the suite, a build) in its own session: UTF-8 log, marker, mail (#45)
 lib/run-revmux.ps1          one review round, report posted to Claude
 lib/human-review.ps1        revdiff for you, annotations posted to Claude
 lib/wb.py                   opens those sessions for Claude with correct Windows paths

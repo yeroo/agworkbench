@@ -63,7 +63,8 @@ Do not write code before a mail with subject `IMPLEMENT plan vK` arrives.
 - Small, focused commits with messages that say why. Tests are part of the change, not a follow-up:
   each acceptance criterion gets a test that fails without the change.
 - Run the project's tests and linters locally. If something needs the network, it cannot run here -
-  say so rather than skipping it silently.
+  say so rather than skipping it silently. Run them in the foreground of your turn, never as a
+  background job you watch: an idle pane with a hidden job looks like a stalled loop to the relay.
 - **Do not push.** You cannot, and Claude does it after review.
 
 Then reply (kind `answer`, subject `IMPLEMENTED <short sha>`): what you changed, the commits, the
