@@ -2386,10 +2386,35 @@ class AutonomousClose(unittest.TestCase):
         self.assertNotIn('close_pending', json.loads((self.state / 'relay.json').read_text(encoding='utf-8')))
 
     def test_a_restarted_relay_takes_a_handed_off_close_back(self):
+        # r2 m4: gone from relay.json while the close is still running, not only once it is done.
         self.pending(close_handoff={'pr': 7, 'at': 'x', 'reasons': ['r']})
-        self.r.close_after_merge(7)
+        real = closer.Closer.agent_blockers
+        during = []
+
+        def blockers(close, number):
+            during.append(json.loads((self.state / 'relay.json').read_text(encoding='utf-8')))
+            return real(close, number)
+        with patch.object(closer.Closer, 'agent_blockers', blockers):
+            self.r.close_after_merge(7)
+        self.assertNotIn('close_handoff', during[0])
+        self.assertEqual(7, during[0]['close_pending'])
         self.assertIn(self.PLANNER, self.closes())
-        self.assertNotIn('close_handoff', json.loads((self.state / 'relay.json').read_text(encoding='utf-8')))
+
+    def test_a_save_waits_out_a_reader_holding_the_state_file(self):
+        # r2 m1: on Windows a replace fails while the conductor has relay.json open for reading.
+        real = os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append(dst)
+            if len(calls) < 3:
+                raise PermissionError(13, 'in use')
+            return real(src, dst)
+        with patch.object(relay.os, 'replace', replace), patch.object(relay.time, 'sleep'):
+            self.r.state['x'] = 1
+            self.r._save()
+        self.assertEqual(3, len(calls))
+        self.assertEqual(1, json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))['x'])
 
     def test_a_pane_that_keeps_changing(self):
         texts = iter(f'{CLAUDE_IDLE}\n{i}' for i in range(10000))

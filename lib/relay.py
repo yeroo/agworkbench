@@ -32,10 +32,12 @@ Four jobs, one loop, one process per issue, running in its own visible agwinterm
    it. It never closes on a timeout
    alone: mail the implementer need not act on (its final notices, anything sent after the merge)
    is ignored, and after the wait only other unread implementer mail is overridden (#44).
-   A pending close survives a restart (`close_pending`, with the merge time `close_merged_at`). In
-   queue mode a close that gives up is handed to the conductor (#44): the relay keeps
+   A pending close survives a restart (`close_pending`, with the merge time `close_merged_at`). A
+   queue member's close that gives up is handed to the conductor (#44), but only while the queue's
+   conductor is running and the relay's session is provably its own: the relay keeps
    `close_pending`, records `close_handoff` and closes its own session, so the conductor's backstop
-   retries it. No doorbell is lost: the relay exits after a close either way.
+   retries it. That ends the relay, also when it resumed the close after a restart (where it used to
+   carry on); a merged, retired PR leaves it nothing else to watch.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
@@ -356,7 +358,15 @@ class Relay:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
-        os.replace(tmp, self.state_file)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, self.state_file)
+                return
+            except PermissionError:
+                # Windows refuses the replace while another process (the conductor) is reading it.
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
 
     def log(self, text: str) -> None:
         print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
@@ -528,20 +538,23 @@ class Relay:
             self._save()
 
     def conductor_running(self) -> bool:
-        """Is this checkout's queue conductor running (#44)? Its worker lock is held and, read under the
-        queue's state lock, its owner is `running`. Under that lock because a conductor decides to
-        finish under it too, after reading every member's relay.json (conductor.handed_off): a relay
-        that saved close_handoff and then sees `running` here is certain the conductor will see it."""
+        """Is this checkout's queue conductor running (#44)? Under the queue's state lock: its worker
+        lock is held and its owner is `running`. Under that lock because a conductor decides to finish
+        under it too, after reading every member's relay.json (conductor.handed_off): a relay that saved
+        close_handoff and then sees `running` here is certain the conductor will see it. The worker lock
+        is probed there as `-Queue` start() does, so the probe cannot mislead a concurrent start."""
         import conductor
         try:
             member = json.loads((self.hub_dir / 'state' / 'queue-member.json').read_text(encoding='utf-8-sig'))
             store = conductor.Store(member['queue'])
-            if not store.running():
-                return False
+            if not store.worker_lock.exists():
+                return False                     # never ran, or removed: and creates nothing for it
             with conductor.Lock(store.state_lock):
-                data = json.loads(store.path.read_text(encoding='utf-8-sig'))
-            return (data.get('owner') or {}).get('state') == 'running'
-        except (OSError, ValueError, KeyError, TypeError, AttributeError, conductor.QueueError):
+                if not store.running():
+                    return False
+                owner = store._load().get('owner') or {}
+            return owner.get('state') == 'running'
+        except (OSError, KeyError, TypeError, ValueError):   # conductor.QueueError is a ValueError
             return False
 
     def hand_off_close(self, close: "closer.Closer", number: int, reasons: list[str]) -> bool:
@@ -601,8 +614,8 @@ class Relay:
         agents are provably done and idle, then this relay's own session. Mail keeps flowing while it
         waits; a stop request, unread mail to the planner (a human's above all) or autonomy turned
         off stops it; never on a timeout
-        alone (after it, only unread implementer mail is overridden, #44). In queue mode a refusal
-        is handed to the conductor's backstop (#44)."""
+        alone (after it, only unread implementer mail is overridden, #44). A refusal is handed to the
+        queue conductor's backstop when there is a running one and the session is provably ours (#44)."""
         import agw
         close = self.closer()
         if not close.autonomous():

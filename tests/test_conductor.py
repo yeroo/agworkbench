@@ -1036,6 +1036,10 @@ class CloseBackstop(unittest.TestCase):
     def test_the_relay_sees_whether_the_conductor_is_running(self):
         # r1 M1: the worker lock held AND the owner running; anything else is "nobody to hand to".
         r = self.relay_for_queue()
+        self.store.worker_lock.unlink()                          # start() probed it; say it never ran
+        self.assertFalse(r.conductor_running())                  # never ran here
+        self.assertFalse(self.store.worker_lock.exists())        # r2 m2: and the probe created nothing
+        self.store.worker_lock.touch()
         self.assertFalse(r.conductor_running())                  # no conductor holds the worker lock
         self.conductor_up('finished')
         self.assertFalse(r.conductor_running())                  # held, but it has published finished
@@ -1043,7 +1047,42 @@ class CloseBackstop(unittest.TestCase):
             data['owner']['state'] = 'running'
         self.assertTrue(r.conductor_running())
         q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.root / 'missing.json')})
-        self.assertFalse(r.conductor_running())                  # an unreadable queue: no handoff
+        self.assertFalse(r.conductor_running())                  # a removed queue: no handoff
+        self.assertFalse((self.root / 'missing').exists())       # ... and nothing created for it
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path)})
+        with self.store.transaction() as data:
+            data['parallel'] = 99                                # r2 i1: the Store's validated read
+        self.assertFalse(r.conductor_running())
+
+    def test_the_relays_worker_lock_probe_is_under_the_state_lock(self):
+        # r2 m2: -Queue start() probes the worker lock under the state lock; so must the relay, or its
+        # momentary hold makes a concurrent start believe a conductor is running.
+        r = self.relay_for_queue()
+        self.conductor_up()
+        real = q.Store.running
+        seen = []
+
+        def running(store):
+            try:
+                q.Lock(store.state_lock, 0).acquire().release()
+                seen.append('state lock free')
+            except q.QueueError:
+                seen.append('state lock held')
+            return real(store)
+        with patch.object(q.Store, 'running', running):
+            self.assertTrue(r.conductor_running())
+        self.assertEqual(['state lock held'], seen)
+
+    def test_finished_reads_no_relay_state_unless_it_would_finish(self):
+        # r2 m1: every member's relay.json is read under the state lock - only when it matters.
+        with patch.object(q, 'handed_off', side_effect=AssertionError('read')):
+            with self.store.transaction() as data:
+                data['members'][0].update(state='pending')
+            self.assertFalse(q.finished(self.store.load()))
+            with self.store.transaction() as data:
+                data['members'][0].update(state='pr-open')
+                data.update(watch=True, label='queue')              # a watching queue never finishes
+            self.assertFalse(q.finished(self.store.load()))
 
     def test_a_handed_off_close_keeps_a_finished_queue_up_until_the_backstop_ends(self):
         # r1 M1: a non-watch queue whose only member has its PR is otherwise finished - before the

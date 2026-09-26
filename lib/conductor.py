@@ -1167,11 +1167,12 @@ def finished(data):
     # unless it is flagged stuck (then it is the human's, and never keeps the queue alive forever).
     if any(m.get('closePending') and not m.get('closeStuck') for m in data['members']):
         return False
-    # A close handed over by its relay (#44) keeps it up too, before the member is even seen merged.
-    if any(handed_off(m) for m in data['members']):
+    if data['watch'] or any(m['state'] == 'pending' or m['state'] == 'launching' or
+                            (m['state'] == 'active' and not m['slotReleased']) for m in data['members']):
         return False
-    return not data['watch'] and not any(m['state'] == 'pending' or m['state'] == 'launching' or
-                                       (m['state'] == 'active' and not m['slotReleased']) for m in data['members'])
+    # A close handed over by its relay (#44) keeps it up too, before the member is even seen merged.
+    # Read only when it would otherwise finish: every relay.json, under the queue's state lock.
+    return not any(handed_off(m) for m in data['members'])
 
 
 def main(argv=None):
