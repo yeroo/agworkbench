@@ -891,7 +891,9 @@ class Worker:
     # The relay closes a merged member's sessions. When that relay is gone (killed, closed, never
     # restarted) and its close has been pending for CLOSE_BACKSTOP_AFTER, the conductor runs the same
     # close (closer.py) one step per tick. While the relay is alive it only flags `closeStuck`: one
-    # closer at a time. Never on a timeout alone.
+    # closer at a time. Never on a timeout alone: after CLOSE_WAIT only unread pre-merge implementer
+    # mail is overridden (#44). A relay whose own close gave up in queue mode hands it over (#44):
+    # it keeps close_pending, records close_handoff and closes its session, and this retries it once.
 
     def mark(self, number, **fields):
         with self.store.transaction() as data:
@@ -953,7 +955,7 @@ class Worker:
         attempt = watch['attempt']
         attempt.step_helpers()
         reasons = attempt.agent_blockers(pr)
-        if not reasons:
+        if not reasons or attempt.overdue_ok():
             if attempt.autonomous():
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)
@@ -971,6 +973,8 @@ class Worker:
         if state.get('close_pending') == pr:
             # Only the close this attempt ran: a relay may have rewritten the file since.
             state.pop('close_pending')
+            state.pop('close_merged_at', None)
+            state.pop('close_handoff', None)
             atomic_json(path, state)
         self.closes.pop(m['number'], None)
         self.mark(m['number'], closePending=None, closeStuck=stuck)

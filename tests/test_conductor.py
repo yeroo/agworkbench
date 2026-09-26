@@ -970,6 +970,51 @@ class CloseBackstop(unittest.TestCase):
         self.w.end_close(self.member(7), 43, self.checkout / '.workbench', stuck=None)
         self.assertEqual({'other': 1}, q.read_json(self.state / 'relay.json'))
 
+    def test_unread_implementer_mail_alone_is_overridden_after_the_wait(self):
+        # #44: the backstop applies the same rule as the relay.
+        self.relay_gone()
+        box = self.checkout / '.workbench' / 'inbox' / 'codex'
+        box.mkdir(parents=True)
+        (box / 'm1.md').write_text('---\nid: m1\nfrom: claude\nto: codex\nsubject: x\n---\nx\n', encoding='utf-8')
+        self.run_for(900 + closer.CLOSE_WAIT - 60)
+        self.assertEqual([], self.actions)                       # it blocks during the wait
+        self.run_for(200)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertEqual(1, len(self.cleanups))
+        self.assertNotIn('closeStuck', self.member(7))
+        self.assertIn('despite unread implementer mail: m1', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_a_relay_that_gave_up_hands_the_close_to_the_backstop(self):
+        # #44 AC5, end to end: a real relay refuses (no loop-done record yet) in queue mode and hands
+        # over; the conductor, reading that same relay.json, closes the issue session and cleans up.
+        import hub
+        import relay
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path), 'repo': 'o/r', 'number': 7})
+        (self.state / 'loop-done.json').unlink()
+        clock = {'t': 0.0}
+        peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
+        with patch.dict(os.environ), patch.object(relay, 'now', lambda: clock['t']), \
+                patch.object(relay, 'pause', lambda s: clock.update(t=clock['t'] + max(s, 1))), \
+                patch.object(q.agw, 'my_pane', return_value='relay-7'):
+            r = relay.Relay(self.checkout / '.workbench', peers, 'o/r', 'issue-7-fix', 5, 60)
+            r.log = lambda text: None
+            r.close_after_merge(42)
+        hub.reload_paths()
+        self.assertEqual([('unpin', 'relay-7'), ('close', 'relay-7')], self.actions)     # only its own session
+        saved = q.read_json(self.state / 'relay.json')
+        self.assertEqual(42, saved['close_pending'])
+        self.assertEqual(42, saved['close_handoff']['pr'])
+        self.actions.clear()
+        self.relay_gone()                                        # its session closed
+        q.atomic_json(self.state / 'loop-done.json', {'pr': 42})  # what held it up is resolved
+        self.run_for(1000)
+        self.assertEqual([('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER), ('close', self.PLANNER)], self.actions)
+        self.assertEqual([42], [a[3] for a in self.cleanups])
+        saved = q.read_json(self.state / 'relay.json')
+        for key in ('close_pending', 'close_merged_at', 'close_handoff'):
+            self.assertNotIn(key, saved)
+        self.assertNotIn('closePending', self.member(7))
+
     def test_an_unreadable_tree_closes_nothing(self):
         self.w.close_backstop()                                  # starts the 15-minute clock
         self.now += 1000
