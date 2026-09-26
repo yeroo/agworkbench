@@ -609,14 +609,17 @@ def member_result(path, number, attempt, token, result):
     return True
 
 
-def write_loop_state(root, state, pr=None, reason=None):
+def write_loop_state(root, state, pr=None, reason=None, *, loop_id=None):
+    """A loop report from the planner's Claude runtime, or - with `loop_id` - from the relay, which is
+    not a Claude runtime and passes the id claude.json holds (#45: a stall it escalates)."""
     if state not in {'pr-open', 'blocked', 'resumed'}:
         raise QueueError('invalid loop state')
     root = Path(root)
     directory = root / '.workbench/state'
     member = read_json(directory / 'queue-member.json')
     identity = read_json(directory / 'claude.json')
-    loop_id = os.environ.get('CLAUDE_CODE_SESSION_ID')
+    if loop_id is None:
+        loop_id = os.environ.get('CLAUDE_CODE_SESSION_ID')
     if not valid_uuid(loop_id) or identity['sessionId'] != loop_id:
         raise QueueError('Claude runtime identity does not match this workbench')
     repo = repo_name(member['repo'])

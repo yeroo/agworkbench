@@ -58,6 +58,18 @@ class QueueReports(unittest.TestCase):
             self.assertEqual(2, self.report('blocked', reason='x'))
         self.assertFalse((self.state / 'loop.json').exists())
 
+    def test_the_relay_reports_with_the_workbench_loop_id_not_a_runtime(self):
+        # #45: the relay is not a Claude runtime; it passes the id claude.json holds, and only that id.
+        with patch.dict(os.environ):
+            os.environ.pop('CLAUDE_CODE_SESSION_ID')
+            report = self.q.write_loop_state(self.folder, 'blocked', reason='stalled: idle', loop_id=self.loop)
+            self.assertEqual(('blocked', self.loop, 1), (report['state'], report['loopId'], report['rev']))
+            with self.assertRaises(self.q.QueueError):
+                self.q.write_loop_state(self.folder, 'blocked', reason='x', loop_id=str(uuid.uuid4()))
+            with self.assertRaises(self.q.QueueError):
+                self.q.write_loop_state(self.folder, 'blocked', reason='x')      # no runtime, no id
+        self.assertEqual(1, self.q.read_json(self.state / 'loop.json')['rev'])
+
     def test_queue_instructions_are_at_each_decision_point(self):
         text = (Path(__file__).resolve().parent.parent / 'claude/commands/start-github-issue.md').read_text()
         for heading, next_heading, needle in [

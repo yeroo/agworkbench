@@ -41,7 +41,7 @@ def reload_paths() -> None:
 HUB = INBOX = STATE = REGISTRY = LOG = Path()
 reload_paths()
 
-KINDS = ("message", "task", "question", "answer", "review-request", "review", "handoff", "note")
+KINDS = ("message", "task", "question", "answer", "review-request", "review", "handoff", "note", "stall")
 BOX_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,40}$")
 TOOLS = ("claude", "codex", "other")
 

@@ -120,15 +120,17 @@ function Get-WorkbenchConfig {
          cleanup        after an autonomous close (#41): merged (default) deletes the checkout, build
                         deletes only its build outputs, off keeps it
          minFreeGB      the queue admits no member while the checkout drive has less free (GiB; default
-                        20, 0 turns the guard off) #>
+                        20, 0 turns the guard off)
+         stallMinutes   the relay's stall watch (#45): minutes a loop may sit idle with nothing to wake
+                        it before the planner gets a stall pointer (default 15, 0 turns it off) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
-                 cleanup = 'merged'; minFreeGB = 20 }
+                 cleanup = 'merged'; minFreeGB = 20; stallMinutes = 15 }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'stallMinutes')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -147,6 +149,11 @@ function Get-WorkbenchConfig {
     $free = $config.minFreeGB
     if (-not ($free -is [int] -or $free -is [long] -or $free -is [double] -or $free -is [decimal]) -or $free -lt 0) {
         throw "minFreeGB in '$path' must be a number >= 0 (got '$free')"
+    }
+    # The relay reads stallMinutes itself (relay.stall_setting); a bad value fails here, at launch.
+    $stall = $config.stallMinutes
+    if (-not ($stall -is [int] -or $stall -is [long] -or $stall -is [double] -or $stall -is [decimal]) -or $stall -lt 0) {
+        throw "stallMinutes in '$path' must be a number >= 0 (got '$stall')"
     }
     return $config
 }

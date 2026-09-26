@@ -31,6 +31,14 @@ Four jobs, one loop, one process per issue, running in its own visible agwinterm
    a stop request, a human's mail or autonomy turned off stops it, and it never closes on a timeout.
    A pending close survives a restart (`close_pending`).
 
+5. **Stalls (#45).** On the same reads it watches for a loop that sits idle with nothing to wake it:
+   both agent panes provably idle, no unread mail, no running helper, and the loop not done, not
+   waiting on the human (`state/waiting.json`, loop.json `blocked`/`pr-open`, a PR open for review).
+   After `stallMinutes` (config, default 15) it mails the planner one `stall` pointer; after two more
+   periods with no progress it reports the loop blocked (blocked status and sound, waiting.json, and
+   loop.json in queue mode). Progress - a commit, mail, a helper, a loop report - resets it. It
+   never types anything but the mail pointer, and never answers a prompt.
+
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
 none of which can push to it.
@@ -71,6 +79,8 @@ AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
+STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
+LAST_WORDS_MAX = 300     # how much of the implementer's last line a stall pointer quotes
 
 
 @dataclass(frozen=True)
@@ -279,10 +289,320 @@ class PrFetch:
     previous: dict[str, Any] | None = None
 
 
+def stall_setting() -> float:
+    """`stallMinutes` from ~/.agworkbench.json (AGWORKBENCH_CONFIG honoured): a number >= 0, 0 = off.
+    The launcher refuses an invalid value; one that slips through here reads as the default."""
+    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return STALL_MINUTES
+    value = config.get("stallMinutes") if isinstance(config, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return STALL_MINUTES
+    return float(value)
+
+
+def git_head(root: Path) -> str | None:
+    try:
+        done = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def last_words(text: str | None, tool: str) -> str | None:
+    """What an agent last said (#45): the last paragraph above its composer box - not its footer or
+    status line, which are the pane's real last rows. None when the composer cannot be found."""
+    import peerchat
+    lines = (text or "").splitlines()
+    prompt_re = peerchat.CLAUDE_PROMPT_RE if tool == "claude" else peerchat.CODEX_PROMPT_RE
+    prompt = next((i for i in range(len(lines) - 1, -1, -1) if prompt_re.match(lines[i])), None)
+    if prompt is None:
+        return None
+    rule = next((i for i in range(prompt - 1, -1, -1) if peerchat.RULE_RE.match(lines[i])), None)
+    if rule is None:
+        return None
+    above = lines[:rule]
+    # Claude's turn timer ("✻ Brewed for 1m 0s") sits between the answer and the box.
+    while above and (not above[-1].strip() or above[-1].lstrip().startswith("✻")):
+        above.pop()
+    start = len(above)
+    while start and above[start - 1].strip():
+        start -= 1
+    words = " ".join(row.strip() for row in above[start:])
+    if not words:
+        return None
+    return words if len(words) <= LAST_WORDS_MAX else "…" + words[-LAST_WORDS_MAX:]
+
+
+class StallWatch:
+    """#45: a loop that sits idle with nothing to wake it - its planner's mail waiter killed under
+    memory pressure, a helper's result nobody watches, an implementer waiting on a question to the human.
+
+    One `tick` per limit interval, with the pane texts the limit check read. Level 0: stalled for S
+    (both panes idle, nothing exempts it) -> one `stall` mail to the planner, level 1. Level 1: 2S
+    after the pointer, with no progress and both panes idle for at least S -> report the loop
+    blocked, level 2. Level 2: nothing more. Progress (the fingerprint changes) or an exemption
+    returns to level 0 with a fresh clock. Session status is never read: agwinterm's agent hooks
+    rewrite it every turn. State is in memory, so a restart only makes a stall later, never earlier."""
+
+    def __init__(self, relay: "Relay", minutes: float):
+        self.relay = relay
+        self.period = max(0.0, float(minutes or 0)) * 60.0
+        self.level = 0
+        self.since: float | None = None          # stalled (idle, not exempt) since
+        self.idle_since: float | None = None     # both panes idle since
+        self.pointer_at: float | None = None
+        self.fingerprint: tuple | None = None
+        self.quiet: dict[str, tuple[str, float]] = {}   # marker-less helper pane -> (tail hash, unchanged since)
+        self.sent: set[str] = set()              # this relay's stall mail: neither progress nor unread
+        self.last_note: str | None = None
+
+    @property
+    def state_dir(self) -> Path:
+        return self.relay.hub_dir / "state"
+
+    def note(self, text: str) -> None:
+        """Log a change of mind once, not every tick."""
+        if text != self.last_note:
+            self.last_note = text
+            self.relay.log(f"stall watch: {text}")
+
+    def read_json(self, name: str) -> Any:
+        try:
+            return json.loads((self.state_dir / name).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return None
+
+    # --- what the loop is doing ---------------------------------------------------------------
+    def helpers(self, snapshot) -> tuple[list[dict], list[str], list[str]]:
+        """(helper sessions, the live ones' names, notes on quiet ones). A helper without a completion
+        marker is live while its pane changed within 2S - one killed under memory pressure leaves its
+        pane on screen and never writes the marker. The human's revdiff is always live."""
+        import agw
+        close = closer.Closer(self.relay.hub_dir, self.relay.repo, closer.issue_from_branch(self.relay.branch),
+                              self.relay.peers, log=lambda text: None, clock=now, dry_run=True)
+        sessions = close.helper_sessions(snapshot)
+        live, quiet, seen = [], [], set()
+        for session in sessions:
+            name = session.get("name") or "?"
+            panes = agw.panes_of(session)
+            if panes and all(close.marker_path(pane).exists() for pane in panes):
+                continue
+            if name.endswith(" your review") or not panes:
+                live.append(name)
+                continue
+            pane = panes[0]
+            seen.add(pane)
+            try:
+                tail = limits.tail_hash(agw.pane_text(pane))
+            except (agw.CtlError, OSError):
+                live.append(name)       # unreadable: never call a helper dead without evidence
+                continue
+            previous = self.quiet.get(pane)
+            if previous is None or previous[0] != tail:
+                self.quiet[pane] = (tail, now())
+                live.append(name)
+            elif now() - previous[1] < 2 * self.period:
+                live.append(name)
+            else:
+                quiet.append(f"helper {name} has no completion marker and its pane has not changed for "
+                             f"{(now() - previous[1]) / 60:.0f} min")
+        for pane in set(self.quiet) - seen:
+            self.quiet.pop(pane)
+        return sessions, live, quiet
+
+    def unread(self) -> list[str]:
+        found = []
+        for box in ("claude", "codex"):
+            for path in self.relay.hub.unread(box):
+                if path.stem in self.sent:
+                    continue
+                try:
+                    message = self.relay.hub.parse_message(path)
+                except (OSError, ValueError):
+                    message = {}
+                if message.get("from") == "relay" and message.get("kind") == "stall":
+                    continue
+                found.append(f"{box}/{path.stem}")
+        return found
+
+    def exemptions(self, live: list[str]) -> list[str]:
+        """Why this loop is not stalled although it may look idle. Empty when nothing exempts it."""
+        reasons = []
+        if (self.state_dir / "loop-done.json").exists():
+            reasons.append("the loop is done")
+        if (self.state_dir / "waiting.json").exists():
+            reasons.append("waiting on the human (state/waiting.json)")
+        loop = self.read_json("loop.json")
+        if isinstance(loop, dict) and loop.get("state") in ("blocked", "pr-open"):
+            reasons.append(f"loop.json says {loop.get('state')}")
+        pr = self.relay.state.get("pr") or {}
+        settings = self.read_json("implementer.json")
+        if pr.get("state") == "OPEN" and not (isinstance(settings, dict) and settings.get("autoMerge") is True):
+            reasons.append(f"PR #{pr.get('number')} is open for review")
+        unread = self.unread()
+        if unread:
+            reasons.append(f"unread mail {', '.join(unread)}")
+        if live:
+            reasons.append(f"helper running: {', '.join(live)}")
+        if self.relay.state.get("limits"):
+            reasons.append(f"usage-limit episode: {', '.join(sorted(self.relay.state['limits']))}")
+        return reasons
+
+    def current_fingerprint(self, sessions: list[dict]) -> tuple:
+        """Everything whose change is progress: a commit, any mail (but this relay's stall mail), a
+        helper session or marker, a loop report, the done record, the waiting record."""
+        messages = []
+        for box in ("claude", "codex"):
+            directory = self.relay.hub_dir / "inbox" / box
+            for folder in (directory, directory / "read", directory / "archive"):
+                messages += [path.stem for path in folder.glob("*.md") if path.stem not in self.sent]
+        markers = sorted(path.name for path in (self.state_dir / "helpers").glob("*.done"))
+        loop = self.read_json("loop.json")
+        return (git_head(self.relay.hub_dir.parent), tuple(sorted(messages)),
+                tuple(sorted(str(session.get("id")) for session in sessions)), tuple(markers),
+                (loop.get("rev"), loop.get("state")) if isinstance(loop, dict) else None,
+                (self.state_dir / "loop-done.json").exists(), (self.state_dir / "waiting.json").exists())
+
+    def busy(self, texts: dict[str, Any]) -> list[str]:
+        reasons = []
+        for peer in self.relay.peers:
+            text = texts.get(peer.box)
+            if not isinstance(text, str):
+                reasons.append(f"{peer.box} pane unreadable")
+            else:
+                reasons += closer.idle_blockers(peer, text)
+        return reasons
+
+    # --- the tick -------------------------------------------------------------------------------
+    def reset(self, why: str) -> None:
+        if self.level or self.since is not None:
+            self.note(f"clock reset ({why})")
+        self.level, self.since, self.pointer_at = 0, None, None
+
+    def tick(self, texts: dict[str, Any]) -> None:
+        if self.period <= 0:
+            return
+        import agw
+        instant = now()
+        try:
+            snapshot = agw.tree()
+        except (agw.CtlError, OSError) as err:
+            self.note(f"terminal tree unreadable ({err}); not judging")
+            return
+        sessions, live, quiet = self.helpers(snapshot)
+        fingerprint = self.current_fingerprint(sessions)
+        if self.fingerprint is not None and fingerprint != self.fingerprint:
+            self.reset("progress")
+        self.fingerprint = fingerprint
+        busy = self.busy(texts)
+        if busy:
+            self.idle_since = None
+        elif self.idle_since is None:
+            self.idle_since = instant
+        exempt = self.exemptions(live)
+        if exempt:
+            self.reset(exempt[0])
+            self.note(f"not stalled: {'; '.join(exempt)}")
+            return
+        if self.level == 0:
+            if busy:
+                self.since = None
+                self.note(f"not stalled: {'; '.join(busy)}")
+                return
+            if self.since is None:
+                self.since = instant
+                self.note("both panes idle with nothing to wake them; stall clock started")
+            if instant - self.since >= self.period:
+                self.pointer(instant - self.since, quiet, texts)
+                self.level, self.pointer_at = 1, instant
+        elif self.level == 1:
+            # A busy pane after the pointer (the planner reading it) does not reset the level, but
+            # escalation waits until both panes have been idle for a whole period: never mid-work.
+            if (instant - self.pointer_at >= 2 * self.period and self.idle_since is not None
+                    and instant - self.idle_since >= self.period):
+                self.escalate(instant - self.since, quiet)
+                self.level = 2
+                # Its own records (waiting.json, loop.json) are not progress; the planner removing them is.
+                self.fingerprint = self.current_fingerprint(sessions)
+
+    # --- acting ---------------------------------------------------------------------------------
+    def implementer_line(self, texts: dict[str, Any]) -> str | None:
+        for peer in self.relay.peers:
+            if peer.box == "codex" and isinstance(texts.get(peer.box), str):
+                return last_words(texts[peer.box], peer.tool)
+        return None
+
+    def pointer(self, idle: float, quiet: list[str], texts: dict[str, Any]) -> None:
+        minutes = f"{idle / 60:.0f}"
+        subject = f"stall: loop idle for {minutes} min, nothing unread, no running helper"
+        body = [f"The relay has seen this loop idle for {minutes} minutes: both agent panes idle with an empty",
+                "composer, no unread mail in either box, no running helper, no PR open for review, and the",
+                "loop neither done nor waiting on the human.", ""]
+        body += [f"- {line}" for line in quiet] + ([""] if quiet else [])
+        words = self.implementer_line(texts)
+        if words:
+            body += [f"The implementer's last line: {words}", ""]
+        body += ["Next step: check your mail waiter - it may have been killed under memory pressure; rearm it",
+                 "if it is not running - and any finished helper (mail from `helper`,",
+                 "`.workbench/state/helpers/*.done`, `.workbench/review/`). Then continue the loop, or, if it",
+                 "waits on the human, say so and run `wb.py status blocked --sound` (queue mode: also",
+                 "`wb.py loop-state blocked --reason ...`).", "",
+                 f"With no progress for another {2 * self.period / 60:.0f} minutes the relay reports the loop blocked."]
+        if self.relay.dry_run:
+            self.relay.log(f"[dry-run] would mail the planner: {subject}")
+            return
+        try:
+            path = self.relay.hub.write_message(to="claude", sender="relay", kind="stall", subject=subject,
+                                                body="\n".join(body))
+        except OSError as err:
+            self.relay.log(f"could not file the stall pointer: {err}")
+            return
+        self.sent.add(Path(path).stem)
+        self.relay.log(f"STALL pointer to the planner: {subject}")
+
+    def escalate(self, idle: float, quiet: list[str]) -> None:
+        import agw
+        summary = (f"stalled: loop idle for {idle / 60:.0f} min, no progress since the relay's stall pointer"
+                   + (f"; {quiet[0]}" if quiet else ""))
+        if self.relay.dry_run:
+            self.relay.log(f"[dry-run] would report the loop blocked: {summary}")
+            return
+        self.relay.log(f"ALERT {summary}")
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            (self.state_dir / "waiting.json").write_text(
+                json.dumps({"at": wall(), "by": "relay", "reason": summary}), encoding="utf-8")
+        except OSError as err:
+            self.relay.log(f"could not write state/waiting.json: {err}")
+        if (self.state_dir / "queue-member.json").exists():
+            try:
+                import conductor
+                identity = conductor.read_json(self.state_dir / "claude.json")
+                conductor.write_loop_state(self.relay.hub_dir.parent, "blocked", reason=summary,
+                                           loop_id=identity.get("sessionId"))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as err:
+                self.relay.log(f"could not report the stall to the queue: {err}")
+        for peer in self.relay.peers:
+            if peer.box != "claude":
+                continue
+            try:
+                agw.set_status("blocked", sound=True, blink=True, pane_id=peer.pane)
+            except (agw.CtlError, OSError) as err:
+                self.relay.log(f"could not set blocked status: {err}")
+            try:
+                agw.notify(peer.pane, summary, title="workbench relay")
+            except (agw.CtlError, OSError) as err:
+                self.relay.log(f"could not notify: {err}")
+
+
 class Relay:
     def __init__(self, hub_dir: Path, peers: list[Peer], repo: str, branch: str,
                  mail_interval: float, pr_interval: float, dry_run: bool = False,
-                 limit_interval: float = 30.0):
+                 limit_interval: float = 30.0, stall_minutes: float = 0.0):
         os.environ["AI_HUB"] = str(hub_dir)
         import hub  # noqa: E402 - imported after AI_HUB is set so its paths point at this workbench
         hub.reload_paths()
@@ -294,6 +614,8 @@ class Relay:
         self.mail_interval = mail_interval
         self.pr_interval = pr_interval
         self.limit_interval = limit_interval
+        # Off unless given: main() passes the configured value (#45).
+        self.stall = StallWatch(self, stall_minutes)
         # Limit rows already on screen when this relay started (e.g. the old tool's message above
         # the agent that replaced it): ignored until they leave the pane's tail.
         self.limit_baseline: dict[str, set[str]] = {}
@@ -428,16 +750,28 @@ class Relay:
         return entry
 
     # usage limits (#24) -------------------------------------------------------------------------
-    def check_limits(self) -> None:
-        """Classify each pane; an episode seen on LIMIT_READS consecutive reads is announced once."""
+    def read_panes(self) -> dict[str, Any]:
+        """Each agent pane's text, read once per limit interval for the limit check and the stall
+        watch; a read that failed is its exception."""
         import agw
+        texts: dict[str, Any] = {}
+        for peer in self.peers:
+            try:
+                texts[peer.box] = agw.pane_text(peer.pane)
+            except (agw.CtlError, OSError) as err:
+                texts[peer.box] = err
+        return texts
+
+    def check_limits(self, texts: dict[str, Any] | None = None) -> None:
+        """Classify each pane; an episode seen on LIMIT_READS consecutive reads is announced once."""
+        if texts is None:
+            texts = self.read_panes()
         episodes = dict(self.state.get('limits', {}))
         changed = False
         for peer in self.peers:
-            try:
-                text = agw.pane_text(peer.pane)
-            except (agw.CtlError, OSError) as err:
-                self.log(f"limit check: cannot read {peer.box}: {err}")
+            text = texts.get(peer.box)
+            if not isinstance(text, str):
+                self.log(f"limit check: cannot read {peer.box}: {text}")
                 continue
             found = limits.classify(text, peer.tool)
             episode = episodes.get(peer.box)
@@ -935,7 +1269,12 @@ class Relay:
             if drain_deadline is None and now() >= next_limit:
                 # After a merge or close only the final notices matter; nobody fails over then.
                 next_limit = now() + self.limit_interval
-                self.check_limits()
+                texts = self.read_panes()
+                self.check_limits(texts)
+                try:
+                    self.stall.tick(texts)
+                except Exception as err:  # noqa: BLE001 - a watchdog bug must never stop the doorbell
+                    self.log(f"stall watch failed: {type(err).__name__}: {err}")
             self.deliver_mail()
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()
@@ -989,6 +1328,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pr-interval", type=float, default=60.0)
     parser.add_argument("--limit-interval", type=float, default=30.0,
                         help="seconds between usage-limit checks of each pane (#24)")
+    parser.add_argument("--stall-minutes", type=float,
+                        help="minutes idle before a stall pointer (#45; default: stallMinutes in "
+                             "~/.agworkbench.json, else 15; 0 = off)")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -1003,7 +1345,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     peers = peers_for(args)
     relay = Relay(Path(args.hub), peers, args.repo, args.branch, args.mail_interval,
-                  args.pr_interval, dry_run=args.dry_run, limit_interval=args.limit_interval)
+                  args.pr_interval, dry_run=args.dry_run, limit_interval=args.limit_interval,
+                  stall_minutes=args.stall_minutes if args.stall_minutes is not None else stall_setting())
     try:
         return relay.run()
     except KeyboardInterrupt:
