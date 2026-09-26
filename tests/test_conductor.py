@@ -991,6 +991,7 @@ class CloseBackstop(unittest.TestCase):
         import relay
         q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path), 'repo': 'o/r', 'number': 7})
         (self.state / 'loop-done.json').unlink()
+        self.conductor_up()
         clock = {'t': 0.0}
         peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
         with patch.dict(os.environ), patch.object(relay, 'now', lambda: clock['t']), \
@@ -1000,6 +1001,7 @@ class CloseBackstop(unittest.TestCase):
             r.log = lambda text: None
             r.close_after_merge(42)
         hub.reload_paths()
+        self.assertIn('handing the close to the queue conductor', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
         self.assertEqual([('unpin', 'relay-7'), ('close', 'relay-7')], self.actions)     # only its own session
         saved = q.read_json(self.state / 'relay.json')
         self.assertEqual(42, saved['close_pending'])
@@ -1014,6 +1016,67 @@ class CloseBackstop(unittest.TestCase):
         for key in ('close_pending', 'close_merged_at', 'close_handoff'):
             self.assertNotIn(key, saved)
         self.assertNotIn('closePending', self.member(7))
+
+    def conductor_up(self, state='running'):
+        """This queue's conductor, as the relay sees it: the worker lock held, the owner's state."""
+        with self.store.transaction() as data:
+            data['owner']['state'] = state
+        lock = q.Lock(self.store.worker_lock, 0).acquire()
+        self.addCleanup(lock.release)
+
+    def relay_for_queue(self):
+        import hub
+        import relay
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path), 'repo': 'o/r', 'number': 7})
+        with patch.dict(os.environ):
+            r = relay.Relay(self.checkout / '.workbench', [], 'o/r', 'issue-7-fix', 5, 60)
+        hub.reload_paths()
+        return r
+
+    def test_the_relay_sees_whether_the_conductor_is_running(self):
+        # r1 M1: the worker lock held AND the owner running; anything else is "nobody to hand to".
+        r = self.relay_for_queue()
+        self.assertFalse(r.conductor_running())                  # no conductor holds the worker lock
+        self.conductor_up('finished')
+        self.assertFalse(r.conductor_running())                  # held, but it has published finished
+        with self.store.transaction() as data:
+            data['owner']['state'] = 'running'
+        self.assertTrue(r.conductor_running())
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.root / 'missing.json')})
+        self.assertFalse(r.conductor_running())                  # an unreadable queue: no handoff
+
+    def test_a_handed_off_close_keeps_a_finished_queue_up_until_the_backstop_ends(self):
+        # r1 M1: a non-watch queue whose only member has its PR is otherwise finished - before the
+        # conductor even sees the merge. Driven through tick(), as run() does.
+        with self.store.transaction() as data:
+            data['members'][0].update(state='pr-open', prState='OPEN')
+        self.assertTrue(q.finished(self.store.load()))           # nothing handed over: it may finish
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 42, 'close_handoff': {'pr': 42, 'reasons': ['x']}})
+        self.relay_gone()
+        self.assertFalse(q.finished(self.store.load()))
+        self.pr_state = 'MERGED'
+        end = self.now + 1300
+        while self.now < end and not q.finished(self.store.load()):
+            self.w.tick()
+            self.now += 20
+        self.assertTrue(q.finished(self.store.load()))
+        self.assertEqual('merged', self.member(7)['state'])
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertEqual([42], [a[3] for a in self.cleanups])
+        self.assertNotIn('close_handoff', q.read_json(self.state / 'relay.json'))
+
+    def test_a_relay_alive_flag_is_cleared_when_the_backstop_takes_over(self):
+        # r1 m1: flagged while the relay lived; once it is gone the attempt must keep the queue up.
+        self.run_for(1000)
+        self.assertIn('relay is alive', self.member(7)['closeStuck'])
+        self.relay_gone()
+        self.w.close_backstop()                                  # the attempt starts
+        self.assertIsNotNone(self.w.closes[7]['attempt'])
+        self.assertNotIn('closeStuck', self.member(7))
+        self.assertFalse(q.finished(self.store.load()))
+        self.run_for(200)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertTrue(q.finished(self.store.load()))
 
     def test_an_unreadable_tree_closes_nothing(self):
         self.w.close_backstop()                                  # starts the 15-minute clock

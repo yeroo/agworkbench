@@ -44,15 +44,15 @@ CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be c
 
 
 def parse_time(value) -> datetime | None:
-    """A zoned ISO time (GitHub's `mergedAt`, the hub's `created:`) in UTC, else None. The same rule as
-    relay.timestamp, kept here because relay imports closer."""
+    """A zoned ISO time (GitHub's `mergedAt`, the hub's `created:`) in UTC, else None. Also the relay's
+    `timestamp` (relay imports closer, not the other way round)."""
     if not isinstance(value, str):
         return None
     try:
         parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
     except (ValueError, OverflowError):
         return None
-    return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
 
 
 def issue_from_branch(branch: str) -> str | None:

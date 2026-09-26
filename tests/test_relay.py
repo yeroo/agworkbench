@@ -2317,8 +2317,11 @@ class AutonomousClose(unittest.TestCase):
         self.assertEqual(self.MERGED_AT, restarted.state['close_merged_at'])
 
     # --- #44: in queue mode a refused close is handed to the conductor ----------------------------
-    def queue_member(self):
+    def queue_member(self, running=True):
+        """A queue member whose conductor is running (or not); the real check is in test_conductor."""
         self.write('queue-member.json', {'queue': 'q.json', 'repo': 'o/repo', 'number': 7})
+        looks = running if isinstance(running, list) else [running] * 2
+        self.looks = self.enterContext(patch.object(relay.Relay, 'conductor_running', side_effect=looks))
 
     def test_a_refused_close_in_queue_mode_is_handed_to_the_conductor(self):
         # #44 AC5: close_pending stays (B1), close_handoff is recorded, and the relay's session goes.
@@ -2338,6 +2341,29 @@ class AutonomousClose(unittest.TestCase):
         self.assertEqual([self.REVMUX, self.RELAY], self.closes())                 # not the issue session
         self.assertEqual([], [a for a in self.actions if a[0] == 'cleanup'])
         self.assertIn('NOT closing, still waiting after 120s', self.log())
+
+    def refused_without_handoff(self):
+        self.blocked()
+        self.assertNotIn(self.RELAY, self.closes())
+        saved = json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))
+        for key in ('close_pending', 'close_merged_at', 'close_handoff'):
+            self.assertNotIn(key, saved)
+        return self.log()
+
+    def test_no_handoff_when_the_conductor_is_not_running(self):
+        # r1 M1: a queue that is not watching finishes once its last member has a PR; nobody would retry.
+        self.queue_member(running=False)
+        (self.state / 'loop-done.json').unlink()
+        self.pending(close_merged_at=self.MERGED_AT)
+        self.assertIn('NOT handing the close to the queue conductor: it is not running', self.refused_without_handoff())
+
+    def test_no_handoff_when_the_conductor_finishes_before_the_second_look(self):
+        # r1 M1: running when checked, gone once close_handoff was saved - it may not have seen it.
+        self.queue_member(running=[True, False])
+        (self.state / 'loop-done.json').unlink()
+        self.pending(close_merged_at=self.MERGED_AT)
+        self.assertIn('NOT handing the close to the queue conductor: it finished meanwhile', self.refused_without_handoff())
+        self.assertEqual(2, self.looks.call_count)
 
     def test_a_refused_close_outside_queue_mode_is_unchanged(self):
         # #44 AC6: no conductor: alert, nothing pending, the relay's session stays.
@@ -2462,8 +2488,9 @@ class AutonomousClose(unittest.TestCase):
         self.assertEqual([self.REVMUX], self.closes())
         self.assertIn('NOT closing: autonomy was turned off during the wait', self.log())
 
-    def test_unread_mail_to_the_planner_or_from_a_human_blocks(self):
-        # r18 M3; #44: the planner's unread mail refuses; the implementer's blocks for the wait only.
+    def test_the_planners_unread_mail_refuses_and_the_implementers_only_holds_the_wait(self):
+        # r18 M3; #44: unread planner mail (a human's too) refuses; the implementer's, a human's too,
+        # blocks for CLOSE_WAIT and is then overridden.
         for box, sender in (('claude', 'codex'), ('claude', 'human'), ('codex', 'human'), ('codex', 'github')):
             with self.subTest(box=box, sender=sender):
                 self.actions.clear()
