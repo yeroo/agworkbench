@@ -1012,7 +1012,9 @@ def main() -> int:
     p = subs.add_parser("suite", help="run a long command (the whole suite, a build) in its own visible session (#45)")
     p.add_argument("--label", required=True, help="names the session and the log, e.g. the head's short sha")
     p.add_argument("--to", help="the mailbox the result goes to (default: AI_BOX, else claude)")
-    p.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command and its arguments")
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="-- then the command and its arguments; no shell: the first word is found on PATH, "
+                        "a .ps1 runs under pwsh, a .cmd/.bat (npm, gradlew) through cmd /d /s /c")
     p.set_defaults(func=cmd_suite)
     p = subs.add_parser("human-review", help="open revdiff for the human, selected")
     p.add_argument("--base", required=True, help="e.g. origin/main")

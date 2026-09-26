@@ -5,13 +5,18 @@ wb.py suite opens this in its own visible session, in agwinterm's direct mode:
 
   python lib/run_helper.py --hub <checkout>\\.workbench --label 1f04542 --to claude -- python -m unittest discover -s tests
 
-It runs the command with no shell around it (argv as given; a `.ps1` gets `pwsh -File`), echoes its
+It runs the command with no shell around it (argv[0] resolved on PATH with PATHEXT; a `.ps1` gets
+`pwsh -File`, a `.cmd`/`.bat` shim such as npm or gradlew gets `cmd /d /s /c`), echoes its
 output to the pane, and writes it to `.workbench/review/suite-<label>.log` as UTF-8 without a BOM,
 whatever the child wrote: Windows PowerShell 5.1's `>` redirection wrote UTF-16, which a text match
 never sees. When the command ends it mails the result to `--to` (sender `helper`) - the relay rings
 that pane, so nobody depends on a private background watcher that low memory can kill - and, as its
 very last act, writes its completion marker (helper_done.write_marker) with the exit code and the
 failure count, so the autonomous close can prove its pane untouched.
+
+It waits for the command, not for its descendants: a grandchild that inherited the output pipe (a
+build server, MSBuild node reuse, a detached test server) cannot hold the result back. Once the
+command has exited, output still arriving is read for GRACE seconds and then left unread.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
 TAIL_LINES = 40           # log lines quoted in the result mail
 CHUNK = 4096
+GRACE = 5.0               # seconds to keep reading after the command exited
 
 SUITE_FAILURES_RE = re.compile(r"SUITE FAILURES:\s*(\d+)")
 UNITTEST_FAILED_RE = re.compile(r"^FAILED \(([^)]*)\)\s*$")
@@ -42,12 +49,23 @@ def log_path(hub: Path, label: str) -> Path:
     return Path(hub) / "review" / f"suite-{label}.log"
 
 
-def command_for(argv: list[str]) -> list[str]:
-    """argv as given, except that a PowerShell script runs under pwsh (Windows PowerShell as a fallback)."""
+def command_for(argv: list[str]) -> list[str] | str:
+    """What to start for argv. A PowerShell script runs under pwsh (Windows PowerShell as a fallback).
+    Otherwise argv[0] is resolved on PATH (PATHEXT honoured, so `npm` finds npm.cmd); a `.cmd` or `.bat`
+    cannot be started directly and runs through cmd.exe, as one command line (a string). Anything
+    else runs as the resolved path. An unresolved name is left as given: starting it reports why."""
     if argv and argv[0].lower().endswith(".ps1"):
         shell = shutil.which("pwsh") or shutil.which("powershell.exe") or "powershell.exe"
         return [shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
-    return list(argv)
+    if not argv:
+        return []
+    resolved = shutil.which(argv[0]) or argv[0]
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        # /s: cmd strips exactly the outer quotes and runs the rest as written, so each argument keeps
+        # the Windows quoting list2cmdline gives it.
+        return f'{subprocess.list2cmdline([comspec])} /d /s /c "{subprocess.list2cmdline([resolved, *argv[1:]])}"'
+    return [resolved, *argv[1:]]
 
 
 def pick_decoder(first: bytes):
@@ -94,41 +112,65 @@ def count_failures(text: str) -> int | None:
 
 
 def run(argv: list[str], log: Path, echo) -> tuple[int | None, str]:
-    """Run argv, echo and log its merged output as it arrives. Returns (exit code or None, the text)."""
-    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    """Run argv, echo and log its merged output as it arrives. Returns (exit code or None, the text)
+    once the command has exited - never waiting on a descendant that holds the pipe open."""
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8", MSBUILDDISABLENODEREUSE="1")
     log.parent.mkdir(parents=True, exist_ok=True)
     parts: list[str] = []
+    lock = threading.Lock()
+    stopped = threading.Event()
     with log.open("w", encoding="utf-8", newline="") as handle:
-        def emit(text: str) -> None:
-            if text:
-                parts.append(text)
-                handle.write(text)
-                handle.flush()          # readable while it runs
-                echo(text)
+        def emit(text: str, *, final: bool = False) -> None:
+            with lock:
+                if text and (final or not stopped.is_set()):
+                    parts.append(text)
+                    handle.write(text)
+                    handle.flush()          # readable while it runs
+                    echo(text)
         try:
-            child = subprocess.Popen(command_for(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+            # Unbuffered: the reader may be abandoned mid-read, and a raw pipe holds no lock.
+            child = subprocess.Popen(command_for(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                                     bufsize=0)
         except OSError as err:
             emit(f"run_helper: could not start {argv[0]}: {err}\n")
             return None, "".join(parts)
-        decoder = None
+
+        def read() -> None:
+            decoder = None
+            try:
+                while not stopped.is_set():
+                    chunk = child.stdout.read(CHUNK)
+                    if not chunk:
+                        break
+                    if decoder is None:
+                        decoder = pick_decoder(chunk)
+                    emit(decoder.decode(chunk))
+                if decoder is not None:
+                    emit(decoder.decode(b"", final=True))
+            except (OSError, ValueError):
+                pass                        # the pipe went away under us
+            finally:
+                child.stdout.close()        # after EOF - late, when a descendant held it open
+
+        reader = threading.Thread(target=read, name="run_helper-output", daemon=True)
+        reader.start()
         try:
-            while True:
-                chunk = child.stdout.read1(CHUNK) if hasattr(child.stdout, "read1") else child.stdout.read(CHUNK)
-                if not chunk:
-                    break
-                if decoder is None:
-                    decoder = pick_decoder(chunk)
-                emit(decoder.decode(chunk))
-            if decoder is not None:
-                emit(decoder.decode(b"", final=True))
-            return child.wait(), "".join(parts)
+            code = child.wait()
         except KeyboardInterrupt:
             child.kill()
             child.wait()
-            emit("\nrun_helper: interrupted; the command was stopped\n")
+            reader.join(GRACE)
+            stopped.set()
+            emit("\nrun_helper: interrupted; the command was stopped\n", final=True)
             return None, "".join(parts)
-        finally:
-            child.stdout.close()
+        reader.join(GRACE)
+        if reader.is_alive():
+            # A descendant still holds the pipe. The reader is left blocked (a daemon: it ends with this
+            # process); closing the pipe under a blocked read can hang on Windows.
+            stopped.set()
+            emit("\nrun_helper: the command exited; output still held open by a child process was not read\n",
+                 final=True)
+        return code, "".join(parts)
 
 
 def result_subject(label: str, code: int | None, failures: int | None) -> str:

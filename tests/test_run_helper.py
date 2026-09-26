@@ -7,8 +7,10 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -26,6 +28,13 @@ FAILING = ("import sys; print('héllo ✓ 日本'); print('Ran 5 tests'); print(
            "print('FAILED (failures=2, errors=1)'); sys.exit(1)")
 UTF16 = ("import sys; sys.stdout.buffer.write('SUITE FAILURES: 0 — ok\\r\\n'.encode('utf-16')); "
          "sys.stdout.flush()")
+
+
+def kill(pid):
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
 
 
 class Wrapper(unittest.TestCase):
@@ -105,6 +114,47 @@ class Wrapper(unittest.TestCase):
         self.assertEqual('suite abc1234: FAILED (did not finish)', mail['subject'])
         self.assertIn('could not start', mail['body'])
 
+    @unittest.skipUnless(sys.platform == 'win32', '.cmd shims are Windows')
+    def test_a_cmd_shim_on_path_runs_with_its_arguments(self):
+        # r2 G1: npm, yarn, gradlew, mvn are .cmd/.bat shims that Popen cannot start directly.
+        shims = self.folder / 'shim bin'
+        shims.mkdir()
+        (shims / 'dumpargs.cmd').write_text(
+            f'@"{sys.executable}" -c "import sys, json; print(json.dumps(sys.argv[1:]))" %*\r\n',
+            encoding='utf-8')
+        with patch.dict(os.environ, {'PATH': str(shims) + os.pathsep + os.environ['PATH']}):
+            self.assertEqual(0, self.run_wrapper('dumpargs', 'a b', 'plain', 'x=1'))
+        log = (self.hub_dir / 'review' / 'suite-abc1234.log').read_text(encoding='utf-8')
+        self.assertEqual(['a b', 'plain', 'x=1'], json.loads(log.splitlines()[0]))
+        self.assertEqual('suite abc1234: passed (exit 0)', self.mails()[0]['subject'])
+
+    def test_a_missing_bare_command_still_mails(self):
+        self.assertEqual(1, self.run_wrapper('no-such-command-xyz', '--version'))
+        self.assertEqual('suite abc1234: FAILED (did not finish)', self.mails()[0]['subject'])
+        self.assertIsNone(self.marker()['exit'])
+
+    def test_a_grandchild_holding_the_pipe_does_not_hold_the_result(self):
+        # r2 G2: a build server or detached test server inherits the output pipe and outlives the command.
+        spawn = ("import subprocess, sys; "
+                 "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                 "stdout=sys.stdout, stderr=subprocess.STDOUT); "
+                 "print('grandchild', p.pid, flush=True)")
+        self.enterContext(patch.object(run_helper, 'GRACE', 1.0))
+        started = time.monotonic()
+        self.assertEqual(0, self.run_wrapper(sys.executable, '-c', spawn))
+        elapsed = time.monotonic() - started
+        log = (self.hub_dir / 'review' / 'suite-abc1234.log').read_text(encoding='utf-8')
+        pid = int(log.split('grandchild ')[1].split()[0])
+        self.addCleanup(kill, pid)
+        self.assertLess(elapsed, 20)
+        self.assertIn('output still held open by a child process was not read', log)
+        self.assertEqual('suite abc1234: passed (exit 0)', self.mails()[0]['subject'])
+        self.assertEqual(0, self.marker()['exit'])
+
+    def test_msbuild_node_reuse_is_off_for_the_command(self):
+        self.run_wrapper(sys.executable, '-c', 'import os; print(os.environ.get("MSBUILDDISABLENODEREUSE"))')
+        self.assertEqual('1', (self.hub_dir / 'review' / 'suite-abc1234.log').read_text(encoding='utf-8').splitlines()[0])
+
     def test_arguments_reach_the_child_unchanged(self):
         # G4: argv, no shell - spaces and quotes survive.
         self.run_wrapper(sys.executable, '-c', 'import sys, json; print(json.dumps(sys.argv[1:]))',
@@ -133,7 +183,9 @@ class Pieces(unittest.TestCase):
         self.assertEqual(['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'build.ps1', '-Release'],
                          command[1:])
         self.assertRegex(Path(command[0]).name.lower(), r'^(pwsh|powershell)(\.exe)?$')
-        self.assertEqual(['python', '-m', 'unittest'], run_helper.command_for(['python', '-m', 'unittest']))
+        # r2 G1: a bare name resolves on PATH (PATHEXT honoured).
+        self.assertEqual([shutil.which('python'), '-m', 'unittest'], run_helper.command_for(['python', '-m', 'unittest']))
+        self.assertEqual(['no-such-command-xyz', 'a'], run_helper.command_for(['no-such-command-xyz', 'a']))
 
     def test_decoder_choice(self):
         self.assertEqual('é', run_helper.pick_decoder('é'.encode('utf-8')).decode('é'.encode('utf-8')))
