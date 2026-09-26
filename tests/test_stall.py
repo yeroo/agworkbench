@@ -480,7 +480,8 @@ class StallProse(unittest.TestCase):
         section = text.split('## Stall pointers')[1].split('## Adopted session')[0]
         for needle in ('kind `stall`', 'Check your background waiter', 'mail from `helper`',
                        '`.workbench/state/waiting.json`', 'That record is a latch',
-                       'run `wb.py status active`', '`loop-state resumed`', 'reason starting `stalled:`'):
+                       'run `wb.py status active`', '`loop-state resumed`', 'reason starting `stalled:`',
+                       'no CI still running on an auto-merge PR', 'no usage-limit episode'):
             self.assertIn(needle, section)
         rules = text.split('## Rules')[1]
         self.assertIn('wb.py" suite --label <sha7> -- <command and its arguments>', rules)

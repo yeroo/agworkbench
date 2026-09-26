@@ -581,8 +581,9 @@ stop to ask you a question. Each of these looks exactly like a loop waiting corr
 30 s reads the relay also watches for a **stall**. A loop is stalled when both agent panes are
 provably idle (no turn running, an empty composer), no mail is unread, and no helper is running.
 It is not stalled when it is done, when it records that it waits on you (`wb.py status blocked`
-writes `.workbench/state/waiting.json`; loop.json `blocked` or `pr-open`), or when a PR is open for
-your review (outside auto-merge). A helper without its completion marker counts as running while its pane
+writes `.workbench/state/waiting.json`; loop.json `blocked` or `pr-open`), when a PR is open for
+your review (outside auto-merge), when an auto-merge PR still has a check running (the planner waits on
+CI), or during a usage-limit episode. A helper without its completion marker counts as running while its pane
 changes. After two periods of silence it no longer does, and the pointer names it. Your revdiff always counts.
 
 - After `stallMinutes` (default 15) the relay mails the planner one pointer (from `relay`, kind
@@ -597,7 +598,10 @@ hooks rewrite it on every turn.
 
 **Suites and builds finish visibly.** `wb.py suite --label <sha7> -- <command>` runs a long command
 in its own `#N suite <label>` session in direct mode (`lib/run_helper.py`). The command runs with
-no shell, and a `.ps1` runs under pwsh. Its output goes to the pane and, as UTF-8 without a BOM, to
+no shell: its first word is found on PATH, a `.ps1` runs under pwsh, and a `.cmd` or `.bat` shim
+(npm, yarn, gradlew, mvn) runs through `cmd /d /s /c`. The helper waits for the command, not for
+processes it left behind: once the command exits, output still held open by a child (a build server,
+a detached test server) is read for 5 s and then left unread. Its output goes to the pane and, as UTF-8 without a BOM, to
 `.workbench/review/suite-<label>.log`, even when the command writes UTF-16. When it ends, it mails
 the result to the caller's box from `helper`: exit code, failure count, and the log's tail. Its last act is to write a completion marker with both, so
 the autonomous close can close it. revmux and revdiff rounds that fail also mail the planner

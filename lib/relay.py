@@ -33,7 +33,8 @@ Five jobs, one loop, one process per issue, running in its own visible agwinterm
 
 5. **Stalls (#45).** On the same reads it watches for a loop that sits idle with nothing to wake it:
    both agent panes provably idle, no unread mail, no running helper, and the loop not done, not
-   waiting on the human (`state/waiting.json`, loop.json `blocked`/`pr-open`, a PR open for review).
+   waiting on the human (`state/waiting.json`, loop.json `blocked`/`pr-open`, a PR open for review),
+   not waiting on CI (an auto-merge PR with a check still running), and no usage-limit episode.
    After `stallMinutes` (config, default 15) it mails the planner one `stall` pointer; after two more
    periods with no progress it reports the loop blocked (blocked status and sound, waiting.json, and
    loop.json in queue mode). Progress - a commit, mail, a helper, a loop report - resets it. It
@@ -562,8 +563,8 @@ class StallWatch:
         minutes = f"{idle / 60:.0f}"
         subject = f"stall: loop idle for {minutes} min, nothing unread, no running helper"
         body = [f"The relay has seen this loop idle for {minutes} minutes: both agent panes idle with an empty",
-                "composer, no unread mail in either box, no running helper, no PR open for review, and the",
-                "loop neither done nor waiting on the human.", ""]
+                "composer, no unread mail in either box, no running helper, no PR open for review or CI",
+                "running, no usage limit, and the loop neither done nor waiting on the human.", ""]
         body += [f"- {line}" for line in quiet] + ([""] if quiet else [])
         words = self.implementer_line(texts)
         if words:

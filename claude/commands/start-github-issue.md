@@ -129,8 +129,8 @@ desktop notification. It stops ringing a limited implementer: mail to it waits.
 ## Stall pointers (the relay's `stall:` mail)
 
 The relay also watches for a loop that sits idle with nothing to wake it: both panes idle with an
-empty composer, no unread mail, no running helper, no PR open for review, and nothing recording that
-you wait on the human. After `stallMinutes` (default 15) it mails you once from `relay`, kind
+empty composer, no unread mail, no running helper, no PR open for review, no CI still running on an
+auto-merge PR, no usage-limit episode, and nothing recording that you wait on the human. After `stallMinutes` (default 15) it mails you once from `relay`, kind
 `stall`, subject `stall: loop idle for N min ...`. Usually your mail waiter was killed under memory
 pressure, a helper's result went unnoticed, or the implementer is waiting on a question to the human.
 The mail quotes the implementer's last line when it has one.
