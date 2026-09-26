@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'lib'))
 import conductor as q
 import closer
+import cleanup
+
+REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
 
 
 class QueueCase(unittest.TestCase):
@@ -35,6 +38,12 @@ class QueueCase(unittest.TestCase):
         # The in-hand lookups (#28) call gh and the terminal; queue mechanics tests assume none in hand.
         self.real_in_hand = q.in_hand
         self.in_hand = self.enterContext(patch.object(q, 'in_hand', return_value={}))
+        # #41: the disk guard reads this; a test machine's real free space must not pause the queue.
+        self.free = 500 * q.GIB
+        self.enterContext(patch.object(q, 'free_bytes', lambda path: (self.free, 'X:')))
+        self.cleanups = []
+        self.enterContext(patch.object(cleanup, 'start_after_close',
+                                       side_effect=lambda *args: self.cleanups.append(args) or (1, 'wmi')))
         self.now = 1000
         self.store = q.Store(self.root / 'queues/o/r.json')
         self.launches = []
@@ -883,9 +892,34 @@ class CloseBackstop(unittest.TestCase):
         self.relay_gone()
         self.run_for(1000)
         self.assertEqual([('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER), ('close', self.PLANNER)], self.actions)
+        # #41: and then the checkout cleanup, for the PR (not the issue) number.
+        self.assertEqual([(self.checkout.parent / self.checkout.name, 'o/r', '7', 42, 'merged')],
+                         [(Path(a[0]), *a[1:]) for a in self.cleanups])
         self.assertNotIn('close_pending', q.read_json(self.state / 'relay.json'))
         self.assertNotIn('closePending', self.member(7))
         self.assertIn('the conductor runs the close', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_the_backstop_cleanup_follows_the_recorded_mode(self):
+        for value, expected in (('build', 'build'), ('off', None)):
+            with self.subTest(value=value):
+                self.setUp()
+                q.atomic_json(self.state / 'implementer.json', {'autonomous': True, 'cleanup': value})
+                self.relay_gone()
+                self.run_for(1000)
+                self.assertEqual([] if expected is None else [expected], [a[4] for a in self.cleanups])
+
+    def test_no_backstop_cleanup_without_the_close(self):
+        self.relay_gone()
+        box = self.checkout / '.workbench' / 'inbox' / 'claude'
+        box.mkdir(parents=True)
+        (box / 'h1.md').write_text('---\nid: h1\nfrom: human\nto: claude\nsubject: wait\n---\nx\n', encoding='utf-8')
+        self.run_for(900 + closer.CLOSE_WAIT + 60)
+        self.assertEqual([], self.cleanups)                     # refused on the timeout
+        self.setUp()
+        q.atomic_json(self.state / 'implementer.json', {'autonomous': False})
+        self.relay_gone()
+        self.run_for(1000)
+        self.assertEqual([], self.cleanups)                     # autonomy off: nothing closed, nothing deleted
 
     def test_the_relay_finishing_its_own_close_clears_the_flags(self):
         self.run_for(1000)
@@ -943,6 +977,124 @@ class CloseBackstop(unittest.TestCase):
             self.w.close_backstop()
         self.assertEqual([], self.actions)
         self.assertIn('close #7', self.w.errors)
+
+class DiskGuard(unittest.TestCase):
+    """#41: below minFreeGB on the checkout drive the conductor admits nothing and fails nothing;
+    it resumes by itself when space returns."""
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh,
+                                                  QueueCase.spawn, QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2,3', parallel=2)
+        self.w = self.worker()
+        self.w.notify = Mock()
+        self.w.status = Mock()
+
+    def states(self):
+        return [m['state'] for m in self.store.load()['members']]
+
+    def test_low_disk_pauses_admission_and_resumes(self):
+        self.free = 5 * q.GIB
+        for _ in range(3):
+            self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual(['pending'] * 3, self.states())
+        paused = self.store.load()['diskPaused']
+        self.assertEqual('low disk: 5.0 GB free < 20 GB on X:', paused)
+        self.free = 4 * q.GIB                                                    # a shrinking disk is not news
+        self.w.tick()
+        self.assertEqual('low disk: 4.0 GB free < 20 GB on X:', self.store.load()['diskPaused'])
+        self.w.notify.assert_called_once_with('queue paused: ' + paused)          # once per change, not per tick
+        self.w.status.assert_called_once_with('blocked')
+        self.assertFalse(q.finished(self.store.load()))
+        self.free = 25 * q.GIB
+        self.w.tick()
+        self.assertEqual([1, 2], [n for n, _, _ in self.launches])
+        self.assertNotIn('diskPaused', self.store.load())
+        self.assertEqual('queue resumed: disk space is back', self.w.notify.call_args.args[0])
+        self.w.status.assert_called_with('active')
+
+    def test_an_orphaned_launch_is_not_respawned_while_paused(self):
+        # r1 m1: a launching member whose launcher died is re-spawned only when there is space.
+        with self.store.transaction() as data:
+            m = data['members'][0]
+            m.update(state='launching', attempt=1, token=str(uuid.uuid4()), result=None, startedAt=self.now,
+                     slotReleased=False)
+        self.free = 5 * q.GIB
+        self.w.tick()
+        self.assertEqual([], self.launches)
+        self.assertEqual('launching', self.member(1)['state'])
+        self.free = 25 * q.GIB
+        self.w.tick()
+        self.assertIn(1, [n for n, _, _ in self.launches])
+
+    def test_low_disk_never_times_out_an_orphaned_launch(self):
+        # r2 m1: the 600 s window of an orphaned launch restarts while paused, so it is re-spawned after.
+        with self.store.transaction() as data:
+            m = data['members'][0]
+            m.update(state='launching', attempt=1, token=str(uuid.uuid4()), result=None, startedAt=self.now - 700,
+                     slotReleased=False)
+        self.free = 5 * q.GIB
+        self.w.tick()
+        self.assertEqual('launching', self.member(1)['state'])
+        self.assertEqual([], self.launches)
+        self.now += 700                                   # a long pause
+        self.w.tick()
+        self.assertEqual('launching', self.member(1)['state'])
+        self.free = 25 * q.GIB
+        with patch.object(q, 'checkout_locked', return_value=True):
+            self.w.tick()                                 # a predecessor still holds it: left waiting
+        self.assertEqual('launching', self.member(1)['state'])
+        self.assertNotIn(1, [n for n, _, _ in self.launches])
+        self.w.tick()
+        self.assertIn(1, [n for n, _, _ in self.launches])
+        self.assertNotEqual('failed', self.member(1)['state'])
+
+    def test_a_restarted_conductor_announces_the_pause_it_finds(self):
+        # r1 m2: run() sets the status active; the first tick of a new worker must say it is paused.
+        self.free = 5 * q.GIB
+        self.w.tick()
+        fresh = self.worker()
+        fresh.notify, fresh.status = Mock(), Mock()
+        fresh.tick()
+        fresh.notify.assert_called_once_with('queue paused: low disk: 5.0 GB free < 20 GB on X:')
+        fresh.status.assert_called_once_with('blocked')
+        fresh.tick()
+        fresh.notify.assert_called_once()
+
+    def test_the_threshold_comes_from_the_queue_config(self):
+        self.free = 5 * q.GIB
+        for value, admitted in ((0, True), (4.5, True), (6, False)):
+            with self.subTest(value=value):
+                self.launches.clear()
+                with self.store.transaction() as data:
+                    for m in data['members']:
+                        m.update(state='pending', attempt=0, slotReleased=False)
+                self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'minFreeGB': value}))
+                self.w.tick()
+                self.assertEqual(admitted, bool(self.launches))
+
+    def test_an_invalid_threshold_pauses_rather_than_admits(self):
+        for value in (-1, 'x', True):
+            with self.subTest(value=value):
+                self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'minFreeGB': value}))
+                self.w.tick()
+                self.assertEqual([], self.launches)
+                self.assertIn('minFreeGB', self.store.load()['diskPaused'])
+                self.assertEqual(['pending'] * 3, self.states())
+
+    def test_diskpaused_must_be_a_string(self):
+        with self.store.transaction() as data:
+            data['diskPaused'] = 5
+        with self.assertRaises(q.StateError):
+            self.store.load()
+
+    def test_free_bytes_reads_the_nearest_existing_ancestor(self):
+        free, drive = REAL_FREE_BYTES(self.root / 'clones' / 'not' / 'yet')     # the root does not exist yet
+        self.assertEqual(shutil.disk_usage(self.root).free // q.GIB, free // q.GIB)
+        self.assertEqual(Path(self.root).anchor, drive)
+
 
 class PriorityOrder(unittest.TestCase):
     """#34: pending members are admitted P0, P1, untriaged, P2, P3, oldest issue first; with -Triage

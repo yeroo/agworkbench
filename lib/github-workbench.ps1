@@ -42,6 +42,10 @@
   github-workbench -Triage -Repo yeroo/docxy            # label every untriaged open issue priority:P0..P3
   github-workbench -Triage -Repo yeroo/docxy -Watch     # and keep doing it for new ones, in its own session
   github-workbench -Retriage -Repo yeroo/docxy -DryRun  # re-judge the labelled ones too; print, write nothing
+.EXAMPLE
+  github-workbench -Cleanup -DryRun                     # list finished checkouts and their sizes; delete nothing
+  github-workbench -Cleanup -Repo yeroo/docxy           # delete docxy's finished checkouts that are safe to delete
+  github-workbench -Cleanup -BuildOnly                  # only their target/, node_modules/, bin/, obj/
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -67,6 +71,8 @@ param(
     [switch] $Triage,
     [switch] $Retriage,
     [int] $Limit,
+    [switch] $Cleanup,
+    [switch] $BuildOnly,
     [switch] $Version,
     [string] $ArgsEnv
 )
@@ -136,6 +142,22 @@ if ($Version) {
     }
     Get-ToolchainVersions | ForEach-Object { "{0,-12} {1}" -f $_.Name, $_.Version }
     exit 0
+}
+
+if ($Cleanup -or $BuildOnly) {
+    # The checkout sweep (#41): lib/cleanup.py, over the configured checkoutRoot.
+    $others = @($PSBoundParameters.Keys | Where-Object { $_ -notin @('Cleanup', 'BuildOnly', 'Repo', 'DryRun') })
+    if (-not $Cleanup -or $others) {
+        Write-Host 'usage: github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]' -ForegroundColor Yellow
+        exit 2
+    }
+    try { $config = Get-WorkbenchConfig } catch { Write-Host $_ -ForegroundColor Yellow; exit 2 }
+    $cleanupArgs = @((Join-Path $script:Lib 'cleanup.py'), 'sweep', '--root', [string]$config.checkoutRoot)
+    if ($Repo) { $cleanupArgs += @('--repo', $Repo) }
+    if ($DryRun) { $cleanupArgs += '--dry-run' }
+    if ($BuildOnly) { $cleanupArgs += '--build-only' }
+    & python @cleanupArgs
+    exit $LASTEXITCODE
 }
 
 if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude')) {
@@ -235,6 +257,7 @@ if (-not $Issue) {
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
     Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-Triage]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-Watch]"
+    Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
     exit 2
 }

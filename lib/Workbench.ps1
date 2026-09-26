@@ -116,14 +116,19 @@ function Get-WorkbenchConfig {
          autoMerge      let the planner merge its own PR when every condition holds (default false)
          failover       switch the implementer to the other tool when it hits its usage limit (default true)
          autonomous     full autonomy (#27): auto-merge, follow-up issues, sessions closed after the merge
-                        (default false) #>
+                        (default false)
+         cleanup        after an autonomous close (#41): merged (default) deletes the checkout, build
+                        deletes only its build outputs, off keeps it
+         minFreeGB      the queue admits no member while the checkout drive has less free (GiB; default
+                        20, 0 turns the guard off) #>
     $path = Join-Path $HOME '.agworkbench.json'
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
-                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false }
+                 implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
+                 cleanup = 'merged'; minFreeGB = 20 }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -136,6 +141,13 @@ function Get-WorkbenchConfig {
     if ($config.autoMerge -isnot [bool]) { throw "autoMerge in '$path' must be true or false (got '$($config.autoMerge)')" }
     if ($config.failover -isnot [bool]) { throw "failover in '$path' must be true or false (got '$($config.failover)')" }
     if ($config.autonomous -isnot [bool]) { throw "autonomous in '$path' must be true or false (got '$($config.autonomous)')" }
+    if ($config.cleanup -isnot [string] -or $config.cleanup -cnotin @('merged', 'build', 'off')) {
+        throw "cleanup in '$path' must be merged, build or off (got '$($config.cleanup)')"
+    }
+    $free = $config.minFreeGB
+    if (-not ($free -is [int] -or $free -is [long] -or $free -is [double] -or $free -is [decimal]) -or $free -lt 0) {
+        throw "minFreeGB in '$path' must be a number >= 0 (got '$free')"
+    }
     return $config
 }
 
@@ -867,7 +879,7 @@ function Resolve-Implementer {
         $autoMerge = $true
     }
     return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $Config.revmuxProfile); AutoMerge = $autoMerge;
-              Autonomous = $autonomous; Conflict = $conflict }
+              Autonomous = $autonomous; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
 }
 
 function Get-SavedSetting([string] $Checkout, [string] $Name) {
@@ -882,10 +894,13 @@ function Get-SavedSetting([string] $Checkout, [string] $Name) {
 
 function Save-Implementer([string] $Checkout, $Resolved) {
     # state\implementer.json is the checkout's settings record: the implementer tool (#20), its
-    # revmux profile, and auto-merge (#23). wb.py reads it for the planner.
+    # revmux profile, and auto-merge (#23). wb.py reads it for the planner. `cleanup` (#41) is the
+    # config's, recorded at each launch: the relay runs in its own session and never sees the config.
     $path = Get-ImplementerStatePath $Checkout
+    $cleanup = 'merged'
+    if ($Resolved.Cleanup) { $cleanup = [string]$Resolved.Cleanup }
     $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge;
-                                 autonomous = [bool]$Resolved.Autonomous }
+                                 autonomous = [bool]$Resolved.Autonomous; cleanup = $cleanup }
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
@@ -893,7 +908,8 @@ function Save-Implementer([string] $Checkout, $Resolved) {
             if ($current.limits) { $record | Add-Member -NotePropertyName limits -NotePropertyValue $current.limits }
             if ($current.tool -ceq $record.tool -and $current.revmuxProfile -ceq $record.revmuxProfile -and
                 $current.autoMerge -is [bool] -and $current.autoMerge -eq $record.autoMerge -and
-                $current.autonomous -is [bool] -and $current.autonomous -eq $record.autonomous) { return }
+                $current.autonomous -is [bool] -and $current.autonomous -eq $record.autonomous -and
+                $current.cleanup -ceq $record.cleanup) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
     }
     Write-AtomicJson $path $record

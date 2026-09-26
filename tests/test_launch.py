@@ -1500,6 +1500,31 @@ class QueueEntry(LauncherFixtures):
                     self.assertEqual(0, result.returncode, result.stdout + result.stderr)
                     self.assertIn(expected, seen.replace('"', ''))
 
+    def test_cleanup_reaches_cleanup_py_with_the_configured_root(self):
+        # #41: -Cleanup sweeps the config's checkoutRoot through lib/cleanup.py.
+        cleanup = str(self.entry_lib / 'cleanup.py')
+        for shell in [PWSH] + ([WINDOWS_PS] if WINDOWS_PS else []):
+            for args, expected in ((('-Cleanup',), f'{cleanup} sweep --root {self.temp}'),
+                                   (('-Cleanup', '-Repo', 'o/repo', '-DryRun', '-BuildOnly'),
+                                    f'{cleanup} sweep --root {self.temp} --repo o/repo --dry-run --build-only')):
+                with self.subTest(shell=shell, args=args):
+                    result, seen = self.launcher(*args, shell=shell)
+                    self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+                    self.assertEqual(expected, seen.replace('"', ''))
+
+    def test_cleanup_misuse_or_a_bad_config_is_refused_before_python(self):
+        for args in (('-BuildOnly',), ('-Cleanup', '7'), ('-Cleanup', '-Autonomous'), ('-Cleanup', '-Queue', 'bugs'),
+                     ('-Cleanup', '-Triage', '-Repo', 'o/repo')):
+            with self.subTest(args=args):
+                result, seen = self.launcher(*args)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIsNone(seen)
+        self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), 'cleanup': 'all'}), encoding='utf-8')
+        result, seen = self.launcher('-Cleanup')
+        self.assertEqual(2, result.returncode)
+        self.assertIn('cleanup', result.stdout + result.stderr)
+        self.assertIsNone(seen)
+
     def test_triage_misuse_is_refused_before_python(self):
         for args in (('-Triage',), ('-Triage', '-Repo', 'o/repo', '7'), ('-Triage', '-Repo', 'o/repo', '-Autonomous'),
                      ('-Triage', '-Repo', 'o/repo', '-Limit', '0'), ('-Retriage', '-Repo', 'o/repo', '-Watch'),
@@ -2403,7 +2428,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertTrue(self.relay_line().endswith("--branch 'issue-7-fix-x'"))
         self.assertIn("pane-codex.ps1'", self.typed_right()[0])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertFalse((self.checkout / '.workbench/state/implementer-claude.json').exists())
 
     def test_claude_composes_right_pane_relay_mailbox_identity_and_pin(self):
@@ -2417,7 +2442,7 @@ class ClaudeImplementer(LauncherFixtures):
         agents = self.state('agents.json')['agents']
         self.assertEqual(('claude', RIGHT_ID), (agents['codex']['tool'], agents['codex']['pane']))
         self.assertEqual('claude', agents['claude']['tool'])
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'claude-only', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         implementer = self.state('implementer-claude.json')
         planner = self.state('claude.json')
         self.assertEqual((RIGHT_ID, 'fresh', 'o/repo#7'), (implementer['pane'], implementer['origin'], implementer['issue']))
@@ -2432,7 +2457,7 @@ class ClaudeImplementer(LauncherFixtures):
     def test_config_selects_claude_and_revmux_profile_is_configurable(self):
         result = self.body(config={'implementer': 'claude', 'revmuxProfile': 'codex-final'})
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'claude', 'revmuxProfile': 'codex-final', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         self.assertTrue(self.relay_line().endswith("--implementer-tool 'claude'"))
 
     def test_invalid_config_and_switch_values_are_refused(self):
@@ -2493,7 +2518,7 @@ class ClaudeImplementer(LauncherFixtures):
         self.assertIn('-Resume', self.typed_right()[-1])
         self.assertIn('pane-codex.ps1', self.pins()[RIGHT_ID])
         self.assertEqual('codex', self.state('agents.json')['agents']['codex']['tool'])
-        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False}, self.state('implementer.json'))
+        self.assertEqual({'tool': 'codex', 'revmuxProfile': 'comprehensive', 'autoMerge': False, 'autonomous': False, 'cleanup': 'merged'}, self.state('implementer.json'))
         # B2: the relay was asked to stop and was restarted without the Claude profile.
         self.assertTrue(json.loads(self.scenario_path.read_text(encoding='utf-8'))['stop_seen'])
         relay = [c[3] for c in self.calls() if c[:2] == ['session', 'type'] and c[-1] == RELAY_ID]
@@ -2820,6 +2845,30 @@ class AutoMergeLaunch(LauncherFixtures):
                     " -Config (Get-WorkbenchConfig) -NoProbe; $r.AutoMerge", env=self.env)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual('False', result.stdout.strip())
+
+    def test_cleanup_is_recorded_from_the_config_at_every_launch(self):
+        # #41: the relay runs in its own session and never reads the config; it reads this record.
+        first = self.body(config={'cleanup': 'build'})
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.assertEqual('build', self.state('implementer.json')['cleanup'])
+        self.reuse_scenario('esc to interrupt')
+        again = self.body(config={'cleanup': 'off'})
+        self.assertEqual(0, again.returncode, again.stdout + again.stderr)
+        self.assertEqual('off', self.state('implementer.json')['cleanup'])
+
+    def test_cleanup_and_min_free_gb_are_validated(self):
+        for key, value, ok in (('cleanup', 'merged', True), ('cleanup', 'off', True), ('cleanup', 'Merged', False),
+                               ('cleanup', 'all', False), ('cleanup', 1, False), ('minFreeGB', 0, True),
+                               ('minFreeGB', 20.5, True), ('minFreeGB', -1, False), ('minFreeGB', '20', False),
+                               ('minFreeGB', True, False)):
+            with self.subTest(key=key, value=value):
+                self.config_path.write_text(json.dumps({'checkoutRoot': str(self.temp), key: value}), encoding='utf-8')
+                result = ps('. ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null; "loaded"', env=self.env)
+                if ok:
+                    self.assertIn('loaded', result.stdout, result.stderr)
+                else:
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertIn(key, result.stderr + result.stdout)
 
     def test_non_boolean_config_is_refused(self):
         for value in ('true', 1, None):
