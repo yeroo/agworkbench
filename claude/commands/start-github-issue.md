@@ -59,12 +59,15 @@ all stop you exactly as they do without autonomy.
   severity.
 - **Your last act** is `python "$AGWORKBENCH/lib/wb.py" loop-state done --pr <P> --sha <merged sha>`, after the
   Phase 7 steps. It refuses while any follow-up is unfiled. The relay closes nothing until this
-  record exists and the implementer has read your "loop complete" mail. Then it closes:
+  record exists and your own inbox is read. Mail the implementer gets after the merge, such as your
+  "loop complete" note, does not have to be read; older unread mail holds the close for 10 minutes
+  at most (#44). Then it closes:
   - the helper sessions that are back at a shell;
   - this issue's session;
   - itself.
 
-  It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout.
+  It logs every step to `.workbench/state/relay-close.log`, and never closes on a timeout alone:
+  only unread implementer mail is overridden after the wait.
 
 ## When the implementer is Claude
 

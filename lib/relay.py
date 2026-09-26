@@ -28,8 +28,16 @@ Four jobs, one loop, one process per issue, running in its own visible agwinterm
    the marker's rows), whatever the agents are doing. The gates - the planner has recorded
    `loop-state done`, no mail is unread, both agent panes are provably idle - apply to the issue
    session and the relay's own session only. Every step goes to `.workbench/state/relay-close.log`;
-   a stop request, a human's mail or autonomy turned off stops it, and it never closes on a timeout.
-   A pending close survives a restart (`close_pending`).
+   a stop request, unread mail to the planner (a human's above all) or autonomy turned off stops
+   it. It never closes on a timeout
+   alone: mail the implementer need not act on (its final notices, anything sent after the merge)
+   is ignored, and after the wait only other unread implementer mail is overridden (#44).
+   A pending close survives a restart (`close_pending`, with the merge time `close_merged_at`). A
+   queue member's close that gives up is handed to the conductor (#44), but only while the queue's
+   conductor is running and the relay's session is provably its own: the relay keeps
+   `close_pending`, records `close_handoff` and closes its own session, so the conductor's backstop
+   retries it. That ends the relay, also when it resumed the close after a restart (where it used to
+   carry on); a merged, retired PR leaves it nothing else to watch.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
@@ -199,14 +207,7 @@ def event_message_id(number: int, event: dict[str, Any], box: str) -> str:
     return f'github-pr{number}-{event["kind"]}-{digest}-{box}'
 
 
-def timestamp(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
-    except (ValueError, OverflowError):
-        return None
+timestamp = closer.parse_time
 
 
 def github_time() -> datetime | None:
@@ -357,7 +358,15 @@ class Relay:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
-        os.replace(tmp, self.state_file)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, self.state_file)
+                return
+            except PermissionError:
+                # Windows refuses the replace while another process (the conductor) is reading it.
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
 
     def log(self, text: str) -> None:
         print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
@@ -524,8 +533,63 @@ class Relay:
 
     def finish_close(self) -> None:
         """The close is done or refused: nothing to resume on a restart."""
-        if self.state.pop('close_pending', None) is not None and not self.dry_run:
+        popped = [self.state.pop(key, None) for key in ('close_pending', 'close_merged_at', 'close_handoff')]
+        if any(value is not None for value in popped) and not self.dry_run:
             self._save()
+
+    def conductor_running(self) -> bool:
+        """Is this checkout's queue conductor running (#44)? Under the queue's state lock: its worker
+        lock is held and its owner is `running`. Under that lock because a conductor decides to finish
+        under it too, after reading every member's relay.json (conductor.handed_off): a relay that saved
+        close_handoff and then sees `running` here is certain the conductor will see it. The worker lock
+        is probed there as `-Queue` start() does, so the probe cannot mislead a concurrent start."""
+        import conductor
+        try:
+            member = json.loads((self.hub_dir / 'state' / 'queue-member.json').read_text(encoding='utf-8-sig'))
+            store = conductor.Store(member['queue'])
+            if not store.worker_lock.exists():
+                return False                     # never ran, or removed: and creates nothing for it
+            with conductor.Lock(store.state_lock):
+                if not store.running():
+                    return False
+                owner = store._load().get('owner') or {}
+            return owner.get('state') == 'running'
+        except (OSError, KeyError, TypeError, ValueError):   # conductor.QueueError is a ValueError
+            return False
+
+    def hand_off_close(self, close: "closer.Closer", number: int, reasons: list[str]) -> bool:
+        """Queue mode (#44): leave the refused close to the conductor's backstop. It keeps
+        close_pending and closes this relay's session, since the conductor defers to a live one.
+        False (nothing handed off) outside queue mode, when no conductor is running to take it (a
+        queue that is not watching finishes once its last member has a PR), or when the session is
+        not provably ours."""
+        import agw
+        if self.dry_run or not (self.hub_dir / 'state' / 'queue-member.json').exists():
+            return False
+        if not self.conductor_running():
+            close.log("NOT handing the close to the queue conductor: it is not running")
+            return False
+        own = self.own_session(close)
+        if own is None:
+            close.log("NOT handing the close to the queue conductor: this relay's session is not provably its own")
+            return False
+        mine, session = own
+        self.state['close_pending'] = number
+        self.state['close_handoff'] = {'pr': number, 'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                       'reasons': reasons}
+        self._save()
+        if not self.conductor_running():
+            # It finished between the two looks, before it could have seen the handoff.
+            close.log("NOT handing the close to the queue conductor: it finished meanwhile")
+            return False
+        close.log(f"handing the close to the queue conductor; closing the relay session {session.get('id')}")
+        try:
+            agw.notify(mine, f"PR #{number}: autonomous close handed to the queue conductor", title='workbench relay')
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not notify: {err}")
+        agw.clear_restore(mine)
+        agw.close_session(session.get('id'))
+        return True
 
     def close_alert(self, reason: str) -> None:
         import agw
@@ -548,7 +612,10 @@ class Relay:
         """After a merged PR and a complete drain, on an autonomous checkout: close the issue's
         helpers as soon as each is proven done and untouched (#33), the issue session only when both
         agents are provably done and idle, then this relay's own session. Mail keeps flowing while it
-        waits; a stop request, a human's mail or autonomy turned off stops it; never on a timeout."""
+        waits; a stop request, unread mail to the planner (a human's above all) or autonomy turned
+        off stops it; never on a timeout
+        alone (after it, only unread implementer mail is overridden, #44). A refusal is handed to the
+        queue conductor's backstop when there is a running one and the session is provably ours (#44)."""
         import agw
         close = self.closer()
         if not close.autonomous():
@@ -556,6 +623,9 @@ class Relay:
             self.finish_close()
             return
         close.log(f"PR #{number} merged; autonomous close starting")
+        if self.state.pop('close_handoff', None) is not None and not self.dry_run:
+            # A restarted relay owns the close again; the conductor defers to it while it lives.
+            self._save()
         left_open: list[str] = []
         while True:
             if self.stop_file.exists():
@@ -571,12 +641,18 @@ class Relay:
             except (agw.CtlError, OSError) as err:
                 close.log(f"helper check failed: {err}")
             reasons = close.agent_blockers(number)
-            if not reasons:
+            if not reasons or close.overdue_ok():
                 break
             if close.timed_out():
                 close.log(f"NOT closing, still waiting after {closer.CLOSE_WAIT:.0f}s: " + '; '.join(reasons))
                 self.close_alert('; '.join(reasons))
-                self.finish_close()
+                try:
+                    handed = self.hand_off_close(close, number, reasons)
+                except (agw.CtlError, OSError) as err:
+                    close.log(f"could not hand the close to the queue conductor: {err}")
+                    handed = False
+                if not handed:
+                    self.finish_close()
                 return
             pause(self.mail_interval)
         if not close.autonomous():
@@ -602,23 +678,31 @@ class Relay:
                    + (f"; left open: {', '.join(left_open)}" if left_open else '')
                    + "; log: .workbench/state/relay-close.log")
         mine = agw.my_pane()
-        found = agw.find_pane(mine, agw.tree()) if mine else None
+        own = self.own_session(close)
         try:
             agw.notify(mine or 'active', summary, title='workbench relay')
         except (agw.CtlError, OSError) as err:
             self.log(f"could not notify: {err}")
         self.finish_close()
-        # Its own session only when it is provably the relay's: the name, this repo's workspace, and
-        # no pane but this one - a human's shell split beside it must never go with it.
-        own = found[1] if found else None
-        if (own is None or (found[0].get('name') or '').casefold() != close.workspace_name.casefold()
-                or own.get('name') != f'#{close.issue} relay' or agw.panes_of(own) != [mine]):
+        if own is None:
             close.log(f"leaving this relay's session open: it is not a single-pane '#{close.issue} relay' "
                       f"in workspace {close.workspace_name}")
             return
-        close.log(f"closing the relay session {own.get('id')}: {summary}")
+        close.log(f"closing the relay session {own[1].get('id')}: {summary}")
         agw.clear_restore(mine)
-        agw.close_session(own.get('id'))
+        agw.close_session(own[1].get('id'))
+
+    def own_session(self, close: "closer.Closer") -> tuple[str, dict] | None:
+        """(my pane, my session) only when the session is provably the relay's: the name, this repo's
+        workspace, and no pane but this one - a human's shell split beside it must never go with it."""
+        import agw
+        mine = agw.my_pane()
+        found = agw.find_pane(mine, agw.tree()) if mine else None
+        own = found[1] if found else None
+        if (own is None or (found[0].get('name') or '').casefold() != close.workspace_name.casefold()
+                or own.get('name') != f'#{close.issue} relay' or agw.panes_of(own) != [mine]):
+            return None
+        return mine, own
 
     def deliver_mail(self) -> None:
         import agw
@@ -697,6 +781,8 @@ class Relay:
         if (self.state.get('pr') or {}).get('state') == 'MERGED':
             # Persisted, so a relay that dies or restarts during the close wait resumes it (#27).
             self.state['close_pending'] = number
+            # The merge time: mail created after it is nothing the PR needed (#44).
+            self.state['close_merged_at'] = self.state['pr'].get('mergedAt')
         self.state['completed_prs'] = sorted({*self.state.get('completed_prs', []), number})
         self.state.pop('pr', None)
         self.state.pop('terminal_mail', None)

@@ -2,7 +2,8 @@
 """closer - the autonomous close after a merge (#27, #33): one implementation, two callers.
 
 The relay runs it after a MERGED PR's final notices are drained. The conductor runs it as a backstop
-for a merged member whose relay has gone (#33). Neither closes on a timeout alone.
+for a merged member whose relay has gone (#33). Neither closes on a timeout alone: after CLOSE_WAIT only
+unread pre-merge implementer mail is overridden (#44); every other blocker still refuses.
 
 Stepwise on purpose: `step_helpers()` and `agent_blockers()` each look once and return, keeping
 their evidence (settled pane hashes) in the object, so the relay can loop on them while it keeps
@@ -19,6 +20,10 @@ delivering mail, and the conductor can advance one check per tick without blocki
 - The issue session (exactly the two agent panes) closes only when the planner recorded
   `loop-state done` for this PR, no mail is unread, no .git/index.lock exists, and both agent panes
   are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds.
+- Mail the implementer never has to act on does not count as unread (#44): the relay's own final
+  notices for this PR (`github-pr<N>-...`), and anything created at or after the merge
+  (`close_merged_at` in relay.json). Other unread implementer mail is a soft blocker: it waits for
+  CLOSE_WAIT, and then the close goes ahead and logs the ids.
 """
 
 from __future__ import annotations
@@ -36,6 +41,18 @@ import limits
 
 CLOSE_WAIT = 600.0       # how long a close waits for the loop to be provably over (#27)
 CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be closed
+
+
+def parse_time(value) -> datetime | None:
+    """A zoned ISO time (GitHub's `mergedAt`, the hub's `created:`) in UTC, else None. Also the relay's
+    `timestamp` (relay imports closer, not the other way round)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
 
 
 def issue_from_branch(branch: str) -> str | None:
@@ -67,6 +84,8 @@ class Closer:
         self.dry_run = dry_run
         self.settled: dict[str, tuple[str, float]] = {}
         self.decided: dict[str, str] = {}       # helper session id -> last logged decision
+        self.hard: list[str] = []               # the last agent_blockers(): what a timeout never overrides
+        self.soft: list[str] = []               # ... and the unread implementer mail ids it does (#44)
         self.deadline = clock() + CLOSE_WAIT
 
     # --- logging and settings ------------------------------------------------------------------
@@ -122,6 +141,24 @@ class Closer:
 
     def timed_out(self) -> bool:
         return self.clock() >= self.deadline
+
+    def overdue_ok(self) -> bool:
+        """After CLOSE_WAIT, when the last agent_blockers() found only unread implementer mail: close
+        anyway (#44), and say so. Anything else still blocking keeps the refusal."""
+        if not (self.timed_out() and not self.hard and self.soft):
+            return False
+        self.log(f"closing after {CLOSE_WAIT:.0f}s despite unread implementer mail: {', '.join(self.soft)}")
+        return True
+
+    def merge_time(self, number: int) -> datetime | None:
+        """When the PR merged, as the relay recorded it with the pending close; None when unknown."""
+        try:
+            state = json.loads((self.hub_dir / 'state' / 'relay.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(state, dict) or state.get('close_pending') != number:
+            return None
+        return parse_time(state.get('close_merged_at'))
 
     def settle(self, pane: str, text: str) -> str | None:
         """None once the pane's tail has been unchanged for CLOSE_SETTLE seconds, else the reason."""
@@ -198,40 +235,55 @@ class Closer:
 
     # --- the agents and the issue session -----------------------------------------------------
     def agent_blockers(self, number: int) -> list[str]:
-        """What still stops the issue-session close. Empty only when the loop is provably over."""
+        """What still stops the issue-session close. Empty only when the loop is provably over. Keeps
+        the split for overdue_ok(): `hard` (every other reason) and `soft` (unread implementer mail ids)."""
         import hub
         import peerchat
-        reasons = []
+        hard: list[str] = []
+        soft: list[str] = []
         try:
             done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
         except (OSError, ValueError):
             done = {}
         if not isinstance(done, dict) or done.get('pr') != number:
-            reasons.append(f'the planner has not recorded `wb.py loop-state done --pr {number}`')
+            hard.append(f'the planner has not recorded `wb.py loop-state done --pr {number}`')
         inbox = self.hub_dir / 'inbox'
         for path in sorted((inbox / 'claude').glob('*.md')):
             # Anything the planner has not read - above all a human's "don't close" - stops the close.
-            reasons.append(f'the planner has unread mail {path.stem}')
+            hard.append(f'the planner has unread mail {path.stem}')
+        merged_at = self.merge_time(number)
+        ignored = []
         for path in sorted((inbox / 'codex').glob('*.md')):
             try:
-                sender = hub.parse_message(path).get('from')
+                message = hub.parse_message(path)
             except (OSError, ValueError):
-                sender = None
-            if sender in (None, 'claude', 'human', 'github'):
-                reasons.append(f'the implementer has not read {path.stem}')
+                message = {}
+            sender = message.get('from')
+            if sender not in (None, 'claude', 'human', 'github'):
+                continue
+            created = parse_time(message.get('created'))
+            if ((sender == 'github' and path.stem.startswith(f'github-pr{number}-'))
+                    or (merged_at is not None and created is not None and created >= merged_at)):
+                # The relay's own final notice, or sent after the merge: nothing the PR still needs.
+                ignored.append(path.stem)
+                continue
+            soft.append(path.stem)
+        if ignored and self.decided.get('__ignored__') != ' '.join(ignored):
+            self.decided['__ignored__'] = ' '.join(ignored)
+            self.log(f"ignoring unread post-merge mail for the implementer: {', '.join(ignored)}")
         if (self.hub_dir.parent / '.git' / 'index.lock').exists():
-            reasons.append('.git/index.lock exists')
+            hard.append('.git/index.lock exists')
         for peer in self.peers:
             try:
                 text = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
-                reasons.append(f'{peer.box} pane unreadable: {err}')
+                hard.append(f'{peer.box} pane unreadable: {err}')
                 continue
             state = self.settle(peer.pane, text)
             if state:
-                reasons.append(f'{peer.box} pane {state}')
+                hard.append(f'{peer.box} pane {state}')
             if peerchat.is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:])):
-                reasons.append(f'{peer.box} is running a turn')
+                hard.append(f'{peer.box} is running a turn')
             profile = peerchat.PROFILES[peer.tool]
             content = (peerchat.claude_composer(text) if peer.tool == 'claude' else peerchat.codex_composer(text))
             if content is None or not peerchat.looks_empty(profile, content):
@@ -239,8 +291,9 @@ class Closer:
                 if peer.tool == 'claude':
                     reason += (' (a greyed prompt suggestion? agents the workbench launches have them off;'
                                ' for an adopted Claude set "promptSuggestionEnabled": false in ~/.claude/settings.json)')
-                reasons.append(reason)
-        return reasons
+                hard.append(reason)
+        self.hard, self.soft = hard, soft
+        return hard + [f'the implementer has not read {mid}' for mid in soft]
 
     def close_issue_session(self) -> None:
         agents = {peer.pane for peer in self.peers}

@@ -891,7 +891,9 @@ class Worker:
     # The relay closes a merged member's sessions. When that relay is gone (killed, closed, never
     # restarted) and its close has been pending for CLOSE_BACKSTOP_AFTER, the conductor runs the same
     # close (closer.py) one step per tick. While the relay is alive it only flags `closeStuck`: one
-    # closer at a time. Never on a timeout alone.
+    # closer at a time. Never on a timeout alone: after CLOSE_WAIT only unread pre-merge implementer
+    # mail is overridden (#44). A relay whose own close gave up in queue mode hands it over (#44):
+    # it keeps close_pending, records close_handoff and closes its session, and this retries it once.
 
     def mark(self, number, **fields):
         with self.store.transaction() as data:
@@ -950,10 +952,14 @@ class Worker:
             watch['attempt'] = closer.Closer(hub_dir, data['repo'], number, peers,
                                              log=lambda text: print(f'#{number} {text}', flush=True), clock=self.clock)
             watch['attempt'].log(f'PR #{pr} (issue #{number}) merged and its relay is gone; the conductor runs the close')
+            if str(m.get('closeStuck', '')).startswith(RELAY_ALIVE):
+                # The relay went (or handed its close over, #44): the flag is resolved, and a flagged
+                # member would let the conductor finish in the middle of this attempt.
+                self.mark(number, closeStuck=None)
         attempt = watch['attempt']
         attempt.step_helpers()
         reasons = attempt.agent_blockers(pr)
-        if not reasons:
+        if not reasons or attempt.overdue_ok():
             if attempt.autonomous():
                 attempt.close_issue_session()
                 attempt.start_cleanup(pr)
@@ -971,6 +977,8 @@ class Worker:
         if state.get('close_pending') == pr:
             # Only the close this attempt ran: a relay may have rewritten the file since.
             state.pop('close_pending')
+            state.pop('close_merged_at', None)
+            state.pop('close_handoff', None)
             atomic_json(path, state)
         self.closes.pop(m['number'], None)
         self.mark(m['number'], closePending=None, closeStuck=stuck)
@@ -1139,13 +1147,32 @@ def file_locked(path):
         return True
 
 
+def handed_off(m):
+    """A relay handed this member's close to the conductor (#44): its relay.json holds close_handoff
+    and close_pending for the member's PR. Read under the queue's state lock by run(), so a relay that
+    saw this conductor running before closing its session is never left without one."""
+    pr = pr_number(m.get('pr'))
+    if pr is None:
+        return False
+    try:
+        state = read_json(Path(m['checkout']) / '.workbench' / 'state' / 'relay.json')
+    except (OSError, ValueError):
+        return False
+    return (isinstance(state, dict) and state.get('close_pending') == pr
+            and isinstance(state.get('close_handoff'), dict) and state['close_handoff'].get('pr') == pr)
+
+
 def finished(data):
     # A merged member whose close is still pending keeps the conductor up for the backstop (#33),
     # unless it is flagged stuck (then it is the human's, and never keeps the queue alive forever).
     if any(m.get('closePending') and not m.get('closeStuck') for m in data['members']):
         return False
-    return not data['watch'] and not any(m['state'] == 'pending' or m['state'] == 'launching' or
-                                       (m['state'] == 'active' and not m['slotReleased']) for m in data['members'])
+    if data['watch'] or any(m['state'] == 'pending' or m['state'] == 'launching' or
+                            (m['state'] == 'active' and not m['slotReleased']) for m in data['members']):
+        return False
+    # A close handed over by its relay (#44) keeps it up too, before the member is even seen merged.
+    # Read only when it would otherwise finish: every relay.json, under the queue's state lock.
+    return not any(handed_off(m) for m in data['members'])
 
 
 def main(argv=None):

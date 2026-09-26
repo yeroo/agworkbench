@@ -2208,7 +2208,213 @@ class AutonomousClose(unittest.TestCase):
         box = self.folder / '.workbench' / 'inbox' / 'codex'
         box.mkdir(parents=True)
         (box / 'm1.md').write_text('---\nid: m1\nfrom: claude\nto: codex\nsubject: loop complete\n---\nbye\n', encoding='utf-8')
-        self.assertIn('the implementer has not read m1', self.blocked())
+        # During the wait it blocks (no `created`, no merge time: nothing proves it came after the merge).
+        close = self.r.closer()
+        self.assertIn('the implementer has not read m1', close.agent_blockers(7))
+        self.assertFalse(close.overdue_ok())
+
+    # --- #44: mail the implementer need not act on, and the close after the wait ------------------
+    MERGED_AT = '2026-09-26T12:31:50Z'
+
+    def mail(self, sender, subject, created, kind='message', message_id=None):
+        """Filed through the hub, as the relay and agmsg file it, with a controlled `created:`."""
+        with patch.object(hub, 'now_iso', return_value=created):
+            return hub.write_message(to='codex', sender=sender, subject=subject, body='x', kind=kind,
+                                     message_id=message_id).stem
+
+    def merged_notice(self):
+        """The relay's own `PR #7 MERGED` notice for the implementer, with the id the relay files."""
+        snapshot = {'number': 7, 'state': 'MERGED', 'mergedAt': self.MERGED_AT, 'url': 'u'}
+        event = next(e for e in relay.pr_events(dict(snapshot, state='OPEN'), snapshot) if e.get('terminal'))
+        mid = relay.event_message_id(7, event, 'codex')
+        self.assertTrue(mid.startswith('github-pr7-note-'), mid)
+        return self.mail('github', event['subject'], '2026-09-26T12:32:03Z', kind=event['kind'], message_id=mid)
+
+    def pending(self, **extra):
+        self.r.state.update(close_pending=7, **extra)
+        self.write('relay.json', self.r.state)
+
+    def test_unread_post_merge_notes_do_not_stop_the_close(self):
+        # #44 AC1, the docxy #124 case: loop done, PR merged, both final notes unread by the implementer.
+        self.pending(close_merged_at=self.MERGED_AT)
+        notice = self.merged_notice()
+        complete = self.mail('claude', 'loop complete', '2026-09-26T12:32:03Z')
+        self.send.side_effect = peerchat.Refused('the implementer never reads them')
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertIn(('cleanup', (self.folder, 'o/repo', '7', 7, 'merged')), self.actions)
+        self.assertLess(self.t, closer.CLOSE_WAIT)                                     # no waiting them out
+        self.assertEqual(1, self.log().count('ignoring unread post-merge mail'))       # logged once, not per tick
+        self.assertIn(f'ignoring unread post-merge mail for the implementer: {notice}, {complete}'
+                      if notice < complete else
+                      f'ignoring unread post-merge mail for the implementer: {complete}, {notice}', self.log())
+        self.assertNotIn('close_pending', self.r.state)
+        self.assertNotIn('close_merged_at', self.r.state)
+
+    def test_pre_merge_mail_waits_and_then_the_close_goes_ahead(self):
+        # #44 AC2: sent before the merge, so it blocks for the wait; alone after it, it is overridden.
+        self.pending(close_merged_at=self.MERGED_AT)
+        early = self.mail('claude', 'FIX r2', '2026-09-26T12:00:00Z')
+        self.send.side_effect = peerchat.Refused('held')
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertGreaterEqual(self.t, closer.CLOSE_WAIT)
+        self.assertIn(f'closing after 120s despite unread implementer mail: {early}', self.log())
+        self.assertNotIn('NOT closing', self.log())
+        self.assertNotIn('ignoring unread post-merge mail', self.log())
+
+    def test_a_hard_blocker_still_refuses_after_the_wait_even_beside_unread_implementer_mail(self):
+        # #44 AC3: the override is for implementer mail alone.
+        box = self.folder / '.workbench' / 'inbox' / 'codex'
+        box.mkdir(parents=True)
+        (box / 'm1.md').write_text('---\nid: m1\nfrom: claude\nto: codex\nsubject: x\n---\nx\n', encoding='utf-8')
+        lock = self.folder / '.git' / 'index.lock'
+        lock.parent.mkdir()
+        lock.write_text('', encoding='utf-8')
+        log = self.blocked()
+        self.assertIn('.git/index.lock exists', log)
+        self.assertIn('the implementer has not read m1', log)
+        self.assertNotIn('despite unread implementer mail', log)
+
+    def test_an_unknown_merge_time_ignores_only_the_relays_own_notices(self):
+        # #44 AC4: no (or an unreadable) close_merged_at: the MERGED notice is still the relay's own,
+        # but nothing proves the planner's mail came after the merge - it waits the wait out.
+        for saved in ({}, {'close_merged_at': 'yesterday'}):
+            with self.subTest(saved=saved):
+                self.setUp()
+                self.pending(**saved)
+                notice = self.merged_notice()
+                complete = self.mail('claude', 'loop complete', '2026-09-26T12:32:03Z')
+                self.send.side_effect = peerchat.Refused('held')
+                close = self.r.closer()
+                reasons = close.agent_blockers(7)
+                self.assertNotIn(f'the implementer has not read {notice}', reasons)
+                self.assertIn(f'the implementer has not read {complete}', reasons)
+                self.assertEqual([complete], close.soft)
+                self.r.close_after_merge(7)
+                self.assertIn(self.PLANNER, self.closes())
+                self.assertGreaterEqual(self.t, closer.CLOSE_WAIT)
+                self.assertIn(f'despite unread implementer mail: {complete}', self.log())
+
+    def test_another_prs_notice_is_not_this_ones(self):
+        self.pending(close_merged_at=self.MERGED_AT)
+        other = self.mail('github', 'PR #6 MERGED', '2026-09-26T11:00:00Z', kind='note',
+                          message_id='github-pr6-note-00000000-codex')
+        self.assertIn(f'the implementer has not read {other}', self.r.closer().agent_blockers(7))
+
+    def test_retire_records_the_merge_time_with_the_pending_close(self):
+        # #44 AC4: retire() drops the PR snapshot, so the merge time is kept beside close_pending.
+        self.r.state['pr'] = {'number': 7, 'state': 'MERGED', 'mergedAt': self.MERGED_AT, 'headRefName': 'issue-7-fix'}
+        self.r.retire(7)
+        saved = json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))
+        self.assertEqual((7, self.MERGED_AT), (saved['close_pending'], saved['close_merged_at']))
+        self.assertEqual(closer.parse_time(self.MERGED_AT), self.r.closer().merge_time(7))
+        self.assertIsNone(self.r.closer().merge_time(8))                             # another PR's close
+
+    def test_a_restart_during_the_close_still_knows_the_merge_time(self):
+        restarted = self.restart({'pr': {'number': 7, 'state': 'MERGED', 'mergedAt': self.MERGED_AT,
+                                         'headRefName': 'issue-7-fix'}})
+        self.assertEqual(self.MERGED_AT, restarted.state['close_merged_at'])
+
+    # --- #44: in queue mode a refused close is handed to the conductor ----------------------------
+    def queue_member(self, running=True):
+        """A queue member whose conductor is running (or not); the real check is in test_conductor."""
+        self.write('queue-member.json', {'queue': 'q.json', 'repo': 'o/repo', 'number': 7})
+        looks = running if isinstance(running, list) else [running] * 2
+        self.looks = self.enterContext(patch.object(relay.Relay, 'conductor_running', side_effect=looks))
+
+    def test_a_refused_close_in_queue_mode_is_handed_to_the_conductor(self):
+        # #44 AC5: close_pending stays (B1), close_handoff is recorded, and the relay's session goes.
+        self.queue_member()
+        (self.state / 'loop-done.json').unlink()
+        self.pending(close_merged_at=self.MERGED_AT)
+        self.blocked_by_handoff()
+        saved = json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))
+        self.assertEqual((7, self.MERGED_AT), (saved['close_pending'], saved['close_merged_at']))
+        self.assertEqual(7, saved['close_handoff']['pr'])
+        self.assertIn('loop-state done --pr 7', '; '.join(saved['close_handoff']['reasons']))
+        self.assertIn('handing the close to the queue conductor', self.log())
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id=self.PLANNER)   # still alerted
+
+    def blocked_by_handoff(self):
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.RELAY], self.closes())                 # not the issue session
+        self.assertEqual([], [a for a in self.actions if a[0] == 'cleanup'])
+        self.assertIn('NOT closing, still waiting after 120s', self.log())
+
+    def refused_without_handoff(self):
+        self.blocked()
+        self.assertNotIn(self.RELAY, self.closes())
+        saved = json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))
+        for key in ('close_pending', 'close_merged_at', 'close_handoff'):
+            self.assertNotIn(key, saved)
+        return self.log()
+
+    def test_no_handoff_when_the_conductor_is_not_running(self):
+        # r1 M1: a queue that is not watching finishes once its last member has a PR; nobody would retry.
+        self.queue_member(running=False)
+        (self.state / 'loop-done.json').unlink()
+        self.pending(close_merged_at=self.MERGED_AT)
+        self.assertIn('NOT handing the close to the queue conductor: it is not running', self.refused_without_handoff())
+
+    def test_no_handoff_when_the_conductor_finishes_before_the_second_look(self):
+        # r1 M1: running when checked, gone once close_handoff was saved - it may not have seen it.
+        self.queue_member(running=[True, False])
+        (self.state / 'loop-done.json').unlink()
+        self.pending(close_merged_at=self.MERGED_AT)
+        self.assertIn('NOT handing the close to the queue conductor: it finished meanwhile', self.refused_without_handoff())
+        self.assertEqual(2, self.looks.call_count)
+
+    def test_a_refused_close_outside_queue_mode_is_unchanged(self):
+        # #44 AC6: no conductor: alert, nothing pending, the relay's session stays.
+        (self.state / 'loop-done.json').unlink()
+        self.pending(close_merged_at=self.MERGED_AT)
+        self.blocked()
+        saved = json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))
+        self.assertNotIn('close_pending', saved)
+        self.assertNotIn('close_merged_at', saved)
+        self.assertNotIn('close_handoff', saved)
+
+    def test_no_handoff_when_the_session_is_not_provably_the_relays(self):
+        # A live '#7 relay' would make the conductor defer forever: then it is today's refusal.
+        self.queue_member()
+        (self.state / 'loop-done.json').unlink()
+        self.tree['workspaces'][0]['sessions'][3]['paneIds'] = [self.RELAY, 'human-shell']
+        self.pending()
+        self.blocked()
+        self.assertIn('NOT handing the close to the queue conductor', self.log())
+        self.assertNotIn('close_pending', json.loads((self.state / 'relay.json').read_text(encoding='utf-8')))
+
+    def test_a_restarted_relay_takes_a_handed_off_close_back(self):
+        # r2 m4: gone from relay.json while the close is still running, not only once it is done.
+        self.pending(close_handoff={'pr': 7, 'at': 'x', 'reasons': ['r']})
+        real = closer.Closer.agent_blockers
+        during = []
+
+        def blockers(close, number):
+            during.append(json.loads((self.state / 'relay.json').read_text(encoding='utf-8')))
+            return real(close, number)
+        with patch.object(closer.Closer, 'agent_blockers', blockers):
+            self.r.close_after_merge(7)
+        self.assertNotIn('close_handoff', during[0])
+        self.assertEqual(7, during[0]['close_pending'])
+        self.assertIn(self.PLANNER, self.closes())
+
+    def test_a_save_waits_out_a_reader_holding_the_state_file(self):
+        # r2 m1: on Windows a replace fails while the conductor has relay.json open for reading.
+        real = os.replace
+        calls = []
+
+        def replace(src, dst):
+            calls.append(dst)
+            if len(calls) < 3:
+                raise PermissionError(13, 'in use')
+            return real(src, dst)
+        with patch.object(relay.os, 'replace', replace), patch.object(relay.time, 'sleep'):
+            self.r.state['x'] = 1
+            self.r._save()
+        self.assertEqual(3, len(calls))
+        self.assertEqual(1, json.loads((self.state / 'relay.json').read_text(encoding='utf-8'))['x'])
 
     def test_a_pane_that_keeps_changing(self):
         texts = iter(f'{CLAUDE_IDLE}\n{i}' for i in range(10000))
@@ -2307,20 +2513,31 @@ class AutonomousClose(unittest.TestCase):
         self.assertEqual([self.REVMUX], self.closes())
         self.assertIn('NOT closing: autonomy was turned off during the wait', self.log())
 
-    def test_unread_mail_to_the_planner_or_from_a_human_blocks(self):
-        # r18 M3
+    def test_the_planners_unread_mail_refuses_and_the_implementers_only_holds_the_wait(self):
+        # r18 M3; #44: unread planner mail (a human's too) refuses; the implementer's, a human's too,
+        # blocks for CLOSE_WAIT and is then overridden.
         for box, sender in (('claude', 'codex'), ('claude', 'human'), ('codex', 'human'), ('codex', 'github')):
             with self.subTest(box=box, sender=sender):
                 self.actions.clear()
                 (self.state / 'relay-close.log').unlink(missing_ok=True)
+                for each in ('claude', 'codex'):
+                    for old in (self.folder / '.workbench' / 'inbox' / each).glob('*.md'):
+                        old.unlink()
                 directory = self.folder / '.workbench' / 'inbox' / box
                 directory.mkdir(parents=True, exist_ok=True)
-                for old in directory.glob('*.md'):
-                    old.unlink()
                 (directory / 'h1.md').write_text(f'---\nid: h1\nfrom: {sender}\nto: {box}\nsubject: wait\n---\nx\n',
                                                  encoding='utf-8')
                 self.send.side_effect = peerchat.Refused('held for the test')
-                self.blocked()
+                if box == 'claude':
+                    self.assertIn('the planner has unread mail h1', self.blocked())
+                    continue
+                close = self.r.closer()
+                self.assertIn('the implementer has not read h1', close.agent_blockers(7))
+                self.assertFalse(close.overdue_ok())
+                self.t = 0.0
+                self.r.close_after_merge(7)
+                self.assertGreaterEqual(self.t, closer.CLOSE_WAIT)
+                self.assertIn('despite unread implementer mail: h1', self.log())
 
     def test_a_failing_close_step_is_logged_and_alerted(self):
         # r18 m2

@@ -970,6 +970,153 @@ class CloseBackstop(unittest.TestCase):
         self.w.end_close(self.member(7), 43, self.checkout / '.workbench', stuck=None)
         self.assertEqual({'other': 1}, q.read_json(self.state / 'relay.json'))
 
+    def test_unread_implementer_mail_alone_is_overridden_after_the_wait(self):
+        # #44: the backstop applies the same rule as the relay.
+        self.relay_gone()
+        box = self.checkout / '.workbench' / 'inbox' / 'codex'
+        box.mkdir(parents=True)
+        (box / 'm1.md').write_text('---\nid: m1\nfrom: claude\nto: codex\nsubject: x\n---\nx\n', encoding='utf-8')
+        self.run_for(900 + closer.CLOSE_WAIT - 60)
+        self.assertEqual([], self.actions)                       # it blocks during the wait
+        self.run_for(200)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertEqual(1, len(self.cleanups))
+        self.assertNotIn('closeStuck', self.member(7))
+        self.assertIn('despite unread implementer mail: m1', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_a_relay_that_gave_up_hands_the_close_to_the_backstop(self):
+        # #44 AC5, end to end: a real relay refuses (no loop-done record yet) in queue mode and hands
+        # over; the conductor, reading that same relay.json, closes the issue session and cleans up.
+        import hub
+        import relay
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path), 'repo': 'o/r', 'number': 7})
+        (self.state / 'loop-done.json').unlink()
+        self.conductor_up()
+        clock = {'t': 0.0}
+        peers = [relay.Peer('claude', 'claude', self.PLANNER), relay.Peer('codex', 'claude', self.IMPLEMENTER)]
+        with patch.dict(os.environ), patch.object(relay, 'now', lambda: clock['t']), \
+                patch.object(relay, 'pause', lambda s: clock.update(t=clock['t'] + max(s, 1))), \
+                patch.object(q.agw, 'my_pane', return_value='relay-7'):
+            r = relay.Relay(self.checkout / '.workbench', peers, 'o/r', 'issue-7-fix', 5, 60)
+            r.log = lambda text: None
+            r.close_after_merge(42)
+        hub.reload_paths()
+        self.assertIn('handing the close to the queue conductor', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+        self.assertEqual([('unpin', 'relay-7'), ('close', 'relay-7')], self.actions)     # only its own session
+        saved = q.read_json(self.state / 'relay.json')
+        self.assertEqual(42, saved['close_pending'])
+        self.assertEqual(42, saved['close_handoff']['pr'])
+        self.actions.clear()
+        self.relay_gone()                                        # its session closed
+        q.atomic_json(self.state / 'loop-done.json', {'pr': 42})  # what held it up is resolved
+        self.run_for(1000)
+        self.assertEqual([('unpin', self.PLANNER), ('unpin', self.IMPLEMENTER), ('close', self.PLANNER)], self.actions)
+        self.assertEqual([42], [a[3] for a in self.cleanups])
+        saved = q.read_json(self.state / 'relay.json')
+        for key in ('close_pending', 'close_merged_at', 'close_handoff'):
+            self.assertNotIn(key, saved)
+        self.assertNotIn('closePending', self.member(7))
+
+    def conductor_up(self, state='running'):
+        """This queue's conductor, as the relay sees it: the worker lock held, the owner's state."""
+        with self.store.transaction() as data:
+            data['owner']['state'] = state
+        lock = q.Lock(self.store.worker_lock, 0).acquire()
+        self.addCleanup(lock.release)
+
+    def relay_for_queue(self):
+        import hub
+        import relay
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path), 'repo': 'o/r', 'number': 7})
+        with patch.dict(os.environ):
+            r = relay.Relay(self.checkout / '.workbench', [], 'o/r', 'issue-7-fix', 5, 60)
+        hub.reload_paths()
+        return r
+
+    def test_the_relay_sees_whether_the_conductor_is_running(self):
+        # r1 M1: the worker lock held AND the owner running; anything else is "nobody to hand to".
+        r = self.relay_for_queue()
+        self.store.worker_lock.unlink()                          # start() probed it; say it never ran
+        self.assertFalse(r.conductor_running())                  # never ran here
+        self.assertFalse(self.store.worker_lock.exists())        # r2 m2: and the probe created nothing
+        self.store.worker_lock.touch()
+        self.assertFalse(r.conductor_running())                  # no conductor holds the worker lock
+        self.conductor_up('finished')
+        self.assertFalse(r.conductor_running())                  # held, but it has published finished
+        with self.store.transaction() as data:
+            data['owner']['state'] = 'running'
+        self.assertTrue(r.conductor_running())
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.root / 'missing.json')})
+        self.assertFalse(r.conductor_running())                  # a removed queue: no handoff
+        self.assertFalse((self.root / 'missing').exists())       # ... and nothing created for it
+        q.atomic_json(self.state / 'queue-member.json', {'queue': str(self.store.path)})
+        with self.store.transaction() as data:
+            data['parallel'] = 99                                # r2 i1: the Store's validated read
+        self.assertFalse(r.conductor_running())
+
+    def test_the_relays_worker_lock_probe_is_under_the_state_lock(self):
+        # r2 m2: -Queue start() probes the worker lock under the state lock; so must the relay, or its
+        # momentary hold makes a concurrent start believe a conductor is running.
+        r = self.relay_for_queue()
+        self.conductor_up()
+        real = q.Store.running
+        seen = []
+
+        def running(store):
+            try:
+                q.Lock(store.state_lock, 0).acquire().release()
+                seen.append('state lock free')
+            except q.QueueError:
+                seen.append('state lock held')
+            return real(store)
+        with patch.object(q.Store, 'running', running):
+            self.assertTrue(r.conductor_running())
+        self.assertEqual(['state lock held'], seen)
+
+    def test_finished_reads_no_relay_state_unless_it_would_finish(self):
+        # r2 m1: every member's relay.json is read under the state lock - only when it matters.
+        with patch.object(q, 'handed_off', side_effect=AssertionError('read')):
+            with self.store.transaction() as data:
+                data['members'][0].update(state='pending')
+            self.assertFalse(q.finished(self.store.load()))
+            with self.store.transaction() as data:
+                data['members'][0].update(state='pr-open')
+                data.update(watch=True, label='queue')              # a watching queue never finishes
+            self.assertFalse(q.finished(self.store.load()))
+
+    def test_a_handed_off_close_keeps_a_finished_queue_up_until_the_backstop_ends(self):
+        # r1 M1: a non-watch queue whose only member has its PR is otherwise finished - before the
+        # conductor even sees the merge. Driven through tick(), as run() does.
+        with self.store.transaction() as data:
+            data['members'][0].update(state='pr-open', prState='OPEN')
+        self.assertTrue(q.finished(self.store.load()))           # nothing handed over: it may finish
+        q.atomic_json(self.state / 'relay.json', {'close_pending': 42, 'close_handoff': {'pr': 42, 'reasons': ['x']}})
+        self.relay_gone()
+        self.assertFalse(q.finished(self.store.load()))
+        self.pr_state = 'MERGED'
+        end = self.now + 1300
+        while self.now < end and not q.finished(self.store.load()):
+            self.w.tick()
+            self.now += 20
+        self.assertTrue(q.finished(self.store.load()))
+        self.assertEqual('merged', self.member(7)['state'])
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertEqual([42], [a[3] for a in self.cleanups])
+        self.assertNotIn('close_handoff', q.read_json(self.state / 'relay.json'))
+
+    def test_a_relay_alive_flag_is_cleared_when_the_backstop_takes_over(self):
+        # r1 m1: flagged while the relay lived; once it is gone the attempt must keep the queue up.
+        self.run_for(1000)
+        self.assertIn('relay is alive', self.member(7)['closeStuck'])
+        self.relay_gone()
+        self.w.close_backstop()                                  # the attempt starts
+        self.assertIsNotNone(self.w.closes[7]['attempt'])
+        self.assertNotIn('closeStuck', self.member(7))
+        self.assertFalse(q.finished(self.store.load()))
+        self.run_for(200)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertTrue(q.finished(self.store.load()))
+
     def test_an_unreadable_tree_closes_nothing(self):
         self.w.close_backstop()                                  # starts the 15-minute clock
         self.now += 1000
