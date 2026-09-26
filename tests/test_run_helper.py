@@ -117,6 +117,10 @@ class Pieces(unittest.TestCase):
     def test_failure_counts(self):
         for text, expected in (('SUITE FAILURES: 0', 0), ('SUITE FAILURES: 4\n', 4),
                                ('Ran 3 tests\n\nFAILED (failures=2, errors=1)', 3), ('FAILED (errors=2)', 2),
+                               # r1 F4: expected failures, skips and unexpected successes are not failures
+                               ('FAILED (failures=1, expected failures=2)', 1),
+                               ('FAILED (errors=1, skipped=4, expected failures=2, unexpected successes=1)', 1),
+                               ('FAILED (unexpected successes=1)', 0),
                                ('Ran 725 tests in 938.825s\n\nOK', 0), ('OK (skipped=3)', 0),
                                ('==== 3 failed, 10 passed in 2.1s ====', 3), ('== 1 failed, 2 errors in 1s ==', 3),
                                ('test result: FAILED. 8 passed; 2 failed; 0 ignored', 2),

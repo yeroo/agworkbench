@@ -145,7 +145,81 @@ class Pointer(StallFixture):
         self.assertEqual(3.0, args.stall_minutes)
 
 
+class Wiring(StallFixture):
+    """r1 F5: main() turns the watch on from the config or the flag, and run() ticks it."""
+    PANES = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222']
+
+    def relay_from_main(self, *extra):
+        made = []
+        with patch.object(relay.Relay, 'run', autospec=True, side_effect=lambda self: made.append(self) or 0):
+            self.assertEqual(0, relay.main(['--hub', str(self.hub_dir), '--claude-pane', self.PANES[0],
+                                            '--codex-pane', self.PANES[1], '--repo', 'o/repo', '--branch', 'issue-7-fix',
+                                            *extra]))
+        return made[0]
+
+    def test_main_takes_the_period_from_the_config_or_the_flag(self):
+        self.assertEqual(15 * 60, self.relay_from_main().stall.period)
+        Path(os.environ['AGWORKBENCH_CONFIG']).write_text('{"stallMinutes": 4}', encoding='utf-8')
+        self.assertEqual(4 * 60, self.relay_from_main().stall.period)
+        self.assertEqual(2 * 60, self.relay_from_main('--stall-minutes', '2').stall.period)
+        self.assertEqual(0, self.relay_from_main('--stall-minutes', '0').stall.period)
+
+    def run_loop(self, until):
+        """Run the real loop on the fake clock until `until()` holds or an hour passes."""
+        self.r.limit_interval = 60
+        self.r.mail_interval = 60
+        self.r.flush_outbox = lambda: True
+        self.r.watch_pr = lambda: False
+        self.enterContext(patch.object(peerchat, 'send', return_value='submitted'))
+
+        def pause(seconds):
+            self.t += seconds
+            if until() or self.t > 3600:
+                self.r.stop_file.parent.mkdir(parents=True, exist_ok=True)
+                self.r.stop_file.write_text('stop', encoding='utf-8')
+        self.enterContext(patch.object(relay, 'pause', pause))
+        self.assertEqual(0, self.r.run())
+
+    def test_the_loop_files_the_pointer(self):
+        self.run_loop(lambda: bool(self.stall_mail()))
+        self.assertEqual(1, len(self.stall_mail()))
+        self.assertLessEqual(S * MIN, self.t)
+        self.assertLess(self.t, (S + 3) * MIN)
+
+    def test_a_failing_tick_is_logged_and_the_loop_goes_on(self):
+        ticks = []
+
+        def broken(texts):
+            ticks.append(texts)
+            raise RuntimeError('bug')
+        self.r.stall.tick = broken
+        self.run_loop(lambda: len(ticks) >= 3)
+        self.assertEqual(3, len(ticks))
+        self.assertIn('stall watch failed: RuntimeError: bug', self.logs)
+
+
 class Escalation(StallFixture):
+    def test_a_pointer_that_could_not_be_filed_is_retried_and_never_cited(self):
+        # r1 F6: no level 1 without a pointer on disk.
+        real = hub.write_message
+        calls = []
+
+        def flaky(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise OSError('disk full')
+            return real(**kwargs)
+        self.enterContext(patch.object(hub, 'write_message', side_effect=flaky))
+        self.run_until(S)
+        self.assertEqual([], self.stall_mail())
+        self.assertEqual(0, self.r.stall.level)
+        self.tick(S + 1)
+        self.assertEqual(1, len(self.stall_mail()))
+        self.run_until(3 * S, start=S + 2)
+        self.assertEqual([], self.escalations())                     # 2S after the real pointer, not the failed one
+        self.tick(3 * S + 1)
+        self.assertEqual(1, len(self.escalations()))
+
     def start_queue(self):
         self.loop_id = str(uuid.uuid4())
         self.write('queue-member.json', {'queue': str(self.folder / 'queue.json'), 'repo': 'o/repo', 'number': 7})
@@ -273,6 +347,32 @@ class NoFalseStalls(StallFixture):
         self.write('implementer.json', {'tool': 'codex', 'autoMerge': True})
         self.run_until(S)
         self.assertEqual(1, len(self.stall_mail()))
+
+    def test_under_auto_merge_running_ci_exempts_and_finished_ci_does_not(self):
+        # r1 F2: the planner waits on CI with a background wait-ci the relay cannot see.
+        self.write('implementer.json', {'tool': 'codex', 'autoMerge': True})
+        done = {'__typename': 'CheckRun', 'name': 'tests', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}
+        for pending in ({'__typename': 'CheckRun', 'name': 'build', 'status': 'IN_PROGRESS'},
+                        {'__typename': 'CheckRun', 'name': 'build', 'status': 'QUEUED'},
+                        {'__typename': 'StatusContext', 'context': 'ci/x', 'state': 'PENDING'},
+                        {'__typename': 'StatusContext', 'context': 'ci/x', 'state': 'EXPECTED'}):
+            with self.subTest(pending=pending):
+                self.r = self.make_relay()
+                self.r.state['pr'] = {'number': 9, 'state': 'OPEN', 'statusCheckRollup': [done, pending]}
+                self.assert_quiet()
+                self.assertTrue(any('CI running' in line for line in self.logs), self.logs)
+        self.r = self.make_relay()
+        self.r.state['pr'] = {'number': 9, 'state': 'OPEN', 'statusCheckRollup': [
+            done, {'__typename': 'StatusContext', 'context': 'ci/x', 'state': 'FAILURE'}]}
+        self.run_until(S)
+        self.assertEqual(1, len(self.stall_mail()))
+
+    def test_the_rollup_adds_no_pr_events(self):
+        self.assertIn('statusCheckRollup', relay.PR_FIELDS.split(','))
+        base = {'number': 9, 'state': 'OPEN', 'url': 'u', 'reviews': [], 'comments': [], 'inline': [],
+                'reviewDecision': '', 'statusCheckRollup': [{'__typename': 'CheckRun', 'name': 'b', 'status': 'QUEUED'}]}
+        later = dict(base, statusCheckRollup=[{'__typename': 'CheckRun', 'name': 'b', 'status': 'COMPLETED'}])
+        self.assertEqual([], relay.pr_events(base, later))
 
     def test_loop_reports_and_records(self):
         for name, data in (('loop.json', {'state': 'pr-open', 'rev': 1}), ('loop.json', {'state': 'blocked', 'rev': 2}),

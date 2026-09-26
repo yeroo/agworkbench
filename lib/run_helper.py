@@ -78,8 +78,10 @@ def count_failures(text: str) -> int | None:
             continue
         match = UNITTEST_FAILED_RE.match(line)
         if match:
-            found = sum(int(value) for key, value in re.findall(r"(\w+)=(\d+)", match.group(1))
-                        if key in ("failures", "errors"))
+            # Only `failures` and `errors`: `expected failures=2` and `skipped=3` are not failures.
+            parts = [part.strip().partition("=") for part in match.group(1).split(",")]
+            found = sum(int(value) for key, _, value in parts
+                        if key.strip() in ("failures", "errors") and value.strip().isdigit())
             continue
         if UNITTEST_OK_RE.match(line):
             found = 0

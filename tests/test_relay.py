@@ -1942,7 +1942,7 @@ class UsageLimits(DeliveryFixture):
             self.pane.return_value = limit_frame(frame) if not frame.startswith('\n') else frame
         for _ in range(times):
             self.clock += 30
-            self.r.check_limits()
+            self.r.check_limits(self.r.read_panes())
 
     def mails(self):
         return [c.kwargs for c in self.r.hub.write_message.call_args_list]

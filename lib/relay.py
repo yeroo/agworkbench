@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Four jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Five jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -40,8 +40,9 @@ Four jobs, one loop, one process per issue, running in its own visible agwinterm
    never types anything but the mail pointer, and never answers a prompt.
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
-relay itself polls the mailbox directory, the GitHub API and the two agent panes (for limits),
-none of which can push to it.
+relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits and
+stalls), and for stalls also the terminal's session tree and `git rev-parse HEAD`, none of which
+can push to it.
 
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
@@ -73,7 +74,8 @@ from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 import limits  # noqa: E402
 import closer  # noqa: E402
 
-PR_FIELDS = "number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,isCrossRepository"
+PR_FIELDS = ("number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,"
+             "isCrossRepository,statusCheckRollup")
 HOLD_ALERT_AFTER = 60.0
 AMBIGUOUS_ALERT_AFTER = 600.0
 ALERT_EVERY = 300.0
@@ -303,6 +305,21 @@ def stall_setting() -> float:
     return float(value)
 
 
+def ci_pending(pr: dict[str, Any]) -> list[str]:
+    """The PR's checks that are still running, from the snapshot's statusCheckRollup (#45 r1): a
+    check run not COMPLETED, a commit status PENDING or EXPECTED."""
+    pending = []
+    for item in pr.get("statusCheckRollup") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("__typename") or ("CheckRun" if "status" in item else "StatusContext")
+        if kind == "CheckRun" and item.get("status") != "COMPLETED":
+            pending.append(str(item.get("name") or "?"))
+        elif kind == "StatusContext" and item.get("state") in ("PENDING", "EXPECTED"):
+            pending.append(str(item.get("context") or "?"))
+    return pending
+
+
 def git_head(root: Path) -> str | None:
     try:
         done = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -441,8 +458,12 @@ class StallWatch:
             reasons.append(f"loop.json says {loop.get('state')}")
         pr = self.relay.state.get("pr") or {}
         settings = self.read_json("implementer.json")
-        if pr.get("state") == "OPEN" and not (isinstance(settings, dict) and settings.get("autoMerge") is True):
-            reasons.append(f"PR #{pr.get('number')} is open for review")
+        if pr.get("state") == "OPEN":
+            if not (isinstance(settings, dict) and settings.get("autoMerge") is True):
+                reasons.append(f"PR #{pr.get('number')} is open for review")
+            elif ci_pending(pr):
+                # Under auto-merge the planner waits on CI with a background wait-ci the relay cannot see.
+                reasons.append(f"PR #{pr.get('number')} CI running: {', '.join(ci_pending(pr))}")
         unread = self.unread()
         if unread:
             reasons.append(f"unread mail {', '.join(unread)}")
@@ -516,8 +537,7 @@ class StallWatch:
             if self.since is None:
                 self.since = instant
                 self.note("both panes idle with nothing to wake them; stall clock started")
-            if instant - self.since >= self.period:
-                self.pointer(instant - self.since, quiet, texts)
+            if instant - self.since >= self.period and self.pointer(instant - self.since, quiet, texts):
                 self.level, self.pointer_at = 1, instant
         elif self.level == 1:
             # A busy pane after the pointer (the planner reading it) does not reset the level, but
@@ -536,7 +556,9 @@ class StallWatch:
                 return last_words(texts[peer.box], peer.tool)
         return None
 
-    def pointer(self, idle: float, quiet: list[str], texts: dict[str, Any]) -> None:
+    def pointer(self, idle: float, quiet: list[str], texts: dict[str, Any]) -> bool:
+        """File the stall pointer. False when it could not be filed: the level stays, and the next
+        tick tries again - an escalation never cites a pointer that does not exist."""
         minutes = f"{idle / 60:.0f}"
         subject = f"stall: loop idle for {minutes} min, nothing unread, no running helper"
         body = [f"The relay has seen this loop idle for {minutes} minutes: both agent panes idle with an empty",
@@ -554,15 +576,16 @@ class StallWatch:
                  f"With no progress for another {2 * self.period / 60:.0f} minutes the relay reports the loop blocked."]
         if self.relay.dry_run:
             self.relay.log(f"[dry-run] would mail the planner: {subject}")
-            return
+            return True
         try:
             path = self.relay.hub.write_message(to="claude", sender="relay", kind="stall", subject=subject,
                                                 body="\n".join(body))
         except OSError as err:
             self.relay.log(f"could not file the stall pointer: {err}")
-            return
+            return False
         self.sent.add(Path(path).stem)
         self.relay.log(f"STALL pointer to the planner: {subject}")
+        return True
 
     def escalate(self, idle: float, quiet: list[str]) -> None:
         import agw
@@ -762,10 +785,9 @@ class Relay:
                 texts[peer.box] = err
         return texts
 
-    def check_limits(self, texts: dict[str, Any] | None = None) -> None:
-        """Classify each pane; an episode seen on LIMIT_READS consecutive reads is announced once."""
-        if texts is None:
-            texts = self.read_panes()
+    def check_limits(self, texts: dict[str, Any]) -> None:
+        """Classify each pane (texts from read_panes); an episode seen on LIMIT_READS consecutive reads
+        is announced once."""
         episodes = dict(self.state.get('limits', {}))
         changed = False
         for peer in self.peers:
