@@ -30,6 +30,7 @@ $report = Join-Path $reviewDir "revmux-r$Round.md"
 
 $run = "r$Round"
 $code = $null
+$posted = $false
 try {
 $created = & revmux new --task workbench --run $run | Out-String
 if ($LASTEXITCODE -ne 0) { throw "revmux new failed: $created" }
@@ -43,11 +44,22 @@ $verdict = switch ($code) { 0 { 'clean' } 1 { 'findings reported' } default { "t
 
 & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender revmux --kind review `
     --subject "revmux round ${Round}: $verdict" --body-file $report | Out-Host
+$posted = $LASTEXITCODE -eq 0
 Write-Host "revmux exit $code ($verdict). Report posted to Claude." -ForegroundColor Yellow
+} catch {
+    Write-Host "revmux round $Round failed: $_" -ForegroundColor Red
 } finally {
+    # Never end silently (#45): the planner waits on this mail, not on a watcher of its own.
+    if (-not $posted) {
+        $why = if ($null -ne $code) { "exit $code" } else { 'it did not finish' }
+        & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender helper --kind note `
+            --subject "revmux round ${Round}: ended without a report ($why)" `
+            --text "run-revmux.ps1 for round $Round ended without posting its report ($why). Look at the '#N revmux r$Round' session and $report." | Out-Host
+    }
     # The last act (#33): mark this helper done, with what its pane shows now, so an autonomous close
     # can prove nobody touched the pane since. A killed script writes no marker and stays open.
     $doneArgs = @((Join-Path $script:Lib 'helper_done.py'), '--hub', $hubDir, '--kind', 'revmux', '--round', "$Round")
     if ($null -ne $code) { $doneArgs += @('--exit', "$code") }
     & python @doneArgs
 }
+if (-not $posted) { exit 1 }

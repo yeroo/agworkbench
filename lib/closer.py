@@ -8,7 +8,7 @@ Stepwise on purpose: `step_helpers()` and `agent_blockers()` each look once and 
 their evidence (settled pane hashes) in the object, so the relay can loop on them while it keeps
 delivering mail, and the conductor can advance one check per tick without blocking its queue.
 
-- Helpers (`#N revmux rK`, `#N your review` in this repo's workspace) close on their own evidence,
+- Helpers (`#N revmux rK`, `#N your review`, `#N suite <label>` in this repo's workspace) close on their own evidence,
   first and independently of the agents. wb.py launches them in agwinterm's DIRECT command mode: the
   pane runs the helper with no shell around it, and when it ends the pane stays on screen with its
   input closed - nothing can be typed into it and nothing more is printed. So a helper closes when
@@ -36,6 +36,8 @@ import limits
 
 CLOSE_WAIT = 600.0       # how long a close waits for the loop to be provably over (#27)
 CLOSE_SETTLE = 30.0      # a pane must be unchanged this long before it may be closed
+# The helper sessions wb.py opens, after the `#N `: a revmux round, the human's revdiff, a suite (#45).
+HELPER_NAMES = r'revmux r\d+|your review|suite [A-Za-z0-9._-]+'
 
 
 def issue_from_branch(branch: str) -> str | None:
@@ -138,7 +140,7 @@ class Closer:
     def helper_sessions(self, snapshot):
         if not self.issue:
             return []
-        name = re.compile(rf'#{self.issue} (revmux r\d+|your review)')
+        name = re.compile(rf'#{self.issue} ({HELPER_NAMES})')
         return [session for workspace, session in agw.sessions(snapshot)
                 if (workspace.get('name') or '').casefold() == self.workspace_name.casefold()
                 and name.fullmatch(session.get('name') or '')]
@@ -200,7 +202,6 @@ class Closer:
     def agent_blockers(self, number: int) -> list[str]:
         """What still stops the issue-session close. Empty only when the loop is provably over."""
         import hub
-        import peerchat
         reasons = []
         try:
             done = json.loads((self.hub_dir / 'state' / 'loop-done.json').read_text(encoding='utf-8-sig'))
@@ -230,16 +231,7 @@ class Closer:
             state = self.settle(peer.pane, text)
             if state:
                 reasons.append(f'{peer.box} pane {state}')
-            if peerchat.is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:])):
-                reasons.append(f'{peer.box} is running a turn')
-            profile = peerchat.PROFILES[peer.tool]
-            content = (peerchat.claude_composer(text) if peer.tool == 'claude' else peerchat.codex_composer(text))
-            if content is None or not peerchat.looks_empty(profile, content):
-                reason = f'{peer.box} composer is not provably empty'
-                if peer.tool == 'claude':
-                    reason += (' (a greyed prompt suggestion? agents the workbench launches have them off;'
-                               ' for an adopted Claude set "promptSuggestionEnabled": false in ~/.claude/settings.json)')
-                reasons.append(reason)
+            reasons += idle_blockers(peer, text)
         return reasons
 
     def close_issue_session(self) -> None:
@@ -254,6 +246,25 @@ class Closer:
         for pane in sorted(agents):
             agw.clear_restore(pane)
         agw.close_session(issue_session.get('id'))
+
+
+def idle_blockers(peer, text: str) -> list[str]:
+    """Why an agent pane is not provably idle: a turn is running, or its composer is not provably
+    empty. Empty only when it is idle. Shared by the close and the relay's stall watch (#45), so the
+    two can never disagree about what idle means."""
+    import peerchat
+    reasons = []
+    if peerchat.is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:])):
+        reasons.append(f'{peer.box} is running a turn')
+    profile = peerchat.PROFILES[peer.tool]
+    content = (peerchat.claude_composer(text) if peer.tool == 'claude' else peerchat.codex_composer(text))
+    if content is None or not peerchat.looks_empty(profile, content):
+        reason = f'{peer.box} composer is not provably empty'
+        if peer.tool == 'claude':
+            reason += (' (a greyed prompt suggestion? agents the workbench launches have them off;'
+                       ' for an adopted Claude set "promptSuggestionEnabled": false in ~/.claude/settings.json)')
+        reasons.append(reason)
+    return reasons
 
 
 def relay_alive(repo: str, issue: str, snapshot) -> bool:

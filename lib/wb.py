@@ -3,6 +3,7 @@
 
   wb.py revmux --round 1 --scope .workbench/review/scope-r1.md    # review round, own session
   wb.py human-review --base origin/main                          # revdiff, selected, for the human
+  wb.py suite --label 1f04542 -- python -m unittest discover -s tests   # the whole suite, own session (#45)
   wb.py status blocked --sound                                    # this pane's sidebar status
   wb.py wait-mail                                                 # background inbox waiter
   wb.py settings                                                  # implementer, revmux profile, auto-merge, failover
@@ -67,6 +68,12 @@ def pane_command(script: str, **params: str) -> str:
     return subprocess.list2cmdline(parts)
 
 
+def helper_command(script: str, *args: str) -> str:
+    """A Python helper's command line for direct mode (#45): python itself runs in the pane, so when
+    the helper ends no shell is left in its foreground and the close can prove it untouched."""
+    return subprocess.list2cmdline([sys.executable or "python", str(HERE / script), *args])
+
+
 def open_session(name: str, cwd: Path, command: str, select: bool) -> str:
     args = {"name": name, "cwd": str(cwd), "command": command, "command-mode": "direct"}
     pane = agw.my_pane()
@@ -108,7 +115,45 @@ def cmd_human_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_suite(args: argparse.Namespace) -> int:
+    root = checkout()
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.label):
+        raise SystemExit(f"wb: --label must be letters, digits, '.', '_' or '-' (got {args.label!r})")
+    if not command:
+        raise SystemExit("wb: suite needs a command after --, e.g. wb.py suite --label abc1234 -- python -m unittest")
+    # The session does not inherit this pane's environment, so the recipient is resolved here.
+    to = args.to or os.environ.get("AI_BOX") or "claude"
+    if not hub.BOX_RE.fullmatch(to):
+        raise SystemExit(f"wb: --to is not a mailbox name: {to!r}")
+    hub_dir = root / ".workbench"
+    line = helper_command("run_helper.py", "--hub", str(hub_dir), "--label", args.label, "--to", to, "--", *command)
+    sid = open_session(f"#{issue_number(root)} suite {args.label}", root, line, select=False)
+    print(f"suite {args.label} running in session {sid}; log: {hub_dir / 'review' / f'suite-{args.label}.log'}; "
+          f"the result will arrive as mail from 'helper' to {to}")
+    return 0
+
+
+def waiting_path(root: Path) -> Path:
+    return root / ".workbench" / "state" / "waiting.json"
+
+
+def set_waiting(root: Path, waiting: bool) -> None:
+    """The durable "waiting on the human" record (#45). The sidebar status cannot be it: agwinterm's
+    agent hooks rewrite that on every turn (active, then completed at the end of it). The relay's stall
+    watch is off while this file exists."""
+    path = waiting_path(root)
+    if waiting:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"at": time.time(), "by": "planner"}), encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
+    hub_dir = os.environ.get("AI_HUB")
+    if hub_dir:
+        set_waiting(Path(hub_dir).resolve().parent, args.state == "blocked")
     agw.set_status(args.state, sound=args.sound, blink=args.sound)
     return 0
 
@@ -116,10 +161,15 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_loop_state(args: argparse.Namespace) -> int:
     # Reports stay in this checkout; the conductor alone owns the global queue.
     if args.state == 'done':
-        return loop_done(checkout(), args.pr, args.sha)
+        code = loop_done(checkout(), args.pr, args.sha)
+        if code == 0:
+            set_waiting(checkout(), False)
+        return code
     from conductor import write_loop_state
     try:
         write_loop_state(checkout(), args.state, args.pr, args.reason)
+        if args.state == 'resumed':
+            set_waiting(checkout(), False)
         return 0
     except (OSError, ValueError, KeyError, TypeError) as err:
         print(f'wb: loop-state: {err}', file=sys.stderr)
@@ -959,6 +1009,11 @@ def main() -> int:
     p.add_argument("--pr", required=True, help="PR number or URL")
     p.add_argument("--head", required=True, help="the full SHA the whole suite passed on")
     p.set_defaults(func=cmd_merge_check)
+    p = subs.add_parser("suite", help="run a long command (the whole suite, a build) in its own visible session (#45)")
+    p.add_argument("--label", required=True, help="names the session and the log, e.g. the head's short sha")
+    p.add_argument("--to", help="the mailbox the result goes to (default: AI_BOX, else claude)")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="-- then the command and its arguments")
+    p.set_defaults(func=cmd_suite)
     p = subs.add_parser("human-review", help="open revdiff for the human, selected")
     p.add_argument("--base", required=True, help="e.g. origin/main")
     p.set_defaults(func=cmd_human_review)
