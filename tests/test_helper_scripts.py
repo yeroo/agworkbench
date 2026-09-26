@@ -60,6 +60,27 @@ class HelperScripts(unittest.TestCase):
         self.assertTrue(mail['subject'].startswith('human review (revdiff): ended without a result'), mail['subject'])
         self.assertIn('revdiff crashed', done.stdout + done.stderr)
 
+    def review(self, stub):
+        (self.bin / 'revdiff.cmd').write_text(stub, encoding='utf-8')
+        done = self.run_script('human-review.ps1', '-Base', 'origin/main')
+        return done, [(mail['from'], mail['subject']) for mail in self.mails()]
+
+    def test_a_failed_revdiff_with_no_output_is_not_no_annotations(self):
+        # r1 F1: a non-zero exit with nothing written must not tell the planner the human had nothing to add.
+        done, mails = self.review('@exit /b 3\r\n')
+        self.assertNotEqual(0, done.returncode)
+        self.assertEqual([('helper', 'human review (revdiff): ended without a result (revdiff exit 3)')], mails)
+
+    def test_annotations_are_posted_whatever_revdiffs_exit(self):
+        done, mails = self.review('@echo fix this line>%3\r\n@exit /b 3\r\n')
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertEqual([('human', 'human review (revdiff): annotations to address')], mails)
+
+    def test_a_clean_quit_with_no_output_is_no_annotations(self):
+        done, mails = self.review('@exit /b 0\r\n')
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertEqual([('human', 'human review (revdiff): no annotations')], mails)
+
 
 if __name__ == '__main__':
     unittest.main()
