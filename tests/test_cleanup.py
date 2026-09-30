@@ -237,12 +237,23 @@ class Remove(Clones):
     @unittest.skipUnless(os.name == 'nt', 'Windows refuses to rename a directory in use')
     def test_a_checkout_in_use_is_not_touched(self):
         checkout = self.clone()
-        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=checkout)
-        self.addCleanup(holder.wait)
-        self.addCleanup(holder.kill)
+        # The holder says it is running in the checkout before anything is tried: a holder that died
+        # at start (it happens on a machine short of memory) would let the rename through, and the
+        # test would fail for a reason that has nothing to do with cleanup. One that did is started again.
+        for _ in range(3):
+            holder = subprocess.Popen([sys.executable, '-c', 'import os, time; print(os.getcwd(), flush=True); time.sleep(60)'],
+                                      cwd=checkout, stdout=subprocess.PIPE, text=True)
+            self.addCleanup(holder.stdout.close)
+            self.addCleanup(holder.wait)
+            self.addCleanup(holder.kill)
+            if os.path.normcase(holder.stdout.readline().strip()) == os.path.normcase(checkout):
+                break
+        else:
+            self.fail(f'the holder did not start in the checkout (exit {holder.poll()})')
         pauses = []
         with self.assertRaisesRegex(cleanup.CleanupError, 'in use, nothing deleted'):
             cleanup.remove(checkout, 'merged', pause=pauses.append)
+        self.assertIsNone(holder.poll(), 'the holder exited while the checkout was being removed')
         self.assertEqual([1.0, 1.0], pauses)                                    # three tries
         self.assertTrue((checkout / '.git' / 'HEAD').exists())
         self.assertTrue((checkout / 'README.md').exists())
