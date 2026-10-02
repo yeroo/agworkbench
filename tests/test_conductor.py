@@ -1363,6 +1363,49 @@ class CloseBackstop(unittest.TestCase):
         self.assertNotIn('closePending', self.member(7))
         self.assertIn('the conductor runs the close', (self.state / 'relay-close.log').read_text(encoding='utf-8'))
 
+    def pointer_in(self, pane, box, mid, *, folder=''):
+        """#96: a relay pointer left typed in `pane` for mail `mid` of `box`; keys go to self.keys."""
+        import peerchat
+        from frames import CLAUDE_IDLE, Clock, claude
+        hub_dir = self.checkout / '.workbench'
+        directory = hub_dir / 'inbox' / box / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f'{mid}.md'
+        path.write_text(f'---\nid: {mid}\nfrom: codex\nto: {box}\nsubject: IMPLEMENTED abc\n---\nbody\n', encoding='utf-8')
+        pointer = closer.relay_pointer({'id': mid, 'from': 'codex', 'subject': 'IMPLEMENTED abc'}, closer.AGMSG, hub_dir)
+        self.text[pane] = claude(pointer)
+        self.keys = []
+
+        def type_into(target, key):
+            self.keys.append((target, key))
+            self.text[target] = CLAUDE_IDLE
+            if key == '\n' and path.exists():
+                path.rename(path.parent / 'read' / path.name)      # the woken planner reads it
+        (directory / 'read').mkdir(exist_ok=True)
+        clock = Clock()
+        self.enterContext(patch.object(q.agw, 'type_into', side_effect=type_into))
+        self.enterContext(patch.object(q.agw, 'cursor_column', side_effect=q.agw.CtlError('no cursor in fixture')))
+        self.enterContext(patch.object(peerchat, 'now', clock.now))
+        self.enterContext(patch.object(peerchat, 'pause', clock.pause))
+
+    def test_the_backstop_clears_a_stale_pointer_for_read_mail(self):
+        self.relay_gone()
+        self.pointer_in(self.IMPLEMENTER, 'codex', 'm1', folder='read')
+        self.run_for(1000)
+        self.assertEqual([(self.IMPLEMENTER, '\x15')], self.keys)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertIn("cleared a stale relay pointer for m1 from codex's composer",
+                      (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
+    def test_the_backstop_submits_a_pointer_for_unread_planner_mail(self):
+        self.relay_gone()
+        self.pointer_in(self.PLANNER, 'claude', 'p1')
+        self.run_for(1000)
+        self.assertEqual([(self.PLANNER, '\n')], self.keys)
+        self.assertIn(('close', self.PLANNER), self.actions)
+        self.assertIn('rescued unsent pointer in claude for p1 [submitted]',
+                      (self.state / 'relay-close.log').read_text(encoding='utf-8'))
+
     def test_closed_no_pr_backstop_checks_issue_before_sessions(self):
         with self.store.transaction() as data:
             data['members'][0].update(state='closed', phase='closed', pr=None, reason='duplicate')
