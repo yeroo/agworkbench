@@ -324,6 +324,13 @@ class Progress(StallFixture):
 
 
 class NoFalseStalls(StallFixture):
+    def test_an_exited_agent_is_named_as_such(self):
+        # #98: the stall watch (and the close) no longer call a shell prompt a non-empty composer.
+        self.text[IMPLEMENTER] = 'Bye!\nPS C:\\repo-issue-7> '
+        self.tick(0)
+        self.assertEqual(['codex is at a shell prompt (its agent exited)'], self.r.stall.busy(self.r.read_panes()))
+        self.assertIn('stall watch: not stalled: codex is at a shell prompt (its agent exited)', self.logs)
+
     def assert_quiet(self, minutes=4 * S):
         self.run_until(minutes)
         self.assertEqual([], self.stall_mail())

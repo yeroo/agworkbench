@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Six jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Seven jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -67,6 +67,17 @@ Six jobs, one loop, one process per issue, running in its own visible agwinterm 
    revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/` stay; each close is
    logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
 
+7. **Exited agents (#98).** On the same reads, whatever exempts the stall watch, it looks for an
+   agent pane back at its root shell: the tree's `foregroundShells` names a live shell with no child
+   in it, and the last row is a bare `PS X:\\...> ` prompt (a crash leaves the agent's frame above it,
+   so nothing above is read). Unchanged for EXIT_GRACE_MINUTES, the pane gets its pinned restore
+   command (every pin resumes the conversation), and once the agent's composer is idle one resume
+   pointer. At most EXIT_RESTARTS per pane per hour (kept in relay.json); the next exit alerts the
+   human and reports the loop blocked (waiting.json, queue cause `environment`), with `exit` mail to
+   the planner when the implementer died. Never while `restartExited` is off, a launcher holds
+   launch.lock, the loop is done or closing, or a usage limit owns the pane (the episode, or
+   implementer.json recording the tool limited or naming another tool).
+
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
 relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits and
 stalls), and for stalls also the terminal's session tree and `git rev-parse HEAD`, none of which
@@ -130,6 +141,12 @@ WINDOW_SLACK = 60.0      # the window-end probe comes this long after the window
 PROBE_TEXT = ("the usage limit may have reset; continue where you left off "
               "(git status, .workbench, unread mail)")
 LAST_WORDS_MAX = 300     # how much of the implementer's last line a stall pointer quotes
+EXIT_GRACE_MINUTES = 2.0     # an exited agent's pane unchanged this long is restarted (#98)
+EXIT_RESTARTS = 3            # restarts per pane in EXIT_WINDOW; the next exit is the human's
+EXIT_WINDOW = 3600.0
+RESTART_POINTER_MINUTES = 10.0   # a restarted agent's resume pointer is dropped if not typed by then
+RESTART_TEXT = ("your agent process exited and the relay restarted it; continue where you left off "
+                "(git status, .workbench, unread mail)")
 
 
 @dataclass(frozen=True)
@@ -359,6 +376,25 @@ def close_helpers_setting() -> tuple[bool, str]:
         return False, f'config {path} is not a JSON object'
     for key, value in config.items():
         if key.casefold() == "closehelpers" and value is not None and value is not True:
+            return False, f'{key}: {json.dumps(value)}'
+    return True, ''
+
+
+def restart_exited_setting() -> tuple[bool, str]:
+    """(`restartExited` from ~/.agworkbench.json, why it is off) (#98), read like `closeHelpers`: on when
+    the file or the key is missing or null; off for a config it cannot read and for any spelling of the
+    key set to anything but true or null."""
+    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return True, ''
+    except (OSError, ValueError) as err:
+        return False, f'config {path} unreadable: {err}'
+    if not isinstance(config, dict):
+        return False, f'config {path} is not a JSON object'
+    for key, value in config.items():
+        if key.casefold() == "restartexited" and value is not None and value is not True:
             return False, f'{key}: {json.dumps(value)}'
     return True, ''
 
@@ -843,6 +879,231 @@ class StallWatch:
                 self.relay.log(f"could not notify: {err}")
 
 
+class ExitWatch:
+    """#98: an agent whose process exited (or crashed) leaves its pane at the root shell's prompt, and
+    nothing else in the loop notices: peerchat holds its mail, the stall watch reads it as not idle.
+
+    One `tick` per limit interval, with the pane texts the limit check read and one tree snapshot. A pane
+    is exited when the terminal reports a live root shell with no child in it (`foregroundShells`) and its
+    last row is a bare pwsh prompt; the rows above are not looked at, since a crash leaves the agent's
+    frame there. Unchanged for EXIT_GRACE_MINUTES (a human who quit on purpose types, and the clock
+    restarts), the pane gets its pinned restore command - every pin resumes the conversation - and, once
+    the agent's composer is idle, one resume pointer. EXIT_RESTARTS per hour, then the human is told and
+    the loop reported blocked. An episode ends when the pane reads not exited twice in a row."""
+
+    def __init__(self, relay: "Relay"):
+        self.relay = relay
+        self.episodes: dict[str, dict] = {}     # box -> {tail, since, misses, notes}
+        self.pointers: dict[str, float] = {}    # box -> wall time of the restart awaiting its pointer
+        self.last_note: str | None = None
+
+    @property
+    def state_dir(self) -> Path:
+        return self.relay.hub_dir / "state"
+
+    def note(self, text: str) -> None:
+        """A watch-wide condition, logged when it changes."""
+        if text != self.last_note:
+            self.last_note = text
+            self.relay.log(f"exit watch: {text}")
+
+    def once(self, episode: dict, text: str) -> None:
+        """A decision about one episode, logged once in it."""
+        if text not in episode["notes"]:
+            episode["notes"].add(text)
+            self.relay.log(f"exit watch: {text}")
+
+    def read_json(self, name: str) -> Any:
+        try:
+            return json.loads((self.state_dir / name).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return None
+
+    # --- reading --------------------------------------------------------------------------------
+    def exited(self, peer: Peer, snapshot: dict, text: Any) -> tuple[bool | None, str | None]:
+        """(exited, the pane's pin); exited is None when unknown: the pane unreadable or not in the tree."""
+        import agw
+        if not isinstance(text, str):
+            return None, None
+        found = agw.find_pane(peer.pane, snapshot)
+        if found is None:
+            return None, None
+        _, session, index = found
+        if "foregroundShells" not in session:
+            self.note("the terminal reports no foregroundShells; exited agents are not detected")
+            return False, None
+        shells = session.get("foregroundShells") or []
+        shell = shells[index] if index < len(shells) else None
+        pin = (session.get("restoreCommands") or {}).get(peer.pane)
+        return bool(isinstance(shell, str) and shell and limits.ps_prompt_last(text)), pin
+
+    # --- the tick -------------------------------------------------------------------------------
+    def tick(self, texts: dict[str, Any]) -> None:
+        import agw
+        try:
+            snapshot = agw.tree()
+        except (agw.CtlError, OSError) as err:
+            self.note(f"terminal tree unreadable ({err}); not judging")
+            return
+        for peer in self.relay.peers:
+            text = texts.get(peer.box)
+            state, pin = self.exited(peer, snapshot, text)
+            if state is None:
+                continue        # unknown: the grace clock neither advances nor resets
+            episode = self.episodes.get(peer.box)
+            if not state:
+                if episode is not None:
+                    episode.update(tail=None, since=None)
+                    episode["misses"] += 1
+                    if episode["misses"] >= LIMIT_READS:
+                        self.episodes.pop(peer.box)
+                        self.relay.log(f"exit watch: {peer.box} is no longer at a shell prompt")
+                self.offer_pointer(peer, text)
+                continue
+            if episode is None:
+                episode = self.episodes[peer.box] = {"tail": None, "since": None, "misses": 0, "notes": set()}
+                self.relay.log(f"exit watch: {peer.box} ({peer.tool}) is at a shell prompt; its agent exited")
+            episode["misses"] = 0
+            tail = limits.tail_hash(text)
+            if episode["tail"] != tail:
+                episode.update(tail=tail, since=wall())
+            if wall() - episode["since"] >= EXIT_GRACE_MINUTES * 60:
+                self.restart(peer, episode, pin)
+
+    # --- acting ---------------------------------------------------------------------------------
+    def blocked_by(self, peer: Peer) -> str | None:
+        """Why this pane must not be restarted now: someone else owns it, or the loop is over."""
+        import conductor
+        enabled, why = restart_exited_setting()
+        if not enabled:
+            return f"restartExited is off ({why})"
+        if conductor.file_locked(self.state_dir / "launch.lock"):
+            return "a launcher holds launch.lock"
+        if (self.state_dir / "loop-done.json").exists():
+            return "the loop is done (state/loop-done.json)"
+        if self.relay.state.get("close_pending") or self.relay.draining:
+            return "the PR is finished; the close owns the panes"
+        if peer.box in self.relay.state.get("limits", {}):
+            return "a usage-limit episode owns it"
+        if peer.box == "codex":
+            saved = self.read_json("implementer.json")
+            if isinstance(saved, dict):
+                if isinstance(saved.get("limits"), dict) and saved["limits"].get(peer.tool):
+                    return f"state/implementer.json records {peer.tool} as limited; the failover owns it"
+                if saved.get("tool") not in (None, peer.tool):
+                    return (f"state/implementer.json names {saved.get('tool')} but this relay rings {peer.tool}; "
+                            "the pin may be another tool's")
+        return None
+
+    def recent(self, box: str) -> list[float]:
+        """This box's restarts within the last EXIT_WINDOW (wall times, kept in relay.json)."""
+        return [t for t in self.relay.state.get("restarts", {}).get(box, []) if wall() - t < EXIT_WINDOW]
+
+    def restart(self, peer: Peer, episode: dict, pin: str | None) -> None:
+        import agw
+        label = f"{peer.box} ({peer.tool})"
+        why = self.blocked_by(peer)
+        if why:
+            self.once(episode, f"not restarting {label}: {why}")
+            return
+        if not pin:
+            if "no pin" not in episode["notes"]:
+                episode["notes"].add("no pin")
+                self.alert(peer, f"agent exited and its pane has no pinned restore command: {label}, pane {peer.pane}",
+                           "Restart the agent in that pane by hand, then run `wb.py status active`.")
+            return
+        recent = self.recent(peer.box)
+        if len(recent) >= EXIT_RESTARTS:
+            if "budget" not in episode["notes"]:
+                episode["notes"].add("budget")
+                self.give_up(peer, len(recent))
+            return
+        if self.relay.dry_run:
+            self.once(episode, f"[dry-run] would restart {label}: {pin}")
+            return
+        try:
+            agw.type_into(peer.pane, pin + "\n")
+        except (agw.CtlError, OSError) as err:
+            self.once(episode, f"could not restart {label}: {err}")
+            return
+        recent.append(wall())
+        self.relay.state.setdefault("restarts", {})[peer.box] = recent
+        self.relay._save()
+        # The command and its output change the tail anyway: a restart that fails waits a fresh grace period.
+        episode.update(tail=None, since=None)
+        self.pointers[peer.box] = wall()
+        self.relay.log(f"agent exited; restarted with resume: {label} attempt {len(recent)}/{EXIT_RESTARTS}")
+
+    def offer_pointer(self, peer: Peer, text: str) -> None:
+        """The restarted agent's one resume pointer, typed once its composer is idle and empty."""
+        import agw
+        import peerchat
+        since = self.pointers.get(peer.box)
+        if since is None:
+            return
+        if wall() - since >= RESTART_POINTER_MINUTES * 60:
+            self.pointers.pop(peer.box)
+            self.relay.log(f"exit watch: dropped the resume pointer for {peer.box}: no idle composer "
+                           f"in {RESTART_POINTER_MINUTES:g} min")
+            return
+        if closer.idle_blockers(peer, text):
+            return
+        try:
+            outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool],
+                                    peerchat.compose_text("Chat from Workbench: ", RESTART_TEXT),
+                                    dry_run=False, retry=False)
+        except (peerchat.Refused, peerchat.Failed, agw.CtlError, OSError) as err:
+            self.relay.log(f"exit watch: resume pointer for {peer.box} not typed yet: {err}")
+            return
+        self.pointers.pop(peer.box)
+        self.relay.log(f"exit watch: resume pointer typed into {peer.box} [{outcome}]")
+
+    def alert(self, peer: Peer, summary: str, step: str, *, blocked: bool = False) -> None:
+        """Tell the human on the planner's pane (blocked with sound when the loop is), and the planner by
+        mail when the dead pane is the implementer's: a dead planner reads no mail."""
+        import agw
+        self.relay.log(f"ALERT {summary}")
+        for planner in [peer_ for peer_ in self.relay.peers if peer_.box == "claude"]:
+            if blocked:
+                try:
+                    agw.set_status("blocked", sound=True, blink=True, pane_id=planner.pane)
+                except (agw.CtlError, OSError) as err:
+                    self.relay.log(f"could not set blocked status: {err}")
+            try:
+                agw.notify(planner.pane, summary, title="workbench relay")
+            except (agw.CtlError, OSError) as err:
+                self.relay.log(f"could not notify: {err}")
+        if peer.box != "claude":
+            body = "\n".join([summary, f"Pane: {peer.box} ({peer.tool}) {peer.pane}", "", "Next step: " + step])
+            try:
+                self.relay.hub.write_message(to="claude", sender="relay", kind="exit", subject=summary, body=body)
+            except OSError as err:
+                self.relay.log(f"could not mail the planner: {err}")
+
+    def give_up(self, peer: Peer, count: int) -> None:
+        """EXIT_RESTARTS restarts in the last hour and it exited again: the loop is blocked on the human."""
+        summary = (f"agent exited {count + 1} times in an hour: {peer.box} ({peer.tool}); "
+                   "the relay does not restart it again")
+        self.alert(peer, summary, "look at the pane (a crashing tool, a broken checkout, a bad pin). Once it is "
+                   "fixed, restart the agent with the pane's pinned command and run `wb.py status active`.",
+                   blocked=True)
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            (self.state_dir / "waiting.json").write_text(
+                json.dumps({"at": wall(), "by": "relay", "reason": summary}), encoding="utf-8")
+        except OSError as err:
+            self.relay.log(f"could not write state/waiting.json: {err}")
+        if (self.state_dir / "queue-member.json").exists():
+            try:
+                import conductor
+                identity = conductor.read_json(self.state_dir / "claude.json")
+                # A tool that crashes this often would crash the next member's too: it keeps its slot.
+                conductor.write_loop_state(self.relay.hub_dir.parent, "blocked", reason=summary,
+                                           loop_id=identity.get("sessionId"), cause="environment")
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as err:
+                self.relay.log(f"could not report the exits to the queue: {err}")
+
+
 class Relay:
     def __init__(self, hub_dir: Path, peers: list[Peer], repo: str, branch: str,
                  mail_interval: float, pr_interval: float, dry_run: bool = False,
@@ -860,6 +1121,7 @@ class Relay:
         self.limit_interval = limit_interval
         # Off unless given: main() passes the configured value (#45).
         self.stall = StallWatch(self, stall_minutes)
+        self.exits = ExitWatch(self)     # #98
         # Limit rows already on screen when this relay started (e.g. the old tool's message above
         # the agent that replaced it): ignored until they leave the pane's tail.
         self.limit_baseline: dict[str, set[str]] = {}
@@ -2125,6 +2387,10 @@ class Relay:
                 next_limit = now() + self.limit_interval
                 texts = self.read_panes()
                 self.check_limits(texts)
+                try:
+                    self.exits.tick(texts)
+                except Exception as err:  # noqa: BLE001 - a watchdog bug must never stop the doorbell
+                    self.log(f"exit watch failed: {type(err).__name__}: {err}")
                 try:
                     self.stall.tick(texts)
                 except Exception as err:  # noqa: BLE001 - a watchdog bug must never stop the doorbell

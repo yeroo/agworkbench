@@ -171,6 +171,13 @@ def shell_prompt(rows: list[str]) -> bool:
     return bool(SHELL_GLYPH_RE.match(filled[-1]) and len(filled) >= 2 and SHELL_TIMING_RE.search(filled[-2]))
 
 
+def ps_prompt_last(text: str | None) -> bool:
+    """#98: the frame's last non-empty row is a bare pwsh prompt (`PS X:\\...> `, nothing typed after it).
+    Rows above it are not looked at: an agent that crashed leaves its whole frame there."""
+    filled = [row.rstrip() for row in (text or "").splitlines() if row.strip()]
+    return bool(filled) and bool(SHELL_PS_RE.match(filled[-1]))
+
+
 def _last_block(rows: list[str]) -> list[str]:
     while rows and not rows[-1].strip():
         rows = rows[:-1]
