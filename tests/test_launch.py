@@ -218,6 +218,10 @@ class CodexLaunch(unittest.TestCase):
         self.assertIn("sandbox_workspace_write.network_access=false", line)
         self.assertIn("sandbox_workspace_write.writable_roots=[]", line)
 
+    def test_the_status_line_is_off(self):
+        # a second footer row hides the composer from peerchat, which then refuses every ring
+        self.assertIn("-c tui.status_line=[]", self.composed())
+
     def test_network_opens_only_through_the_config_switch(self):
         self.assertIn("network_access=true", self.composed({"allowNetwork": True}))
 
