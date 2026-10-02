@@ -45,6 +45,24 @@ CODEX_UNSUBMITTED = r"""──────────────────�
   (AI_HUB=C:\Users\boris\source\workbench\docxy-issue-50\.workbench)
   gpt-6-astra high · ~\source\workbench\docxy-issue-50 · Wait for implementation plan"""
 
+# Codex 0.158 with no status line: a blank row above the footer, and a right-aligned
+# `% context left` footer instead of `? for shortcuts` while the composer holds text.
+CODEX_0158_IDLE = """• Waiting for mail.
+
+› Ask Codex to do anything
+
+  ? for shortcuts"""
+
+CODEX_0158_TEXT = (r"Chat from Claude: you have inbox mail from claude: demo P3 wip r1 [id "
+                   r"20260929T110054Z-claude-555c] - read it with: python C:\src\demo\lib\agmsg.py read "
+                   r"20260929T110054Z-claude-555c")
+
+CODEX_0158_TYPED = ("• Waiting for mail.\n\n"
+                    "› Chat from Claude: you have inbox mail from claude: demo P3 wip r1 [id\n"
+                    "  20260929T110054Z-claude-555c] - read it with: python C:\\src\\demo\\lib\\agmsg.py read\n"
+                    "  20260929T110054Z-claude-555c\n\n"
+                    + " " * 78 + "97% context left")
+
 
 TEXT = (r"Chat from Workbench: workbench mail from claude: plan v1 for #50 (step 1: "
         r"projcore::editor) [id 20260922T193916Z-claude-1528] - read it with: python C:\Users\boris\source\agworkbench\lib\agmsg.py "

@@ -81,6 +81,9 @@ CODEX_CONT_RE = re.compile(r"^ {2}\s*(\S.*?)\s*$")
 # Codex indents its footer rows by two spaces. Only the final row is stripped: a multi-row overlay
 # and an indented modal choice have the same shape, so the guard fails closed on both.
 FOOTER_RE = re.compile(r"^ {2}\S")
+# Once its composer holds text, Codex 0.158 replaces `? for shortcuts` with this row, pushed to the
+# right edge of the pane - far more than two spaces in.
+CONTEXT_FOOTER_RE = re.compile(r"^\s{2,}\d{1,3}% context left\s*$")
 # A highlighted chooser row - a permission prompt, a trust dialog, a picker. Kimi Code marks its
 # approval choice with `▶`.
 CHOOSER_RE = re.compile(r"^\s*[>❯›▶]\s+\d+\.\s+\S")
@@ -228,7 +231,7 @@ def trailing_block(text: str) -> list[str]:
     lines = text.splitlines()[-BOX_LINES:]
     while lines and not lines[-1].strip():
         lines.pop()
-    if lines and FOOTER_RE.match(lines[-1]):
+    if lines and (FOOTER_RE.match(lines[-1]) or CONTEXT_FOOTER_RE.match(lines[-1])):
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()

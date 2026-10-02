@@ -15,7 +15,7 @@ import agw
 import peerchat
 import relay
 from frames import (CLAUDE_IDLE, CLAUDE_RUNNING, CODEX_IDLE, CODEX_QUEUED, CODEX_UNSUBMITTED,
-                    CLAUDE_SUGGESTION, CLAUDE_WRAPPED_DRAFT, TEXT, Clock, FakeAgw, claude, codex, stable_frames)
+                    CODEX_0158_IDLE, CODEX_0158_TEXT, CODEX_0158_TYPED, CLAUDE_SUGGESTION, CLAUDE_WRAPPED_DRAFT, TEXT, Clock, FakeAgw, claude, codex, stable_frames)
 
 
 
@@ -174,6 +174,18 @@ class Submission(unittest.TestCase):
         with self.assertRaisesRegex(peerchat.Failed, 'pointer still unsent'):
             self.send(fake, content)
         self.assertEqual([content, '\t', '\t', '\t', '\n'], fake.keys)
+
+    def test_codex_0158_context_footer_does_not_hide_the_typed_pointer(self):
+        self.assertEqual('Ask Codex to do anything', peerchat.codex_composer(CODEX_0158_IDLE))
+        self.assertTrue(peerchat.owns(peerchat.codex_composer(CODEX_0158_TYPED), CODEX_0158_TEXT))
+        fake = FakeAgw(frames=stable_frames(CODEX_0158_IDLE, CODEX_0158_TYPED, CODEX_0158_IDLE))
+        self.assertEqual('submitted', self.send(fake, CODEX_0158_TEXT))
+        self.assertEqual([CODEX_0158_TEXT, '\t'], fake.keys)
+
+    def test_only_a_context_footer_is_stripped_at_the_right_edge(self):
+        for row in (' ' * 78 + '1. Yes', ' ' * 78 + '97% context left, 1. Yes'):
+            with self.subTest(row=row):
+                self.assertIsNone(peerchat.codex_composer(CODEX_0158_TYPED.rsplit('\n', 1)[0] + '\n' + row))
 
     def test_dialog_and_disappearance_after_submit_withhold_further_keys(self):
         for frame, reason in [(codex(TEXT) + '\n› 1. Yes', 'dialog'), ('─' * 50, 'disappeared')]:
