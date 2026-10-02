@@ -1397,6 +1397,15 @@ class CloseBackstop(unittest.TestCase):
         self.assertIn("cleared a stale relay pointer for m1 from codex's composer",
                       (self.state / 'relay-close.log').read_text(encoding='utf-8'))
 
+    def test_the_backstop_clears_rather_than_rings_implementer_mail_it_ignores(self):
+        # r1 m2: unread implementer mail the close does not wait for (here from a sender it does not
+        # count) is cleared once settled, never submitted by the faster rescue.
+        self.relay_gone()
+        self.pointer_in(self.IMPLEMENTER, 'codex', 'n1')
+        self.run_for(1000)
+        self.assertEqual([(self.IMPLEMENTER, '\x15')], self.keys)
+        self.assertIn(('close', self.PLANNER), self.actions)
+
     def test_the_backstop_submits_a_pointer_for_unread_planner_mail(self):
         self.relay_gone()
         self.pointer_in(self.PLANNER, 'claude', 'p1')

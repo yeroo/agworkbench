@@ -1776,7 +1776,7 @@ class Worker:
         attempt.step_helpers(gate=(lambda: attempt.issue_closed(self.gh)[0] is True) if pr is None else None)
         try:
             # #96: a pointer for mail still unread is submitted; one nobody needs to read is cleared.
-            attempt.rescue_pointers()
+            attempt.rescue_pointers(pr)
             attempt.clear_stale_pointers(pr)
         except Exception as err:  # noqa: BLE001 - the blockers below still decide
             attempt.log(f'pointer check failed: {type(err).__name__}: {err}')

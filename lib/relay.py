@@ -168,7 +168,6 @@ class Hold:
         return self.last_alert_at is not None
 
 
-pointer_text = closer.pointer_text   # the line typed into a pane; closer's, so the conductor builds the same (#96)
 
 
 def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -910,7 +909,8 @@ class Relay:
         self.rescue = closer.PointerRescue(
             self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
             pointer=lambda message: closer.relay_pointer(message, self.agmsg, self.hub_dir),
-            alert=lambda peer, mid, reason: self.hold(peer, mid, reason, failed=True), clock=lambda: now())
+            alert=lambda peer, mid, reason: self.alert(peer, mid, reason),
+            resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now())
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
@@ -1547,8 +1547,8 @@ class Relay:
                 close.log(f"helper check failed: {err}")
             try:
                 # #96: a pointer for mail still unread is submitted; one nobody needs to read is cleared.
-                self.rescue_pointers()
-                close.clear_stale_pointers(number)
+                self.rescue_pointers(skip=lambda peer, message: close.needs_no_reading(number, peer, message))
+                self.rung(close.clear_stale_pointers(number))
             except Exception as err:  # noqa: BLE001 - the blockers below still decide
                 close.log(f"pointer check failed: {type(err).__name__}: {err}")
             reasons = close.agent_blockers(number)
@@ -1649,20 +1649,36 @@ class Relay:
                 return None
         return None
 
-    def rescue_pointers(self) -> None:
-        """One pointer-rescue look at both panes (#96). A rescued mid is rung: announced (saved, so a
-        restart does not ring it again) and its hold cleared."""
+    def rescue_pointers(self, skip=None) -> None:
+        """One pointer-rescue look at both panes (#96). A rescued mid is rung (`rung`). `skip(peer,
+        message)` leaves a pointer alone: the close's mail that needs no reading."""
         if self.dry_run:
             return
-        rescued = self.rescue.step(self.read_panes())
-        if not rescued:
+        self.rung(self.rescue.step(self.read_panes(), skip=skip))
+
+    def rung(self, pointers) -> None:
+        """Count each (peer, mid) whose pointer is dealt with - rescued, or cleared by the close - as
+        rung: announced (saved, so neither deliver_mail nor a restart types it again), hold cleared."""
+        if not pointers:
             return
         announced = set(self.state.get("announced", []))
-        for peer, mid in rescued:
+        for peer, mid in pointers:
             announced.add(mid)
             self.clear(peer, mid)
         self.state["announced"] = sorted(announced)
         self._save()
+
+    def rescue_resolved(self, peer: Peer) -> None:
+        """The rescue's UNSUBMITTED alert for this pane is over: take its blocked status back, unless a
+        hold of ours still has it alerted (#96 r1 m1: the alert is the rescue's, not a hold's, so the
+        announced-mail sweep in deliver_mail cannot reset it while the pointer is still stuck)."""
+        import agw
+        if self.dry_run or any(box == peer.box and held.alerted for (box, _), held in self.holds.items()):
+            return
+        try:
+            agw.set_status('idle', pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not clear relay status for {peer.box}: {err}")
 
     def deliver_mail(self) -> None:
         import agw

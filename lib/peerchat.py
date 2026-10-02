@@ -548,12 +548,13 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
     )
 
 
-def verify_submitted(pane: str, profile: Profile, typed: str, *, retries: int | None = None,
+def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: int | None = None,
                      fallback: bool = True) -> str:
-    """Verify an empty composer; retry only the key, with a fresh guard before each press. `retries`
-    bounds the extra submit keys (SUBMIT_RETRIES by default) and `fallback` allows Codex's one Return after them; `resubmit`
-    turns both off so that one rescue attempt is exactly one key."""
-    limit = SUBMIT_RETRIES if retries is None else retries
+    """Verify an empty composer; retry only the key, with a fresh guard before each press.
+    `max_retries` bounds the extra submit keys (SUBMIT_RETRIES by default) and `fallback` allows
+    Codex's one Return after them; `resubmit` turns both off so that one rescue attempt is exactly
+    one key."""
+    limit = SUBMIT_RETRIES if max_retries is None else max_retries
     retries = 0
     returned = False
     suffix = ''
@@ -670,7 +671,7 @@ def resubmit(pane: str, profile: Profile, typed: str) -> str:
         pause(SETTLE)
     except (agw.CtlError, OSError) as err:
         raise Failed(f"submitting: {err}") from err
-    return verify_submitted(pane, profile, typed, retries=0, fallback=False)
+    return verify_submitted(pane, profile, typed, max_retries=0, fallback=False)
 
 
 def clear_pointer(pane: str, profile: Profile, typed: str) -> bool:

@@ -126,14 +126,14 @@ class Pointer(unittest.TestCase):
     def test_the_pointer_carries_the_id_and_the_read_command_but_never_the_body(self):
         message = {"id": "20260922T1-codex-ab12", "from": "codex", "subject": "IMPLEMENTED abc123",
                    "body": "a long body that must stay in the file"}
-        text = relay.pointer_text(message, Path("C:/wb/lib/agmsg.py"), Path("C:/clone/.workbench"))
+        text = closer.pointer_text(message, Path("C:/wb/lib/agmsg.py"), Path("C:/clone/.workbench"))
         self.assertIn("20260922T1-codex-ab12", text)
         self.assertIn("read 20260922T1-codex-ab12", text)
         self.assertNotIn("long body", text)
 
     def test_the_pointer_is_one_line(self):
         message = {"id": "x", "from": "github", "subject": "PR #7 is open"}
-        self.assertNotIn(chr(10), relay.pointer_text(message, Path("a"), Path("b")))
+        self.assertNotIn(chr(10), closer.pointer_text(message, Path("a"), Path("b")))
 
 
 HEAD_A, HEAD_B = 'a' * 40, 'b' * 40
@@ -471,7 +471,7 @@ class Delivery(DeliveryFixture):
     def test_post_submit_ambiguity_still_alerts_failure_immediately(self):
         self.claude_peer()
         pointer = peerchat.compose_text('Chat from Workbench: ',
-                                        relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
+                                        closer.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
         # The relay reads the first frame for busy state before peerchat's own precheck.
         fake = FakeAgw('claude', frames=[CLAUDE_IDLE] + stable_frames(CLAUDE_IDLE, claude(pointer), CLAUDE_SUGGESTION), cursors=[2])
         clock = Clock()
@@ -635,7 +635,7 @@ class Delivery(DeliveryFixture):
 
     def test_real_send_refuses_stuck_text_then_rerings_after_composer_empties(self):
         pointer = peerchat.compose_text('Chat from Workbench: ',
-                                        relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
+                                        closer.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
         fake = FakeAgw(after=lambda f: codex(pointer, 'Working (esc to interrupt)'))
         clock = Clock()
         self.send.side_effect = self.real_send
@@ -3988,6 +3988,34 @@ class PointerRescue(PointerRescueFixture):
         self.look(120 + relay.ALERT_EVERY)
         self.assertEqual(2, self.notify.call_count)
 
+    def blocked_then(self, end):
+        """r1 m1: three failed looks raise the rescue's own alert; deliver_mail's sweep of announced
+        mail must not take it back while the pointer is still stuck."""
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer
+        for step in range(4):
+            self.look(step * 30)
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id='codex-pane')
+        self.tick(121)
+        self.look(150)
+        self.tick(151)
+        self.assertNotIn(call('idle', pane_id='codex-pane'), self.status.call_args_list)
+        self.assertFalse(any(line.startswith('cleared hold') for line in self.logs))
+        end()
+        self.look(180)
+        self.status.assert_called_with('idle', pane_id='codex-pane')
+
+    def test_the_unsubmitted_alert_stands_until_the_pointer_is_rescued(self):
+        def takes():
+            self.takes = lambda keys: True
+        self.blocked_then(takes)
+        self.assertIn('rescued unsent pointer in codex for m1 [submitted]', self.logs)
+
+    def test_the_unsubmitted_alert_ends_when_the_pointer_is_gone(self):
+        def sent_by_hand():
+            self.typed = None
+        self.blocked_then(sent_by_hand)
+
     def test_an_announced_pointer_still_in_the_composer_is_rescued(self):
         self.r.state['announced'] = ['m1']
         self.typed = self.pointer
@@ -4131,8 +4159,29 @@ class StalePointers(unittest.TestCase):
         self.text[self.IMPLEMENTER] = claude(pointer)
         close = self.r.closer()
         self.settled(close)
-        close.clear_stale_pointers(7)
+        self.assertEqual([(self.r.peers[1], 'github-pr7-note-1-codex')], close.clear_stale_pointers(7))
         self.assertEqual([(self.IMPLEMENTER, peerchat.CLEAR_KEY)], self.keys)
+
+    def test_the_close_clears_ignored_mail_instead_of_ringing_it_and_never_retypes_it(self):
+        # r1 m2: the rescue's two looks come a mail interval apart, well inside CLOSE_SETTLE; it must
+        # leave mail the close ignores to the clear, and the cleared mid counts as rung.
+        mid = 'github-pr7-note-1-codex'
+        pointer = self.filed('codex', mid, sender='github')
+        self.text[self.IMPLEMENTER] = claude(pointer)
+        retyped = []
+
+        def ring(pane, profile, text, **kwargs):
+            if self.text[pane] == CLAUDE_IDLE:
+                retyped.append(text)
+                return 'submitted'
+            raise peerchat.Refused('composer holds a draft')
+        self.send.side_effect = ring
+        self.r.close_after_merge(7)
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertEqual([(self.IMPLEMENTER, peerchat.CLEAR_KEY)], self.keys)   # cleared, never submitted
+        self.assertEqual([], retyped)
+        self.assertIn(mid, self.r.state['announced'])
+        self.assertNotIn(('codex', mid), self.r.holds)
 
     def test_a_pointer_for_unread_planner_mail_is_submitted_not_cleared(self):
         pointer = self.filed('claude', 'p1', sender='codex')
