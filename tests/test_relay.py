@@ -4147,6 +4147,25 @@ class StalePointers(unittest.TestCase):
         self.assertFalse(any('composer' in reason for reason in close.agent_blockers(7)))
         self.assertIn("cleared a stale relay pointer for m1 from codex's composer", self.log())
 
+    def test_an_exited_agent_does_not_hold_the_close(self):
+        # #98 FIX r1 M3: a crashed Claude left its frame above the prompt; the exit watch does not restart
+        # it while the close is pending, so a blocker here would hold the close forever.
+        self.text[self.IMPLEMENTER] = claude('half a thought') + '\nPS C:\\repo-issue-7> '
+        close = self.r.closer()
+        self.settled(close)
+        self.assertEqual([], [reason for reason in close.agent_blockers(7) if reason.startswith('codex')])
+        self.r.close_after_merge(7)
+        self.assertIn(self.PLANNER, self.closes())
+
+    def test_a_pointer_above_a_shell_prompt_is_never_cleared(self):
+        # #98 FIX r1: a Ctrl+U into a dead pane would land on the pwsh command line.
+        pointer = self.filed('codex', 'm1', folder='read')
+        self.text[self.IMPLEMENTER] = claude(pointer) + '\nPS C:\\repo-issue-7> '
+        close = self.r.closer()
+        self.settled(close)
+        self.assertEqual([], close.clear_stale_pointers(7))
+        self.assertEqual([], self.keys)
+
     def test_the_close_loop_clears_it_end_to_end(self):
         pointer = self.filed('codex', 'm1', folder='read')
         self.text[self.IMPLEMENTER] = claude(pointer)

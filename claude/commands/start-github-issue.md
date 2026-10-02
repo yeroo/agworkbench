@@ -265,10 +265,10 @@ Once the agent's composer is up, it types one `Chat from Workbench:` pointer say
 Claude may therefore get a second, short "continue" turn after its own resume turn. You need to do
 nothing for a restart; mail held for the dead pane is rung once its agent is back.
 
-The relay restarts a pane at most 3 times an hour. When it gives up, or the pane has no pin, it mails
-you from `relay`, kind `exit` (only when the dead pane is the implementer's) and alerts the human.
-When it gives up it also writes waiting.json and, in queue mode, reports `loop-state blocked` with
-cause `environment`. Do not restart the agent yourself. Say in one line that the implementer keeps
+The relay restarts a pane at most 3 times an hour. When it gives up, or the pane has no pin, it
+notifies the human on your pane and, when the dead pane is the implementer's, mails you from
+`relay`, kind `exit`. Only giving up also sets the blocked sound status, writes waiting.json and,
+in queue mode, reports `loop-state blocked` with cause `environment`. Do not restart the agent yourself. Say in one line that the implementer keeps
 exiting, and leave it to the human. Once the human has restarted it with the pane's pinned command,
 run `wb.py status active` (plus `wb.py loop-state resumed` in queue mode). The human turns
 restarting off with `restartExited: false` in `~/.agworkbench.json`.

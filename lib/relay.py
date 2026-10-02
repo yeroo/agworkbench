@@ -74,14 +74,17 @@ Seven jobs, one loop, one process per issue, running in its own visible agwinter
    command (every pin resumes the conversation), and once the agent's composer is idle one resume
    pointer. At most EXIT_RESTARTS per pane per hour (kept in relay.json); the next exit alerts the
    human and reports the loop blocked (waiting.json, queue cause `environment`), with `exit` mail to
-   the planner when the implementer died. Never while `restartExited` is off, a launcher holds
+   the planner when the implementer died, and the pane is left alone until it runs an agent again.
+   An exited pane counts as idle (closer.idle_blockers): the close may close it, and the stall
+   pointer names it when the exit watch may not restart it. Never while `restartExited` is off, a launcher holds
    launch.lock, the loop is done or closing, or a usage limit owns the pane (the episode, or
    implementer.json recording the tool limited or naming another tool).
 
 Nothing here polls on behalf of an agent: agents are woken by the relay and otherwise idle. The
-relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits and
-stalls), and for stalls also the terminal's session tree and `git rev-parse HEAD`, none of which
-can push to it.
+relay itself polls the mailbox directory, the GitHub API, the two agent panes (for limits, exited
+agents and stalls), the terminal's session tree (for exited agents on every limit interval, even
+with the stall watch off, and for stalls), and for stalls `git rev-parse HEAD`, none of which can
+push to it.
 
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
@@ -813,6 +816,9 @@ class StallWatch:
                 f"composer, {mail}, no running helper, no PR open for review or CI",
                 "running, no usage-limit episode, and the loop neither done nor waiting on the human.", ""]
         notes = [f"unread mail {entry} is held for the implementer at its usage limit" for entry in held] + quiet
+        # #98: an exited agent counts as idle; the exit watch restarts it unless it may not (its log says why).
+        notes += [f"{peer.box} is at a shell prompt (its agent exited)" for peer in self.relay.peers
+                  if isinstance(texts.get(peer.box), str) and limits.ps_prompt_last(texts[peer.box])]
         if self.ci_stuck:
             notes.append(f"{self.ci_stuck} - look at the checks; a runner or an external CI may be down")
         body += [f"- {line}" for line in notes] + ([""] if notes else [])
@@ -1006,20 +1012,27 @@ class ExitWatch:
         if why:
             self.once(episode, f"not restarting {label}: {why}")
             return
+        if "budget" in episode["notes"]:
+            # The relay gave up on this episode and told the human so: only the pane seen running an
+            # agent again (a new episode) brings the budget back into play.
+            return
+        recent = self.recent(peer.box)
+        if self.relay.dry_run:
+            # A dry run reads the live relay.json: it alerts nobody and records nothing.
+            what = (f"alert (no pinned restore command for {label})" if not pin
+                    else f"give up on {label} ({len(recent)} restarts in the last hour)" if len(recent) >= EXIT_RESTARTS
+                    else f"restart {label}: {pin}")
+            self.once(episode, f"[dry-run] would {what}")
+            return
         if not pin:
             if "no pin" not in episode["notes"]:
                 episode["notes"].add("no pin")
                 self.alert(peer, f"agent exited and its pane has no pinned restore command: {label}, pane {peer.pane}",
-                           "Restart the agent in that pane by hand, then run `wb.py status active`.")
+                           "tell the human; they restart the agent in that pane by hand.")
             return
-        recent = self.recent(peer.box)
         if len(recent) >= EXIT_RESTARTS:
-            if "budget" not in episode["notes"]:
-                episode["notes"].add("budget")
-                self.give_up(peer, len(recent))
-            return
-        if self.relay.dry_run:
-            self.once(episode, f"[dry-run] would restart {label}: {pin}")
+            episode["notes"].add("budget")
+            self.give_up(peer, len(recent))
             return
         try:
             agw.type_into(peer.pane, pin + "\n")
@@ -1046,7 +1059,8 @@ class ExitWatch:
             self.relay.log(f"exit watch: dropped the resume pointer for {peer.box}: no idle composer "
                            f"in {RESTART_POINTER_MINUTES:g} min")
             return
-        if closer.idle_blockers(peer, text):
+        # idle_blockers calls a shell prompt idle (no agent to wait for), but there is no composer there.
+        if limits.ps_prompt_last(text) or closer.idle_blockers(peer, text):
             return
         try:
             outcome = peerchat.send(peer.pane, peerchat.PROFILES[peer.tool],
@@ -1084,8 +1098,8 @@ class ExitWatch:
         """EXIT_RESTARTS restarts in the last hour and it exited again: the loop is blocked on the human."""
         summary = (f"agent exited {count + 1} times in an hour: {peer.box} ({peer.tool}); "
                    "the relay does not restart it again")
-        self.alert(peer, summary, "look at the pane (a crashing tool, a broken checkout, a bad pin). Once it is "
-                   "fixed, restart the agent with the pane's pinned command and run `wb.py status active`.",
+        self.alert(peer, summary, "leave it to the human: they look at the pane (a crashing tool, a broken checkout, "
+                   "a bad pin) and restart the agent with the pane's pinned command; then run `wb.py status active`.",
                    blocked=True)
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)

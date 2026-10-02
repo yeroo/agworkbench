@@ -308,11 +308,12 @@ class NotTouched(ExitFixture):
 
 class Guards(ExitFixture):
     def guarded(self, reason, minutes=10):
+        restarts = self.r.state.get('restarts')
         self.exit()
         self.run_until(minutes)
         self.assertEqual([], self.typed.call_args_list)
         self.assertEqual(1, len(self.logged(reason)), self.logs)
-        self.assertNotIn('restarts', self.r.state)
+        self.assertEqual(restarts, self.r.state.get('restarts'))
 
     def test_restart_exited_off(self):
         for text in ('{"restartExited": false}', '{"RestartExited": 0}', '{"restartExited": true, "RESTARTEXITED": false}'):
@@ -373,6 +374,30 @@ class Guards(ExitFixture):
         self.r = self.make_relay(dry_run=True)
         self.guarded('[dry-run] would restart codex (kimi)')
 
+    def assert_no_alert(self):
+        self.notify.assert_not_called()
+        self.status.assert_not_called()
+        self.assertEqual([], self.exit_mail())
+        self.assertFalse((self.hub_dir / 'state' / 'waiting.json').exists())
+        self.assertFalse((self.hub_dir / 'state' / 'loop.json').exists())
+
+    def test_dry_run_with_no_pin_alerts_nobody(self):
+        # FIX r1 M1
+        self.r = self.make_relay(dry_run=True)
+        del self.session['restoreCommands'][IMPLEMENTER]
+        self.guarded('[dry-run] would alert (no pinned restore command for codex (kimi))')
+        self.assert_no_alert()
+
+    def test_dry_run_with_the_budget_spent_gives_up_on_nothing(self):
+        # FIX r1 M1: a dry run reading a live relay.json must not block the real loop.
+        self.write('queue-member.json', {'queue': str(self.folder / 'queue.json'), 'repo': 'o/repo', 'number': 7})
+        self.write('claude.json', {'sessionId': str(uuid.uuid4())})
+        (self.hub_dir / 'state' / 'relay.json').write_text(json.dumps(
+            {'restarts': {'codex': [1_000_000 + 0.0, 1_000_000 + 60.0, 1_000_000 + 120.0]}}), encoding='utf-8')
+        self.r = self.make_relay(dry_run=True)
+        self.guarded('[dry-run] would give up on codex (kimi) (3 restarts in the last hour)')
+        self.assert_no_alert()
+
     def test_guard_lifting_lets_the_restart_happen(self):
         self.write('loop-done.json', {'pr': 7})
         self.exit()
@@ -425,10 +450,23 @@ class Alerts(ExitFixture):
         self.assertEqual(1, len(mails))
         self.assertEqual(('relay', 'exit'), (mails[0]['from'], mails[0]['kind']))
         self.assertFalse((self.hub_dir / 'state' / 'loop.json').exists())
-        # An hour after the first restart the oldest one leaves the window.
-        self.run_until(63, start=40.5)
+        # FIX r1 M2: giving up is final for the episode, also once the oldest restart leaves the hour.
+        self.run_until(90, start=40.5)
+        self.assertEqual(3, len(self.restarts()))
+        self.assertEqual(1, len(self.logged('exited 4 times')))
+
+    def test_a_new_episode_after_the_hour_restarts_again(self):
+        for start in (0, 10, 20):
+            self.cycle(start)
+        self.exit()
+        self.run_until(40, start=30)
+        self.assertEqual(3, len(self.restarts()))
+        self.agent(IMPLEMENTER, KIMI_IDLE)                           # the human restarted it
+        self.run_until(41, start=40.5)
+        self.exit()
+        self.run_until(70, start=60)                                 # the restart at minute 2 left the hour at 62
         self.assertEqual(4, len(self.restarts()))
-        self.assertEqual(2, len(self.logged('attempt 3/3')))          # the 3rd, then the 4th in the new hour
+        self.assertEqual(2, len(self.logged('attempt 3/3')))
 
     def test_budget_survives_a_relay_restart(self):
         for start in (0, 10, 20):
@@ -469,6 +507,17 @@ class Alerts(ExitFixture):
 
 
 class Pointer(ExitFixture):
+    def test_no_pointer_into_a_shell(self):
+        # FIX r1 M3: idle_blockers calls a shell idle; the pointer still needs a composer.
+        self.exit()
+        self.run_until(2)
+        self.exit(text=at_prompt(KIMI_IDLE), shell=None)              # not exited by the tree's account
+        self.run_until(5, start=2.5)
+        self.send.assert_not_called()
+        self.agent(IMPLEMENTER, KIMI_IDLE)
+        self.tick(5.5)
+        self.send.assert_called_once()
+
     def test_pointer_deadline(self):
         self.exit()
         self.run_until(2)
@@ -492,11 +541,13 @@ class Pointer(ExitFixture):
 
 
 class IdleBlockers(unittest.TestCase):
-    def test_a_shell_prompt_reads_as_an_exited_agent(self):
-        for tool, frame in (('claude', at_prompt(CLAUDE_IDLE)), ('codex', at_prompt()), ('kimi', at_prompt(KIMI_IDLE))):
-            with self.subTest(tool=tool):
-                self.assertEqual(['codex is at a shell prompt (its agent exited)'],
-                                 closer.idle_blockers(relay.Peer('codex', tool, IMPLEMENTER), frame))
+    def test_a_shell_prompt_is_idle(self):
+        # FIX r1 M3: no agent is left to be busy or to hold a draft, whatever frame the crash left above.
+        for tool, frame in (('claude', at_prompt(CLAUDE_IDLE)), ('claude', at_prompt(CLAUDE_RUNNING)),
+                            ('codex', at_prompt()), ('kimi', at_prompt(KIMI_IDLE)),
+                            ('kimi', at_prompt(fixture('kimi/draft-wrapped.txt')))):
+            with self.subTest(tool=tool, frame=frame[-80:]):
+                self.assertEqual([], closer.idle_blockers(relay.Peer('codex', tool, IMPLEMENTER), frame))
 
     def test_an_idle_agent_is_still_idle(self):
         self.assertEqual([], closer.idle_blockers(relay.Peer('claude', 'claude', PLANNER), CLAUDE_IDLE))
