@@ -60,9 +60,12 @@ RETRY_DELAY = 10.0
 SETTLE = 0.35            # let the TUI redraw before reading it back
 VERIFY_TIMEOUT = 3.0
 SUBMIT_TIMEOUT = 5.0
-SUBMIT_RETRIES = 2
+SUBMIT_RETRIES = 3
 MAX_TYPED = 1200         # longer than this belongs in the inbox, not in a composer
 FRAGMENT = 24            # how much of the typed text must be visible before submitting
+CLEAR_KEY = "\x15"       # Ctrl+U: delete to the start of the line; inert on an empty one
+CLEAR_PRESSES = 3
+POINTER_ID_RE = re.compile(r"\[id\s+([^\]\s]+)\]")
 QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
 CLAUDE_BUSY_RE = re.compile(r"…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·")
 
@@ -187,15 +190,21 @@ def owns(content: str, typed: str) -> bool:
         return False
     if visible == attempted:
         return True
-    marker = re.search(r"\[id\s+([^\]\s]+)\]", typed)
+    marker = POINTER_ID_RE.search(typed)
     if marker:
         return compact(marker.group(0)) in visible
     return len(visible) * 2 >= len(attempted)
 
 
+def pointer_id(content: str | None) -> str | None:
+    """The message id of a relay pointer (`[id X]`) in composer content; None without a whole one."""
+    found = POINTER_ID_RE.search(content or "")
+    return found.group(1) if found else None
+
+
 def queued_for(text: str, typed: str) -> bool:
     """Recognize this pointer in a queue entry, including its complete message id."""
-    mid = re.search(r"\[id\s+([^\]\s]+)\]", typed)
+    mid = POINTER_ID_RE.search(typed)
     if not mid:
         return False
     entries: list[str] = []
@@ -539,8 +548,12 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
     )
 
 
-def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
-    """Verify an empty composer; retry only the key, with a fresh guard before each press."""
+def verify_submitted(pane: str, profile: Profile, typed: str, *, retries: int | None = None,
+                     fallback: bool = True) -> str:
+    """Verify an empty composer; retry only the key, with a fresh guard before each press. `retries`
+    bounds the extra submit keys (SUBMIT_RETRIES by default) and `fallback` allows Codex's one Return after them; `resubmit`
+    turns both off so that one rescue attempt is exactly one key."""
+    limit = SUBMIT_RETRIES if retries is None else retries
     retries = 0
     returned = False
     suffix = ''
@@ -576,12 +589,12 @@ def verify_submitted(pane: str, profile: Profile, typed: str) -> str:
             elif not owns(content, typed):
                 raise Failed(f"composer holds something other than the attempted pointer: {content!r}; further keys withheld")
             elif needs_key:
-                if retries < SUBMIT_RETRIES:
+                if retries < limit:
                     retries += 1
                     key = profile.submit
                     phase = f'retry {retries}'
                     suffix = f' after retry {retries}'
-                elif (profile.tool == 'codex' and not returned and not any(
+                elif (fallback and profile.tool == 'codex' and not returned and not any(
                         is_busy(snapshot) or 'esc to interrupt' in snapshot.lower()
                         or 'queued follow-up inputs' in snapshot.lower() for snapshot in (frame, fresh))):
                     key = '\n'
@@ -626,6 +639,67 @@ def send_once(pane: str, profile: Profile, text: str, *, dry_run: bool) -> str:
         return verify_submitted(pane, profile, text)
     except (agw.CtlError, OSError) as err:
         raise Failed(f"{phase}: {err}") from err
+
+
+def resubmit(pane: str, profile: Profile, typed: str) -> str:
+    """Press the submit key once more for a pointer that is still in the composer, then verify it.
+
+    For a later rescue (#96), not for `send`: the caller has already seen the pointer sit there. The
+    pane is read afresh here, and nothing is pressed unless the composer provably holds this pointer
+    and nothing else, with no dialog on screen. Busy is the caller's check. One key, no retries: the
+    caller counts attempts across ticks.
+    """
+    text = agw.pane_text(pane)
+    if dialog_visible(text):
+        raise Refused("a chooser or approval dialog is on screen in the target pane")
+    content, state, _ = composer_state(pane, profile, text)
+    if state == 'dialog':
+        raise Refused('a chooser or approval dialog appeared while checking the target composer')
+    if state == 'changing':
+        raise Refused('the target composer changed while checking it; not submitting')
+    if content is None:
+        raise Refused(f"no {profile.display} composer visible in the target pane")
+    if state == 'empty':
+        raise Refused('the composer is already empty')
+    if state == 'ambiguous':
+        raise AmbiguousComposer(content)
+    if not owns(content, typed):
+        raise Refused(f"the composer holds something other than the pointer: {content[:60]!r}")
+    try:
+        agw.type_into(pane, profile.submit)
+        pause(SETTLE)
+    except (agw.CtlError, OSError) as err:
+        raise Failed(f"submitting: {err}") from err
+    return verify_submitted(pane, profile, typed, retries=0, fallback=False)
+
+
+def clear_pointer(pane: str, profile: Profile, typed: str) -> bool:
+    """Delete a stale pointer from the composer with Ctrl+U, re-reading before each press (#96).
+
+    The first press needs a composer that `owns` the pointer; later ones accept what is left of it
+    (a part of the pointer, which our own press made). True once the composer looks empty, False
+    after CLEAR_PRESSES presses. Refused, with nothing (more) pressed, on anything else.
+    """
+    pressed = 0
+    while True:
+        text = agw.pane_text(pane)
+        if dialog_visible(text):
+            raise Refused("a chooser or approval dialog is on screen in the target pane")
+        content, state, _ = composer_state(pane, profile, text)
+        if content is not None and state == 'empty':
+            return True
+        if pressed >= CLEAR_PRESSES:
+            return False
+        if state in ('dialog', 'changing') or content is None:
+            raise Refused(f"the composer cannot be read safely ({state}); not clearing")
+        if state == 'ambiguous' and not pressed:
+            raise AmbiguousComposer(content)
+        mine = owns(content, typed) if not pressed else compact(content) in compact(typed)
+        if not mine:
+            raise Refused(f"the composer holds something other than the pointer: {content[:60]!r}")
+        agw.type_into(pane, CLEAR_KEY)
+        pressed += 1
+        pause(SETTLE)
 
 
 def send(pane: str, profile: Profile, text: str, *, dry_run: bool, retry: bool) -> str:

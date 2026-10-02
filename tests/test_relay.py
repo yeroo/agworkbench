@@ -638,13 +638,13 @@ class Delivery(DeliveryFixture):
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
             self.tick(0)
             self.assert_unannounced()
-            self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
+            self.assertEqual([pointer] + ['\t'] * 4, fake.keys)
             self.tick(5)
-            self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
+            self.assertEqual([pointer] + ['\t'] * 4, fake.keys)
             self.assertEqual(1, self.notify.call_count)
             fake.frames = stable_frames(CODEX_IDLE, codex(pointer), CODEX_IDLE)
             self.tick(10)
-        self.assertEqual([pointer, '\t', '\t', '\t', pointer, '\t'], fake.keys)
+        self.assertEqual([pointer] + ['\t'] * 4 + [pointer, '\t'], fake.keys)
         self.assertEqual(['m1'], self.r.state['announced'])
         self.status.assert_called_with('idle', pane_id=self.peer.pane)
 
