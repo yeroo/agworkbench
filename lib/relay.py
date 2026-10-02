@@ -75,7 +75,14 @@ can push to it.
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
 refusal before typing is retried on the next tick. Submit keys are verified and retried by
-peerchat; a failed ring is announced only after a later send succeeds from an empty composer.
+peerchat; a failed ring is announced only after a later send succeeds from an empty composer, or
+after the pointer rescue (#96) submits it. Every `--limit-interval` seconds, watching and draining,
+and on every pass of the autonomous close, the relay looks for its own pointer still sitting in an
+idle composer (the exact text it types, for mail still unread, seen the same on two looks) and
+presses the submit key once more - one key per look, never text. After 3 attempts it logs
+`UNSUBMITTED` and alerts. In the autonomous close a pointer whose mail no longer needs reading is
+cleared with Ctrl+U instead (`closer.Closer.clear_stale_pointers`). Stall pointers and the
+usage-limit probe carry no `[id X]` and are not rescued.
 """
 
 from __future__ import annotations
@@ -161,13 +168,6 @@ class Hold:
         return self.last_alert_at is not None
 
 
-def pointer_text(message: dict[str, Any], agmsg: Path, hub_dir: Path) -> str:
-    """The single line typed into a pane. Never the body - that stays in the file."""
-    sender = message.get("from", "?")
-    subject = message.get("subject", "")
-    mid = message.get("id", "")
-    return (f"workbench mail from {sender}: {subject} [id {mid}] - read it with: "
-            f"python {agmsg} read {mid}  (AI_HUB={hub_dir})")
 
 
 def pr_events(old: dict[str, Any] | None, new: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -905,6 +905,12 @@ class Relay:
             self._save()
         self.agmsg = HERE / "agmsg.py"
         self.holds: dict[tuple[str, str], Hold] = {}
+        # #96: a pointer left typed-but-unsent in a composer gets submitted on a later look.
+        self.rescue = closer.PointerRescue(
+            self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
+            pointer=lambda message: closer.relay_pointer(message, self.agmsg, self.hub_dir),
+            alert=lambda peer, mid, reason: self.alert(peer, mid, reason),
+            resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now())
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
@@ -1539,6 +1545,12 @@ class Relay:
                     gate=(lambda: close.issue_closed(gh_call)[0] is True) if number is None else None)
             except (agw.CtlError, OSError) as err:
                 close.log(f"helper check failed: {err}")
+            try:
+                # #96: a pointer for mail still unread is submitted; one nobody needs to read is cleared.
+                self.rescue_pointers(skip=lambda peer, message: close.needs_no_reading(number, peer, message))
+                self.rung(close.clear_stale_pointers(number))
+            except Exception as err:  # noqa: BLE001 - the blockers below still decide
+                close.log(f"pointer check failed: {type(err).__name__}: {err}")
             reasons = close.agent_blockers(number)
             if not reasons or close.overdue_ok():
                 if number is None:
@@ -1626,6 +1638,48 @@ class Relay:
             return None
         return mine, own
 
+    def unread_message(self, box: str, mid: str) -> dict[str, Any] | None:
+        """One unread message of a box by id, parsed; None when it is not unread (any more)."""
+        for path in self.hub.unread(box):
+            if path.stem != mid:
+                continue
+            try:
+                return self.hub.parse_message(path)
+            except (FileNotFoundError, ValueError):
+                return None
+        return None
+
+    def rescue_pointers(self, skip=None) -> None:
+        """One pointer-rescue look at both panes (#96). A rescued mid is rung (`rung`). `skip(peer,
+        message)` leaves a pointer alone: the close's mail that needs no reading."""
+        if self.dry_run:
+            return
+        self.rung(self.rescue.step(self.read_panes(), skip=skip))
+
+    def rung(self, pointers) -> None:
+        """Count each (peer, mid) whose pointer is dealt with - rescued, or cleared by the close - as
+        rung: announced (saved, so neither deliver_mail nor a restart types it again), hold cleared."""
+        if not pointers:
+            return
+        announced = set(self.state.get("announced", []))
+        for peer, mid in pointers:
+            announced.add(mid)
+            self.clear(peer, mid)
+        self.state["announced"] = sorted(announced)
+        self._save()
+
+    def rescue_resolved(self, peer: Peer) -> None:
+        """The rescue's UNSUBMITTED alert for this pane is over: take its blocked status back, unless a
+        hold of ours still has it alerted (#96 r1 m1: the alert is the rescue's, not a hold's, so the
+        announced-mail sweep in deliver_mail cannot reset it while the pointer is still stuck)."""
+        import agw
+        if self.dry_run or any(box == peer.box and held.alerted for (box, _), held in self.holds.items()):
+            return
+        try:
+            agw.set_status('idle', pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not clear relay status for {peer.box}: {err}")
+
     def deliver_mail(self) -> None:
         import agw
         import peerchat
@@ -1660,8 +1714,7 @@ class Relay:
                     # Claude and Kimi take Return, which would land in a running turn: ring between turns.
                     if peer.tool in ("claude", "kimi") and is_busy(agw.pane_text(peer.pane)):
                         raise peerchat.Refused('mid-turn; waiting for the agent to finish')
-                    text = peerchat.compose_text("Chat from Workbench: ",
-                                                 pointer_text(message, self.agmsg, self.hub_dir))
+                    text = closer.relay_pointer(message, self.agmsg, self.hub_dir)
                     if self.dry_run:
                         self.log(f"[dry-run] would ring {peer.box}: {text}")
                         continue
@@ -2060,6 +2113,7 @@ class Relay:
                 return 0
         next_limit = 0.0
         next_sweep = 0.0
+        next_rescue = 0.0
         next_no_pr = 0.0
         while True:
             if self.stop_file.exists():
@@ -2082,6 +2136,13 @@ class Relay:
                     self.sweep_helpers()
                 except Exception as err:  # noqa: BLE001 - a sweep bug must never stop the doorbell
                     self.log(f"helper close failed: {type(err).__name__}: {err}")
+            if now() >= next_rescue:
+                # Watching and draining alike (#96): a late pointer is rung while the drain runs.
+                next_rescue = now() + self.limit_interval
+                try:
+                    self.rescue_pointers()
+                except Exception as err:  # noqa: BLE001 - a rescue bug must never stop the doorbell
+                    self.log(f"pointer rescue failed: {type(err).__name__}: {err}")
             self.deliver_mail()
             if drain_deadline is not None:
                 pending = self.pending_terminal_mail()

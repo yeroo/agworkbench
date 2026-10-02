@@ -22,7 +22,9 @@ delivering mail, and the conductor can advance one check per tick without blocki
 - The issue session (exactly the two agent panes) closes only when the planner recorded
   `loop-state done` for this PR or a `done --no-pr` record for this issue, no mail is unread,
   no .git/index.lock exists, and both agent panes
-  are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds.
+  are idle with a provably empty composer and unchanged for CLOSE_SETTLE seconds. Before each look a
+  relay pointer left in a composer is dealt with (#96): one for mail still unread is submitted
+  (`PointerRescue`), one whose mail needs no reading is cleared with Ctrl+U (`clear_stale_pointers`).
 - Finished helpers close early, on every loop (#84): the relay runs `step_finished_helpers` on its own
   timer, outside the autonomous close and whatever `autonomous` says. Its trigger is the result mail:
   a revmux or suite helper closes on the first look after the mail its completion marker names
@@ -57,6 +59,10 @@ NO_PR = 'no-pr'
 # The helper sessions wb.py opens, after the `#N `: a revmux round, the human's revdiff, a suite (#45).
 HELPER_NAMES = r'revmux r\d+|your review|suite [A-Za-z0-9._-]+'
 MAIL_ID_RE = re.compile(r'[A-Za-z0-9._-]+')
+AGMSG = Path(__file__).resolve().parent / 'agmsg.py'   # the path every relay pointer names
+POINTER_LABEL = "Chat from Workbench: "   # what every relay pointer starts with
+RESCUE_ATTEMPTS = 3      # rescue submits of one pointer before it is reported UNSUBMITTED (#96)
+ALERT_EVERY = 300.0      # between two alerts about the same unsubmitted pointer
 
 
 def parse_time(value) -> datetime | None:
@@ -113,6 +119,131 @@ def helper_untouched(marker_rows: list[str], current_rows: list[str]) -> bool:
     return bool(marker_rows) and current_rows == marker_rows
 
 
+# --- relay pointers left in a composer (#96) ----------------------------------------------------
+
+def pointer_text(message: dict, agmsg: Path, hub_dir: Path) -> str:
+    """The single line typed into a pane. Never the body - that stays in the file."""
+    sender = message.get("from", "?")
+    subject = message.get("subject", "")
+    mid = message.get("id", "")
+    return (f"workbench mail from {sender}: {subject} [id {mid}] - read it with: "
+            f"python {agmsg} read {mid}  (AI_HUB={hub_dir})")
+
+
+def relay_pointer(message: dict, agmsg: Path, hub_dir: Path) -> str:
+    """Exactly what the relay types for this message, label included."""
+    import peerchat
+    return peerchat.compose_text(POINTER_LABEL, pointer_text(message, agmsg, hub_dir))
+
+
+def mail_file(hub_dir: Path, box: str, mid: str) -> tuple[Path, bool] | None:
+    """(path, unread) of one message in a box - the inbox, then read/, then archive/ - else None."""
+    if not MAIL_ID_RE.fullmatch(box or '') or not MAIL_ID_RE.fullmatch(mid or ''):
+        return None
+    for folder, unread in (('', True), ('read', False), ('archive', False)):
+        path = Path(hub_dir) / 'inbox' / box / folder / f'{mid}.md'
+        if path.is_file():
+            return path, unread
+    return None
+
+
+def agent_busy(peer, text: str) -> bool:
+    """A turn is running in this agent pane: the busy half of `idle_blockers`, shared with the pointer
+    rescue so the two can never disagree about it."""
+    import peerchat
+    return peerchat.is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:]))
+
+
+class PointerRescue:
+    """Submit a relay pointer that is still sitting in an idle composer (#96).
+
+    peerchat verifies a ring's submit inside one send; once that returns, wrongly or after its retries
+    ran out, nothing looks again, and the pointer can sit typed-but-unsent until a human presses
+    Enter. Each `step(texts)` looks at every agent pane: a composer whose content `owns` the exact
+    pointer the relay types for mail still UNREAD in that box, seen the same on two consecutive steps
+    (never racing a send or the agent itself), on an idle pane with no dialog, gets one more submit
+    key through `peerchat.resubmit`. Each attempt that does not submit counts; from RESCUE_ATTEMPTS on
+    it logs UNSUBMITTED and alerts (at most every ALERT_EVERY seconds per pointer). The alert is the
+    rescue's own: once that pointer is rescued, or is no longer in a composer it looked at, it calls
+    `resolved(peer, mid)` so the caller can take the alert back. Only ever the submit key, one per
+    pointer per step, never text. The counts live in memory; a restart starts them over. The relay
+    runs it on its own clock, watching and draining, and in its close loop; the conductor's close
+    backstop runs it through `Closer.rescue_pointers`. In the close, `skip` leaves alone the mail the
+    close does not wait for: `Closer.clear_stale_pointers` clears those pointers instead.
+    """
+
+    def __init__(self, peers, *, unread_message: Callable[[str, str], dict | None], pointer: Callable[[dict], str],
+                 log: Callable[[str], None], alert: Callable[[object, str, str], None],
+                 resolved: Callable[[object, str], None] | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        self.peers = peers
+        self.unread_message = unread_message
+        self.pointer = pointer
+        self.log = log
+        self.alert = alert
+        self.resolved = resolved
+        self.clock = clock
+        self.last: dict[str, tuple[str, str]] = {}            # box -> (mid, content) seen on the last step
+        self.attempts: dict[tuple[str, str], int] = {}
+        self.alerted: dict[tuple[str, str], float] = {}
+
+    def step(self, texts: dict, skip: Callable[[object, dict], bool] | None = None) -> list[tuple[object, str]]:
+        """One look at every pane; returns (peer, mid) for each pointer it got submitted. `skip(peer,
+        message)` true leaves that pointer alone."""
+        import peerchat
+        rescued = []
+        seen: dict[str, tuple[str, str]] = {}
+        looked: set[str] = set()
+        for peer in self.peers:
+            text = texts.get(peer.box)
+            if not isinstance(text, str) or peer.tool not in peerchat.PROFILES:
+                continue
+            looked.add(peer.box)
+            if agent_busy(peer, text) or peerchat.dialog_visible(text):
+                continue
+            content = peerchat.composer_content(peer.tool, text)
+            mid = peerchat.pointer_id(content)
+            message = self.unread_message(peer.box, mid) if mid else None
+            if message is None or (skip is not None and skip(peer, message)):
+                continue
+            typed = self.pointer(message)
+            if not peerchat.owns(content, typed):
+                continue
+            seen[peer.box] = (mid, content)
+            if self.last.get(peer.box) != (mid, content):
+                continue
+            key = (peer.box, mid)
+            try:
+                outcome = peerchat.resubmit(peer.pane, peerchat.PROFILES[peer.tool], typed)
+            except (peerchat.Refused, peerchat.Failed, agw.CtlError, OSError) as err:
+                count = self.attempts[key] = self.attempts.get(key, 0) + 1
+                if count < RESCUE_ATTEMPTS:
+                    self.log(f"unsent pointer in {peer.box} for {mid}: rescue attempt {count} did not submit: {err}")
+                    continue
+                self.log(f"UNSUBMITTED pointer for {mid} in {peer.box}: {err}")
+                last = self.alerted.get(key)
+                if last is None or self.clock() - last >= ALERT_EVERY:
+                    self.alerted[key] = self.clock()
+                    self.alert(peer, mid, f"pointer typed but not submitted after {count} attempts: {err}")
+                continue
+            seen.pop(peer.box)
+            self.forget(peer, mid)
+            self.log(f"rescued unsent pointer in {peer.box} for {mid} [{outcome}]")
+            rescued.append((peer, mid))
+        for box, mid in list(self.attempts):
+            if box in looked and seen.get(box, (None,))[0] != mid:
+                # Gone from the composer it was stuck in: sent by hand, read, cleared or replaced.
+                self.forget(next(peer for peer in self.peers if peer.box == box), mid)
+        self.last = seen
+        return rescued
+
+    def forget(self, peer, mid: str) -> None:
+        key = (peer.box, mid)
+        self.attempts.pop(key, None)
+        if self.alerted.pop(key, None) is not None and self.resolved is not None:
+            self.resolved(peer, mid)
+
+
 class Closer:
     def __init__(self, hub_dir: Path, repo: str, issue: str | int | None, peers, *, log: Callable[[str], None],
                  clock: Callable[[], float] = time.monotonic, dry_run: bool = False, workspace: str | None = None):
@@ -129,6 +260,7 @@ class Closer:
         self.decided: dict[str, str] = {}       # helper session id -> last logged decision
         self.hard: list[str] = []               # the last agent_blockers(): what a timeout never overrides
         self.soft: list[str] = []               # ... and the unread implementer mail ids it does (#44)
+        self.rescue: PointerRescue | None = None  # the conductor's pointer rescue (#96), made on first use
         self.deadline = clock() + CLOSE_WAIT
 
     # --- logging and settings ------------------------------------------------------------------
@@ -406,12 +538,9 @@ class Closer:
                 message = hub.parse_message(path)
             except (OSError, ValueError):
                 message = {}
-            sender = message.get('from')
-            if sender not in (None, 'claude', 'human', 'github'):
+            if message.get('from') not in (None, 'claude', 'human', 'github'):
                 continue
-            created = parse_time(message.get('created'))
-            if ((number is not None and sender == 'github' and path.stem.startswith(f'github-pr{number}-'))
-                    or (merged_at is not None and created is not None and created >= merged_at)):
+            if self.ignored_implementer_mail(number, path.stem, message, merged_at):
                 # The relay's final PR notice, or mail after the merge/no-PR done time: no action needed.
                 ignored.append(path.stem)
                 continue
@@ -434,6 +563,133 @@ class Closer:
         self.hard, self.soft = hard, soft
         return hard + [f'the implementer has not read {mid}' for mid in soft]
 
+    @staticmethod
+    def ignored_implementer_mail(number: int | None, stem: str, message: dict, merged_at: datetime | None) -> bool:
+        """Implementer mail the close does not wait for (#44): from a sender it does not count (a helper),
+        the relay's final notice for this PR, or anything created at or after the merge/no-PR done time."""
+        sender = message.get('from')
+        if sender not in (None, 'claude', 'human', 'github'):
+            return True
+        created = parse_time(message.get('created'))
+        return ((number is not None and sender == 'github' and stem.startswith(f'github-pr{number}-'))
+                or (merged_at is not None and created is not None and created >= merged_at))
+
+    def needs_no_reading(self, number: int | None, peer, message: dict) -> bool:
+        """An unread message whose relay pointer the close clears instead of ringing (#96): implementer
+        mail the close does not wait for. Planner mail always needs reading."""
+        return peer.box == 'codex' and self.ignored_implementer_mail(
+            number, message.get('id', ''), message, self.merge_time(number))
+
+    # --- relay pointers left in a composer (#96) --------------------------------------------------
+    def unread_message(self, box: str, mid: str) -> dict | None:
+        import hub
+        found = mail_file(self.hub_dir, box, mid)
+        if found is None or not found[1]:
+            return None
+        try:
+            return hub.parse_message(found[0])
+        except (OSError, ValueError):
+            return None
+
+    def pointer_alert(self, peer, mid: str, reason: str) -> None:
+        message = f"workbench mail for {peer.box} ({mid}) is waiting: {reason}"
+        self.log(f"ALERT {message}")
+        if self.dry_run:
+            return
+        try:
+            agw.set_status('blocked', sound=True, blink=True, pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not set blocked status for {peer.box}: {err}")
+        try:
+            agw.notify(peer.pane, message, title='workbench close')
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not notify {peer.box}: {err}")
+
+    def pointer_resolved(self, peer, mid: str) -> None:
+        if self.dry_run:
+            return
+        try:
+            agw.set_status('idle', pane_id=peer.pane)
+        except (agw.CtlError, OSError) as err:
+            self.log(f"could not clear the blocked status for {peer.box}: {err}")
+
+    def rescue_pointers(self, number: int | None) -> list:
+        """One `PointerRescue` step over the agent panes, for the conductor's backstop (the relay runs
+        its own, which also records the mail as announced). Mail the close does not wait for is left
+        to `clear_stale_pointers`."""
+        if self.dry_run:
+            return []
+        if self.rescue is None:
+            self.rescue = PointerRescue(self.peers, unread_message=self.unread_message,
+                                        pointer=lambda message: relay_pointer(message, AGMSG, self.hub_dir),
+                                        log=self.log, alert=self.pointer_alert, resolved=self.pointer_resolved,
+                                        clock=self.clock)
+        texts = {}
+        for peer in self.peers:
+            try:
+                texts[peer.box] = agw.pane_text(peer.pane)
+            except (agw.CtlError, OSError) as err:
+                texts[peer.box] = err
+        return self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message))
+
+    def clear_stale_pointers(self, number: int | None) -> list:
+        """Delete a relay pointer that no longer needs reading from a settled, idle composer (#96).
+
+        Its mail is read or archived, or is implementer mail the close does not wait for (the relay's
+        final notice, post-merge mail, a helper's): ringing it now would only start a turn the close
+        has to wait out, while leaving it makes the composer not provably empty and refuses the close.
+        The pane must be settled by `agent_blockers`' own record (not reset here), idle, with no dialog,
+        and its composer must own exactly the pointer the relay types for that mail. Ctrl+U through
+        `peerchat.clear_pointer`; a composer it cannot empty stays a blocker, as before. Pointers for
+        mail still to be read are `rescue_pointers`' (and the relay's), never cleared. Returns (peer, mid)
+        for each pointer it cleared, so the relay can count that mail as rung."""
+        import hub
+        import peerchat
+        merged_at = self.merge_time(number)
+        cleared_pointers = []
+        for peer in self.peers:
+            if peer.tool not in peerchat.PROFILES:
+                continue
+            try:
+                text = agw.pane_text(peer.pane)
+            except (agw.CtlError, OSError):
+                continue
+            seen = self.settled.get(peer.pane)
+            if (seen is None or seen[0] != limits.tail_hash(text) or self.clock() - seen[1] < CLOSE_SETTLE
+                    or agent_busy(peer, text) or peerchat.dialog_visible(text)):
+                continue
+            content = peerchat.composer_content(peer.tool, text)
+            mid = peerchat.pointer_id(content)
+            found = mail_file(self.hub_dir, peer.box, mid) if mid else None
+            if found is None:
+                continue
+            path, unread = found
+            try:
+                message = hub.parse_message(path)
+            except (OSError, ValueError):
+                continue
+            if unread and not (peer.box == 'codex' and self.ignored_implementer_mail(number, path.stem, message, merged_at)):
+                continue
+            typed = relay_pointer(message, AGMSG, self.hub_dir)
+            if not peerchat.owns(content, typed):
+                continue
+            where = f"a stale relay pointer for {mid} from {peer.box}'s composer"
+            if self.dry_run:
+                self.log(f"[dry-run] would clear {where}")
+                continue
+            self.log(f"clearing {where}")
+            try:
+                cleared = peerchat.clear_pointer(peer.pane, peerchat.PROFILES[peer.tool], typed)
+            except (peerchat.Refused, agw.CtlError, OSError) as err:
+                self.log(f"could not clear {where}: {err}")
+                continue
+            if cleared:
+                self.log(f"cleared {where}")
+                cleared_pointers.append((peer, mid))
+            else:
+                self.log(f"could not clear {where}: not empty after {peerchat.CLEAR_PRESSES} presses")
+        return cleared_pointers
+
     def close_issue_session(self) -> None:
         agents = {peer.pane for peer in self.peers}
         snapshot = agw.tree()
@@ -454,7 +710,7 @@ def idle_blockers(peer, text: str) -> list[str]:
     two can never disagree about what idle means."""
     import peerchat
     reasons = []
-    if peerchat.is_busy(text) or (peer.tool == 'codex' and any('Working' in row for row in text.splitlines()[-6:])):
+    if agent_busy(peer, text):
         reasons.append(f'{peer.box} is running a turn')
     profile = peerchat.PROFILES[peer.tool]
     content = peerchat.composer_content(peer.tool, text)

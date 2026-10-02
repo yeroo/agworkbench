@@ -126,14 +126,14 @@ class Pointer(unittest.TestCase):
     def test_the_pointer_carries_the_id_and_the_read_command_but_never_the_body(self):
         message = {"id": "20260922T1-codex-ab12", "from": "codex", "subject": "IMPLEMENTED abc123",
                    "body": "a long body that must stay in the file"}
-        text = relay.pointer_text(message, Path("C:/wb/lib/agmsg.py"), Path("C:/clone/.workbench"))
+        text = closer.pointer_text(message, Path("C:/wb/lib/agmsg.py"), Path("C:/clone/.workbench"))
         self.assertIn("20260922T1-codex-ab12", text)
         self.assertIn("read 20260922T1-codex-ab12", text)
         self.assertNotIn("long body", text)
 
     def test_the_pointer_is_one_line(self):
         message = {"id": "x", "from": "github", "subject": "PR #7 is open"}
-        self.assertNotIn(chr(10), relay.pointer_text(message, Path("a"), Path("b")))
+        self.assertNotIn(chr(10), closer.pointer_text(message, Path("a"), Path("b")))
 
 
 HEAD_A, HEAD_B = 'a' * 40, 'b' * 40
@@ -216,6 +216,8 @@ class PaneIds(unittest.TestCase):
 
 
 class DeliveryFixture(unittest.TestCase):
+    rescue_live = False
+
     def setUp(self):
         self.peer = relay.Peer('codex', 'codex', 'codex-pane')
         # Run the constructor, replacing only mailbox storage boundaries. No real hub is touched.
@@ -244,6 +246,10 @@ class DeliveryFixture(unittest.TestCase):
         # #84 r3: the helper sweep is HelperSweep's and HelperSweepInRun's to test; here it would read
         # the developer's config and trip the terminal guard, which run() would swallow.
         self.enterContext(patch.object(relay.Relay, 'sweep_helpers'))
+        # #96: likewise the pointer rescue is PointerRescue's to test; here its pane reads would use up
+        # the reads a test scripted for deliver_mail.
+        if not self.rescue_live:
+            self.enterContext(patch.object(relay.Relay, 'rescue_pointers'))
 
     def tick(self, instant):
         self.t = instant
@@ -465,7 +471,7 @@ class Delivery(DeliveryFixture):
     def test_post_submit_ambiguity_still_alerts_failure_immediately(self):
         self.claude_peer()
         pointer = peerchat.compose_text('Chat from Workbench: ',
-                                        relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
+                                        closer.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
         # The relay reads the first frame for busy state before peerchat's own precheck.
         fake = FakeAgw('claude', frames=[CLAUDE_IDLE] + stable_frames(CLAUDE_IDLE, claude(pointer), CLAUDE_SUGGESTION), cursors=[2])
         clock = Clock()
@@ -629,7 +635,7 @@ class Delivery(DeliveryFixture):
 
     def test_real_send_refuses_stuck_text_then_rerings_after_composer_empties(self):
         pointer = peerchat.compose_text('Chat from Workbench: ',
-                                        relay.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
+                                        closer.pointer_text(self.messages['m1'], self.r.agmsg, self.r.hub_dir))
         fake = FakeAgw(after=lambda f: codex(pointer, 'Working (esc to interrupt)'))
         clock = Clock()
         self.send.side_effect = self.real_send
@@ -638,13 +644,13 @@ class Delivery(DeliveryFixture):
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
             self.tick(0)
             self.assert_unannounced()
-            self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
+            self.assertEqual([pointer] + ['\t'] * 4, fake.keys)
             self.tick(5)
-            self.assertEqual([pointer, '\t', '\t', '\t'], fake.keys)
+            self.assertEqual([pointer] + ['\t'] * 4, fake.keys)
             self.assertEqual(1, self.notify.call_count)
             fake.frames = stable_frames(CODEX_IDLE, codex(pointer), CODEX_IDLE)
             self.tick(10)
-        self.assertEqual([pointer, '\t', '\t', '\t', pointer, '\t'], fake.keys)
+        self.assertEqual([pointer] + ['\t'] * 4 + [pointer, '\t'], fake.keys)
         self.assertEqual(['m1'], self.r.state['announced'])
         self.status.assert_called_with('idle', pane_id=self.peer.pane)
 
@@ -3884,6 +3890,329 @@ class Timestamps(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             relay.Relay.log(None, "hello")
         self.assertEqual("hello\n", out.getvalue())
+
+
+class PointerRescueFixture(DeliveryFixture):
+    """#96: a pointer the TUI did not take sits typed-but-unsent; the relay presses submit again on a
+    later look - never text, never into anything but its own pointer."""
+    rescue_live = True
+
+    def setUp(self):
+        super().setUp()
+        self.pointer = closer.relay_pointer(self.messages['m1'], self.r.agmsg, self.r.hub_dir)
+        self.clock = Clock()
+        self.keys = []
+        self.takes = lambda keys: False      # does the pane take the latest submit key?
+        self.typed = None                    # composer content, None for an empty composer
+        self.extra = ''
+        self.send.side_effect = self.real_send
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=self.screen))
+        self.enterContext(patch.object(agw, 'type_into', side_effect=self.type_into))
+        self.enterContext(patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor in fixture')))
+        self.enterContext(patch.object(peerchat, 'now', self.clock.now))
+        self.enterContext(patch.object(peerchat, 'pause', self.clock.pause))
+
+    def screen(self, pane):
+        return codex(self.typed, self.extra) if self.typed else codex('Ask Codex to do anything', self.extra)
+
+    def type_into(self, pane, text):
+        self.keys.append(text)
+        if text in ('\t', '\n'):
+            if self.takes(self.keys):
+                self.typed = None
+        else:
+            self.typed = (self.typed or '') + text
+
+    def look(self, instant=None):
+        if instant is not None:
+            self.t = instant
+        self.r.rescue_pointers()
+
+    def ring_fails(self):
+        """The first ring types the pointer and the pane swallows every submit key of it."""
+        self.tick(0)
+        self.assertEqual([self.pointer, '\t', '\t', '\t', '\t', '\n'], self.keys)
+        self.assertIn(('codex', 'm1'), self.r.holds)
+        self.assertTrue(any(line.startswith('FAILED ringing codex for m1') for line in self.logs))
+        self.keys.clear()
+
+
+class PointerRescue(PointerRescueFixture):
+    def test_a_failed_ring_is_submitted_two_looks_later(self):
+        self.ring_fails()
+        self.takes = lambda keys: True
+        self.look(30)                                  # first look: remembered, nothing pressed
+        self.assertEqual([], self.keys)
+        self.tick(31)                                  # the ordinary ring still refuses the occupied composer
+        self.assertEqual([], self.keys)
+        self.look(60)
+        self.assertEqual(['\t'], self.keys)            # exactly one key, never the text again
+        self.assertIn('m1', self.r.state['announced'])
+        self.r._save.assert_called()
+        self.assertNotIn(('codex', 'm1'), self.r.holds)
+        self.assertIn('rescued unsent pointer in codex for m1 [submitted]', self.logs)
+        self.tick(61)
+        self.assertEqual(['\t'], self.keys)            # announced: not rung again
+
+    def test_the_rescued_mid_is_saved_as_announced(self):
+        self.use_disk_state()
+        self.pointer = closer.relay_pointer(self.messages['m1'], self.r.agmsg, self.r.hub_dir)
+        self.ring_fails()
+        self.takes = lambda keys: True
+        self.look(30)
+        self.look(60)
+        saved = json.loads(self.r.state_file.read_text(encoding='utf-8'))
+        self.assertIn('m1', saved['announced'])
+
+    def test_a_pointer_seen_once_is_not_resubmitted(self):
+        self.ring_fails()
+        self.look(30)
+        self.typed = self.pointer + ' and a word'      # changed between the looks: not ours any more
+        self.look(60)
+        self.typed = self.pointer
+        self.look(90)                                  # a first look again
+        self.assertEqual([], self.keys)
+
+    def test_never_taken_is_unsubmitted_after_three_attempts_with_one_alert(self):
+        self.r.state['announced'] = ['m1']             # the wrong-`submitted` case: rung, but still there
+        self.typed = self.pointer
+        for step in range(4):
+            self.look(step * 30)
+        self.assertEqual(['\t'] * 3, self.keys)        # one key per look after the first
+        self.assertTrue(any(line.startswith('UNSUBMITTED pointer for m1 in codex') for line in self.logs))
+        self.assertEqual(1, self.notify.call_count)
+        self.look(120)
+        self.look(150)
+        self.assertEqual(['\t'] * 5, self.keys)        # still one key per look
+        self.assertEqual(1, self.notify.call_count)    # alerts are throttled
+        self.look(120 + relay.ALERT_EVERY)
+        self.assertEqual(2, self.notify.call_count)
+
+    def blocked_then(self, end):
+        """r1 m1: three failed looks raise the rescue's own alert; deliver_mail's sweep of announced
+        mail must not take it back while the pointer is still stuck."""
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer
+        for step in range(4):
+            self.look(step * 30)
+        self.status.assert_called_with('blocked', sound=True, blink=True, pane_id='codex-pane')
+        self.tick(121)
+        self.look(150)
+        self.tick(151)
+        self.assertNotIn(call('idle', pane_id='codex-pane'), self.status.call_args_list)
+        self.assertFalse(any(line.startswith('cleared hold') for line in self.logs))
+        end()
+        self.look(180)
+        self.status.assert_called_with('idle', pane_id='codex-pane')
+
+    def test_the_unsubmitted_alert_stands_until_the_pointer_is_rescued(self):
+        def takes():
+            self.takes = lambda keys: True
+        self.blocked_then(takes)
+        self.assertIn('rescued unsent pointer in codex for m1 [submitted]', self.logs)
+
+    def test_the_unsubmitted_alert_ends_when_the_pointer_is_gone(self):
+        def sent_by_hand():
+            self.typed = None
+        self.blocked_then(sent_by_hand)
+
+    def test_an_announced_pointer_still_in_the_composer_is_rescued(self):
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer
+        self.takes = lambda keys: True
+        self.look(0)
+        self.look(30)
+        self.assertEqual(['\t'], self.keys)
+        self.assertIn('rescued unsent pointer in codex for m1 [submitted]', self.logs)
+
+    def test_read_mail_is_not_resubmitted(self):
+        self.typed = self.pointer
+        self.unread['codex'] = []
+        for step in range(3):
+            self.look(step * 30)
+        self.assertEqual([], self.keys)
+
+    def test_a_human_draft_with_the_id_is_never_touched(self):
+        for draft in ['look at [id m1] later', self.pointer + ' - and then merge']:
+            with self.subTest(draft=draft):
+                self.typed = draft
+                for step in range(3):
+                    self.look(step * 30)
+                self.assertEqual([], self.keys)
+
+    def test_a_busy_pane_is_not_touched(self):
+        self.typed = self.pointer
+        self.extra = 'Working (esc to interrupt)'
+        for step in range(3):
+            self.look(step * 30)
+        self.assertEqual([], self.keys)
+
+    def test_a_busy_claude_pane_is_not_touched(self):
+        self.r.peers[0] = self.peer = relay.Peer('codex', 'claude', 'codex-pane')
+        self.r.rescue.peers = self.r.peers
+        busy = CLAUDE_RUNNING.replace('\n>\n', '\n> ' + self.pointer + '\n')
+        with patch.object(agw, 'pane_text', return_value=busy):
+            for step in range(3):
+                self.look(step * 30)
+        self.assertEqual([], self.keys)
+
+    def test_dry_run_presses_nothing(self):
+        self.r.dry_run = True
+        self.typed = self.pointer
+        for step in range(3):
+            self.look(step * 30)
+        self.assertEqual([], self.keys)
+
+
+class PointerRescueInRun(PointerRescueFixture):
+    """#96: run() looks for unsent pointers on its own clock, outside the limit check, so a late
+    pointer is rescued while a finished PR's notices drain (docxy #917)."""
+
+    def test_a_draining_relay_rescues_a_failed_ring(self):
+        self.r.state.update(pr=with_(OPEN, number=7, state='MERGED', headRefName='issue-6'),
+                            terminal_mail=[['codex', 'm1']])
+        self.r.close_after_merge = Mock(return_value=True)
+        self.r.fetch_pr = Mock(return_value=None)
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.t > 600)
+        # The first ring's keys are swallowed; the rescue's is taken.
+        self.takes = lambda keys: len(keys) > 6
+
+        def advance(seconds):
+            self.t += max(seconds, 1)
+        with patch.object(relay, 'pause', advance):
+            self.assertEqual(0, self.r.run())
+        self.assertTrue(any('resuming final notice drain' in line for line in self.logs))
+        self.assertEqual([self.pointer, '\t', '\t', '\t', '\t', '\n', '\t'], self.keys)
+        self.assertIn('rescued unsent pointer in codex for m1 [submitted]', self.logs)
+        self.assertIn('PR is finished; final notices delivered or read', self.logs)
+        self.r.close_after_merge.assert_called_once_with(7)
+
+    def test_a_rescue_bug_never_stops_the_doorbell(self):
+        self.r.rescue_pointers = Mock(side_effect=RuntimeError('boom'))
+        self.r.stop_file = SimpleNamespace(exists=lambda: self.r.rescue_pointers.call_count > 0)
+        self.r.fetch_pr = Mock(return_value=None)
+        with patch.object(relay, 'pause'):
+            self.assertEqual(0, self.r.run())
+        self.assertIn('pointer rescue failed: RuntimeError: boom', self.logs)
+
+
+class StalePointers(unittest.TestCase):
+    """#96: in the autonomous close a pointer whose mail needs no reading is cleared from a settled,
+    idle composer; one for mail still to be read is submitted instead. Nothing else is touched."""
+    # AutonomousClose's fixture, borrowed rather than inherited so its tests do not run twice.
+    PLANNER, IMPLEMENTER, RELAY = AutonomousClose.PLANNER, AutonomousClose.IMPLEMENTER, AutonomousClose.RELAY
+    REVMUX, REVIEW, OTHER = AutonomousClose.REVMUX, AutonomousClose.REVIEW, AutonomousClose.OTHER
+    spawned, marker, write, advance, closes, log = (AutonomousClose.spawned, AutonomousClose.marker,
+                                                    AutonomousClose.write, AutonomousClose.advance,
+                                                    AutonomousClose.closes, AutonomousClose.log)
+
+    def setUp(self):
+        AutonomousClose.setUp(self)
+        self.keys = []
+        self.enterContext(patch.object(agw, 'type_into', side_effect=self.type_into))
+        self.enterContext(patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor in fixture')))
+        clock = Clock()
+        self.enterContext(patch.object(peerchat, 'now', clock.now))
+        self.enterContext(patch.object(peerchat, 'pause', clock.pause))
+        self.hub_dir = self.folder / '.workbench'
+
+    def type_into(self, pane, text):
+        self.keys.append((pane, text))
+        if text in (peerchat.CLEAR_KEY, '\n'):
+            self.text[pane] = CLAUDE_IDLE
+
+    def filed(self, box, mid, *, folder='', sender='claude', created=None):
+        directory = self.hub_dir / 'inbox' / box / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        head = f'---\nid: {mid}\nfrom: {sender}\nto: {box}\nsubject: IMPLEMENTED abc\n'
+        if created:
+            head += f'created: {created}\n'
+        (directory / f'{mid}.md').write_text(head + '---\nbody\n', encoding='utf-8')
+        message = hub.parse_message(directory / f'{mid}.md')
+        return closer.relay_pointer(message, self.r.agmsg, self.hub_dir)
+
+    def settled(self, close):
+        close.agent_blockers(7)
+        self.t += closer.CLOSE_SETTLE
+
+    def test_a_pointer_for_read_mail_is_cleared_and_the_close_goes_ahead(self):
+        pointer = self.filed('codex', 'm1', folder='read')
+        self.text[self.IMPLEMENTER] = claude(pointer)
+        close = self.r.closer()
+        self.assertTrue(any('codex composer is not provably empty' in reason for reason in close.agent_blockers(7)))
+        self.t += closer.CLOSE_SETTLE
+        close.clear_stale_pointers(7)
+        self.assertEqual([(self.IMPLEMENTER, peerchat.CLEAR_KEY)], self.keys)
+        self.assertEqual(CLAUDE_IDLE, self.text[self.IMPLEMENTER])
+        self.assertFalse(any('composer' in reason for reason in close.agent_blockers(7)))
+        self.assertIn("cleared a stale relay pointer for m1 from codex's composer", self.log())
+
+    def test_the_close_loop_clears_it_end_to_end(self):
+        pointer = self.filed('codex', 'm1', folder='read')
+        self.text[self.IMPLEMENTER] = claude(pointer)
+        self.r.close_after_merge(7)
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertIn((self.IMPLEMENTER, peerchat.CLEAR_KEY), self.keys)
+
+    def test_a_post_merge_implementer_notice_is_cleared(self):
+        pointer = self.filed('codex', 'github-pr7-note-1-codex', sender='github')
+        self.text[self.IMPLEMENTER] = claude(pointer)
+        close = self.r.closer()
+        self.settled(close)
+        self.assertEqual([(self.r.peers[1], 'github-pr7-note-1-codex')], close.clear_stale_pointers(7))
+        self.assertEqual([(self.IMPLEMENTER, peerchat.CLEAR_KEY)], self.keys)
+
+    def test_the_close_clears_ignored_mail_instead_of_ringing_it_and_never_retypes_it(self):
+        # r1 m2: the rescue's two looks come a mail interval apart, well inside CLOSE_SETTLE; it must
+        # leave mail the close ignores to the clear, and the cleared mid counts as rung.
+        mid = 'github-pr7-note-1-codex'
+        pointer = self.filed('codex', mid, sender='github')
+        self.text[self.IMPLEMENTER] = claude(pointer)
+        retyped = []
+
+        def ring(pane, profile, text, **kwargs):
+            if self.text[pane] == CLAUDE_IDLE:
+                retyped.append(text)
+                return 'submitted'
+            raise peerchat.Refused('composer holds a draft')
+        self.send.side_effect = ring
+        self.r.close_after_merge(7)
+        self.assertIn(self.PLANNER, self.closes())
+        self.assertEqual([(self.IMPLEMENTER, peerchat.CLEAR_KEY)], self.keys)   # cleared, never submitted
+        self.assertEqual([], retyped)
+        self.assertIn(mid, self.r.state['announced'])
+        self.assertNotIn(('codex', mid), self.r.holds)
+
+    def test_a_pointer_for_unread_planner_mail_is_submitted_not_cleared(self):
+        pointer = self.filed('claude', 'p1', sender='codex')
+        self.text[self.PLANNER] = claude(pointer)
+        close = self.r.closer()
+        self.settled(close)
+        close.clear_stale_pointers(7)
+        self.assertEqual([], self.keys)
+        self.r.rescue_pointers()
+        self.r.rescue_pointers()
+        self.assertEqual([(self.PLANNER, '\n')], self.keys)
+        self.assertIn('p1', self.r.state['announced'])
+
+    def test_nothing_is_typed_into_a_busy_unsettled_or_foreign_composer(self):
+        pointer = self.filed('codex', 'm1', folder='read')
+        cases = {'busy': CLAUDE_RUNNING.replace('\n>\n', '\n> ' + pointer + '\n'),
+                 'foreign': claude('my own draft about [id m1]'),
+                 'extended': claude(pointer + ' plus a note')}
+        for name, frame in cases.items():
+            with self.subTest(name=name):
+                self.text[self.IMPLEMENTER] = frame
+                close = self.r.closer()
+                self.settled(close)
+                close.clear_stale_pointers(7)
+                self.assertEqual([], self.keys)
+        with self.subTest(name='unsettled'):
+            self.text[self.IMPLEMENTER] = claude(pointer)
+            close = self.r.closer()
+            close.agent_blockers(7)                    # first sight: settling, not settled
+            close.clear_stale_pointers(7)
+            self.assertEqual([], self.keys)
 
 
 if __name__ == "__main__":

@@ -91,7 +91,8 @@ class Submission(unittest.TestCase):
 
     def test_submit_and_queue_after_retries_report_the_path(self):
         for retry, completed, expected in [(1, CODEX_IDLE, 'submitted after retry 1'),
-                                            (2, CODEX_QUEUED, 'queued after retry 2')]:
+                                            (2, CODEX_QUEUED, 'queued after retry 2'),
+                                            (3, CODEX_IDLE, 'submitted after retry 3')]:
             with self.subTest(retry=retry):
                 fake = FakeAgw(after=lambda f: completed if len(f.keys) >= retry + 2 else codex(TEXT))
                 self.assertEqual(expected, self.send(fake))
@@ -100,10 +101,10 @@ class Submission(unittest.TestCase):
     def test_idle_codex_uses_one_return_after_tabs_fail(self):
         fake = FakeAgw(after=lambda f: CODEX_IDLE if f.keys[-1] == '\n' else codex(TEXT))
         self.assertEqual('submitted after Return', self.send(fake))
-        self.assertEqual([TEXT, '\t', '\t', '\t', '\n'], fake.keys)
+        self.assertEqual([TEXT, '\t', '\t', '\t', '\t', '\n'], fake.keys)
 
     def test_exhausted_retries_quote_the_composer_without_retyping(self):
-        for tool, keys in [('codex', ['\t', '\t', '\t', '\n']), ('claude', ['\n'] * 3)]:
+        for tool, keys in [('codex', ['\t'] * 4 + ['\n']), ('claude', ['\n'] * 4)]:
             with self.subTest(tool=tool):
                 fake = FakeAgw(tool, after=lambda f: codex(TEXT) if f.tool == 'codex' else claude(TEXT))
                 with self.assertRaisesRegex(peerchat.Failed, 'pointer still unsent') as caught:
@@ -119,7 +120,7 @@ class Submission(unittest.TestCase):
                 fake = FakeAgw(after=lambda f: frame)
                 with self.assertRaises(peerchat.Failed):
                     self.send(fake)
-                self.assertEqual([TEXT, '\t', '\t', '\t'], fake.keys)
+                self.assertEqual([TEXT, '\t', '\t', '\t', '\t'], fake.keys)
 
     def test_old_same_id_queue_cannot_hide_unsent_or_changed_composer(self):
         for draft in [TEXT, 'check if codex replied']:
@@ -128,7 +129,7 @@ class Submission(unittest.TestCase):
                 fake = FakeAgw(after=lambda f: frame)
                 with self.assertRaises(peerchat.Failed):
                     self.send(fake)
-                expected = ['\t'] * (3 if draft == TEXT else 1)
+                expected = ['\t'] * (4 if draft == TEXT else 1)
                 self.assertEqual([TEXT] + expected, fake.keys)
 
     def test_changed_drafts_fail_before_first_submit_and_during_polling(self):
@@ -173,7 +174,7 @@ class Submission(unittest.TestCase):
         fake = FakeAgw(frames=stable_frames(CODEX_IDLE, CODEX_UNSUBMITTED))
         with self.assertRaisesRegex(peerchat.Failed, 'pointer still unsent'):
             self.send(fake, content)
-        self.assertEqual([content, '\t', '\t', '\t', '\n'], fake.keys)
+        self.assertEqual([content, '\t', '\t', '\t', '\t', '\n'], fake.keys)
 
     def test_dialog_and_disappearance_after_submit_withhold_further_keys(self):
         for frame, reason in [(codex(TEXT) + '\n› 1. Yes', 'dialog'), ('─' * 50, 'disappeared')]:
@@ -207,7 +208,7 @@ class Submission(unittest.TestCase):
         cases = [('read', 3, 'verifying typed text'), ('read', 4, 'verifying typed text'),
                  ('read', 5, 'verifying submit'), ('read', 6, 'verifying submit'),
                  ('type', 1, 'typing text'), ('type', 2, 'submitting'), ('type', 3, 'retry 1'),
-                 ('type', 5, 'Return fallback')]
+                 ('type', 5, 'retry 3'), ('type', 6, 'Return fallback')]
         for kind, index, phase in cases:
             for error_type in [agw.CtlError, OSError]:
                 with self.subTest(kind=kind, index=index, error_type=error_type):
@@ -305,7 +306,7 @@ class Submission(unittest.TestCase):
         fake = FakeAgw('claude', after=lambda f: claude(TEXT), cursors=[2])
         with self.assertRaisesRegex(peerchat.Failed, 'pointer still unsent'):
             self.send(fake)
-        self.assertEqual([TEXT, '\n', '\n', '\n'], fake.keys)
+        self.assertEqual([TEXT, '\n', '\n', '\n', '\n'], fake.keys)
 
     def test_codex_does_not_read_cursor_or_gain_ambiguity(self):
         fake = FakeAgw('codex', frames=[codex('a real draft')], cursors=[2])
@@ -375,7 +376,7 @@ class Submission(unittest.TestCase):
                 boundary_reads = 0
                 def after(fake):
                     nonlocal started, boundary_reads
-                    if len(fake.keys) == 4:
+                    if len(fake.keys) == 5:
                         if started is None:
                             started = self.clock.t
                         if self.clock.t >= started + peerchat.SUBMIT_TIMEOUT:
@@ -386,7 +387,7 @@ class Submission(unittest.TestCase):
                 fake = FakeAgw(after=after)
                 with self.assertRaises(peerchat.Failed):
                     self.send(fake)
-                self.assertEqual([TEXT, '\t', '\t', '\t'], fake.keys)
+                self.assertEqual([TEXT, '\t', '\t', '\t', '\t'], fake.keys)
                 self.assertEqual(4, boundary_reads)
 
     def test_cli_prints_valid_json(self):
@@ -625,3 +626,103 @@ class KimiSubmission(unittest.TestCase):
                     self.send(fake)
                 self.assertIn(reason, str(caught.exception))
                 self.assertEqual([], fake.keys)
+
+
+class Screen(FakeAgw):
+    """A pane whose frame is a function of the keys pressed so far: the rescue never types text."""
+
+    def __init__(self, tool, screen, cursors=None):
+        super().__init__(tool, cursors=cursors)
+        self.screen = screen
+
+    def pane_text(self, pane):
+        self.events.append('text')
+        self.reads += 1
+        return self.screen(self.keys)
+
+
+class Rescue(unittest.TestCase):
+    """#96: a pointer still sitting in the composer gets one more submit key, or is cleared - never
+    retyped, and never anything else's draft."""
+
+    def setUp(self):
+        self.clock = Clock()
+
+    def run_in(self, fake, call):
+        with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column), \
+                patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
+                patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
+            return call()
+
+    def resubmit(self, fake, typed=TEXT):
+        return self.run_in(fake, lambda: peerchat.resubmit('pane', peerchat.PROFILES[fake.tool], typed))
+
+    def clear(self, fake, typed=TEXT):
+        return self.run_in(fake, lambda: peerchat.clear_pointer('pane', peerchat.PROFILES[fake.tool], typed))
+
+    def test_pointer_id_needs_a_whole_marker(self):
+        self.assertEqual('20260922T193916Z-claude-1528', peerchat.pointer_id(TEXT))
+        self.assertIsNone(peerchat.pointer_id(TEXT.split('[id ')[0]))
+        self.assertIsNone(peerchat.pointer_id('[id 20260922T19'))
+        self.assertIsNone(peerchat.pointer_id(None))
+
+    def test_one_key_then_verified(self):
+        for tool, frame, idle, key in [('claude', claude(TEXT), CLAUDE_IDLE, '\n'),
+                                       ('codex', codex(TEXT), CODEX_IDLE, '\t')]:
+            with self.subTest(tool=tool):
+                fake = Screen(tool, lambda keys, frame=frame, idle=idle: idle if keys else frame)
+                self.assertEqual('submitted', self.resubmit(fake))
+                self.assertEqual([key], fake.keys)
+
+    def test_exactly_one_key_even_when_the_verify_fails(self):
+        for tool, frame in [('claude', claude(TEXT)), ('codex', codex(TEXT))]:
+            with self.subTest(tool=tool):
+                fake = Screen(tool, lambda keys, frame=frame: frame)
+                with self.assertRaisesRegex(peerchat.Failed, 'pointer still unsent'):
+                    self.resubmit(fake)
+                self.assertEqual([peerchat.PROFILES[tool].submit], fake.keys)
+
+    def test_refuses_without_a_key(self):
+        cases = [('dialog', claude(TEXT) + '\n❯ 1. Yes\n  2. No', peerchat.Refused),
+                 ('foreign draft', claude('check if codex replied'), peerchat.Refused),
+                 ('extended pointer', claude(TEXT + ' and more'), peerchat.Refused),
+                 ('empty', CLAUDE_IDLE, peerchat.Refused),
+                 ('ambiguous', CLAUDE_SUGGESTION, peerchat.AmbiguousComposer)]
+        for name, frame, error in cases:
+            with self.subTest(name=name):
+                fake = Screen('claude', lambda keys, frame=frame: frame, cursors=[2])
+                with self.assertRaises(error):
+                    self.resubmit(fake, TEXT if name != 'ambiguous' else 'run a third revmux round before I merge')
+                self.assertEqual([], fake.keys)
+
+    def test_clear_presses_ctrl_u_until_empty(self):
+        fake = Screen('claude', lambda keys: CLAUDE_IDLE if keys else claude(TEXT))
+        self.assertTrue(self.clear(fake))
+        self.assertEqual([peerchat.CLEAR_KEY], fake.keys)
+
+    def test_clear_continues_on_what_is_left_of_the_pointer(self):
+        rest = TEXT[:40]          # a remainder without the id: ours only because our press made it
+        fake = Screen('codex', lambda keys: [codex(TEXT), codex(rest), CODEX_IDLE][min(len(keys), 2)])
+        self.assertTrue(self.clear(fake))
+        self.assertEqual([peerchat.CLEAR_KEY] * 2, fake.keys)
+
+    def test_clear_gives_up_after_three_presses(self):
+        fake = Screen('claude', lambda keys: claude(TEXT))
+        self.assertFalse(self.clear(fake))
+        self.assertEqual([peerchat.CLEAR_KEY] * peerchat.CLEAR_PRESSES, fake.keys)
+
+    def test_clear_never_touches_another_draft(self):
+        for frame in [claude('check if codex replied'), claude('[id 20260922T193916Z-claude-1528] mine'),
+                      claude(TEXT) + '\n❯ 1. Yes\n  2. No']:
+            with self.subTest(frame=frame[-40:]):
+                fake = Screen('claude', lambda keys, frame=frame: frame)
+                with self.assertRaises(peerchat.Refused):
+                    self.clear(fake)
+                self.assertEqual([], fake.keys)
+
+    def test_clear_stops_when_the_remainder_is_not_ours(self):
+        fake = Screen('claude', lambda keys: claude('somebody typed this') if keys else claude(TEXT))
+        with self.assertRaises(peerchat.Refused):
+            self.clear(fake)
+        self.assertEqual([peerchat.CLEAR_KEY], fake.keys)

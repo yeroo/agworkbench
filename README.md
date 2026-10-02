@@ -516,7 +516,7 @@ and `lib/kimi.py` prepares what the pane needs.
 can prove is empty, never into a dialog, and never answers a prompt. A refusal before typing waits
 for the next tick. After typing a pointer once, it verifies submission from an empty composer
 and records whether the pointer was submitted or queued. Before typing or submitting, it rereads
-the composer after any cursor query and requires both parsed snapshots to agree. A stuck pointer gets up to two more
+the composer after any cursor query and requires both parsed snapshots to agree. A stuck pointer gets up to three more
 submit-key presses, each guarded by a fresh composer check. A clipped pointer must still show its
 complete message ID. Codex gets one Return fallback only
 when no running-turn or queued-input evidence is visible. It never submits a changed draft or
@@ -524,6 +524,11 @@ a dialog. This verifies submission, not that the agent has read the mail. Failed
 alert immediately; mail held for a minute also raises a blocked status, sound, blink, and desktop
 notification naming the recipient, message, and reason. Alerts repeat at most every five minutes
 per message. Failed rings stay unannounced and can be sent again once the composer is empty.
+A pointer that still sits typed-but-unsent after that (#96) is looked for on every
+`--limit-interval` tick, watching or draining: an idle pane whose composer holds exactly the
+relay's pointer for mail still unread, the same on two looks, gets one more submit key per look,
+never the text. Three attempts that do not submit log `UNSUBMITTED` and alert. Stall pointers and
+the usage-limit probe carry no message ID and are not rescued.
 For Claude, unrecognized one-row text with its caret at the starting column is ambiguous: possibly
 a suggestion, or a draft with its caret at the start. The relay still refuses to type, but this
 pre-write hold alerts only after the same full text persists for ten minutes. A change in that text
@@ -613,7 +618,9 @@ merges, unless you opted in for that checkout.
   the agents are doing; a running revdiff stays open and is named. The issue session and the relay
   itself close only once the planner has recorded `wb.py loop-state done`, the planner has read
   all its mail, and both panes are unchanged for 30 s with empty composers and no
-  `.git/index.lock`. The implementer's unread mail works differently (#44). The relay's own
+  `.git/index.lock`. A relay pointer left in a settled, idle composer for mail that no longer needs
+  reading (read, or implementer mail the close ignores) is cleared with Ctrl+U first, and one for
+  mail still unread is submitted (#96); anything else in a composer still holds the close. The implementer's unread mail works differently (#44). The relay's own
   `PR #N MERGED` notice and anything sent after the merge or no-PR done record, such as the planner's "loop complete"
   note, never hold the close. Older unread implementer mail holds it for 10 minutes; then the
   close goes ahead and logs the ids. It only ever touches the checkout's workspace (a named
