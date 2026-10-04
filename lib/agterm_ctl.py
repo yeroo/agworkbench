@@ -13,6 +13,8 @@ Two differences decide the shape of it:
   unsplit agwinterm session is its own single pane - and the right pane's id is a uuid5 derived
   from the session id, so any process can compute it again from `AGTERM_SESSION_ID` and
   `AGTERM_PANE` with no state kept anywhere.
+- **Case.** agwinterm's ids are lowercase GUIDs and the workbench checks that spelling (relay.py's
+  pane-id rule); agterm's are uppercase. Ids leave here lowercase and are matched in any case.
 - **Realization.** agterm starts a session's process only once the session has been shown. A
   session created with `--no-select` sits "not realized" and its command never runs, where
   agwinterm runs it in the background. So a background `session.new` here creates the session
@@ -45,11 +47,11 @@ class CtlError(RuntimeError):
 # --- ids ------------------------------------------------------------------------------------
 
 def right_pane_id(session_id: str) -> str:
-    return str(uuid.uuid5(RIGHT_PANE_NS, session_id.upper())).upper()
+    return str(uuid.uuid5(RIGHT_PANE_NS, session_id.upper()))
 
 
 def pane_id(session_id: str, slot: str) -> str:
-    return session_id.upper() if slot == "left" else right_pane_id(session_id)
+    return session_id.lower() if slot == "left" else right_pane_id(session_id)
 
 
 def caller_pane() -> str | None:
@@ -70,7 +72,7 @@ def bridge_env(env=None) -> None:
         return
     slot = "right" if env.get("AGTERM_PANE") == "right" else "left"
     env["AGWINTERM_ENABLED"] = "1"
-    env["AGWINTERM_SESSION_ID"] = session.upper()
+    env["AGWINTERM_SESSION_ID"] = session.lower()
     env["AGWINTERM_PANE_ID"] = pane_id(session, slot)
     if env.get("AGTERM_WINDOW_ID"):
         env["AGWINTERM_WINDOW_ID"] = env["AGTERM_WINDOW_ID"]
@@ -129,7 +131,7 @@ def raw_tree() -> dict[str, Any]:
 
 
 def _session_node(session: dict[str, Any]) -> dict[str, Any]:
-    sid = str(session["id"]).upper()
+    sid = str(session["id"]).lower()
     split = bool(session.get("split") or session.get("hasSplit"))
     panes = [sid, right_pane_id(sid)] if split else [sid]
     node: dict[str, Any] = {
@@ -162,7 +164,7 @@ def tree() -> dict[str, Any]:
     raw = raw_tree()
     return {
         "workspaces": [
-            {"id": str(ws["id"]).upper(), "name": ws.get("name", ""), "active": bool(ws.get("active")),
+            {"id": str(ws["id"]).lower(), "name": ws.get("name", ""), "active": bool(ws.get("active")),
              "sessions": [_session_node(s) for s in ws.get("sessions", [])]}
             for ws in raw.get("workspaces", [])
         ]
@@ -191,9 +193,9 @@ def resolve(target: str | None, raw: dict[str, Any] | None = None) -> tuple[str,
             raise CtlError("no active session")
         session = next(s for s in sessions if s["id"] == sid)
         return sid, "right" if session.get("split") and session.get("splitFocused") else "left"
-    wanted = target.upper()
+    wanted = target.lower()
     for session in sessions:
-        sid = str(session["id"]).upper()
+        sid = str(session["id"]).lower()
         if wanted == sid:
             return session["id"], "left"
         if wanted == right_pane_id(sid):
@@ -205,9 +207,17 @@ def resolve(target: str | None, raw: dict[str, Any] | None = None) -> tuple[str,
     raise CtlError(f"no pane or session '{target}'")
 
 
+def _real_workspace(workspace_id: str, raw: dict[str, Any]) -> str:
+    """agterm's own spelling of a workspace id handed out here in lowercase."""
+    for ws in raw.get("workspaces", []):
+        if str(ws["id"]).lower() == workspace_id.lower():
+            return ws["id"]
+    return workspace_id
+
+
 def _workspace_of(session_id: str, raw: dict[str, Any]) -> str | None:
     for ws in raw.get("workspaces", []):
-        if any(s["id"].upper() == session_id.upper() for s in ws.get("sessions", [])):
+        if any(s["id"].lower() == session_id.lower() for s in ws.get("sessions", [])):
             return ws["id"]
     return None
 
@@ -222,7 +232,7 @@ def _session_new(args: dict[str, Any]) -> str:
         argv += ["--name", str(args["name"])]
     argv += ["--cwd", str(args.get("cwd") or os.getcwd())]
     if args.get("workspace"):
-        argv += ["--workspace", str(args["workspace"])]
+        argv += ["--workspace", _real_workspace(str(args["workspace"]), raw)]
     elif args.get("workspace-name"):
         argv += ["--workspace-name", str(args["workspace-name"])]
         if args.get("create-workspace"):
@@ -237,7 +247,7 @@ def _session_new(args: dict[str, Any]) -> str:
         argv += ["--command", str(args["command"])]
     # Never --no-select: an unselected agterm session is not realized and its command never runs.
     result = agtermctl(*argv)
-    sid = str(result.get("id") if isinstance(result, dict) else result).upper()
+    sid = str(result.get("id") if isinstance(result, dict) else result).lower()
     if args.get("no-select") and previous:
         time.sleep(0.4)  # let the new surface spawn before it is hidden again
         try:
@@ -259,8 +269,8 @@ def _session_split(args: dict[str, Any], target: str | None) -> str:
         # A fresh split pane is realized only while its session is on screen.
         if not session.get("realized", True) or not session.get("active"):
             _realize(sid)
-        return right_pane_id(sid) if mode != "off" else sid.upper()
-    return sid.upper()
+        return right_pane_id(sid) if mode != "off" else sid.lower()
+    return sid.lower()
 
 
 def _realize(session_id: str) -> None:
@@ -332,9 +342,9 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
         pane = pane_id(sid, slot)
         if command in ("", "none"):
             agtermctl("session", "restore", "--clear", "--target", sid, "--pane", slot)
-            return {"action": "cleared", "pane": pane, "session": sid.upper()}
+            return {"action": "cleared", "pane": pane, "session": sid.lower()}
         agtermctl("session", "restore", command, "--target", sid, "--pane", slot)
-        return {"action": "pinned", "pane": pane, "session": sid.upper(), "command": command}
+        return {"action": "pinned", "pane": pane, "session": sid.lower(), "command": command}
     if cmd == "session.close":
         sid, _ = resolve(target)
         agtermctl("session", "close", "--target", sid)
@@ -349,10 +359,10 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
             agtermctl("session", "context", "--clear", "--target", sid)
         else:
             agtermctl("session", "context", str(args.get("text", "")), "--target", sid)
-        return {"session": sid.upper(), "context": args.get("text")}
+        return {"session": sid.lower(), "context": args.get("text")}
     if cmd == "session.move":
         sid, _ = resolve(target)
-        agtermctl("session", "move", str(args["workspace"]), "--target", sid)
+        agtermctl("session", "move", _real_workspace(str(args["workspace"]), raw_tree()), "--target", sid)
         return "moved"
     if cmd == "session.select":
         sid, _ = resolve(target)
@@ -395,7 +405,7 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
         return "notified"
     if cmd == "workspace.new":
         result = agtermctl("workspace", "new", str(args.get("name", "")))
-        return str(result.get("id") if isinstance(result, dict) else result).upper()
+        return str(result.get("id") if isinstance(result, dict) else result).lower()
     if cmd.startswith("install"):
         return "agterm: nothing to install"  # hooks/skill come from `agtermctl integration install`
     raise CtlError(f"verb not supported on agterm: {cmd}")
