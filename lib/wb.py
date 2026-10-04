@@ -123,7 +123,7 @@ def pane_command(root: Path, tag: str, script: str, **params: str) -> list[str]:
     # its last native command's code instead of 0. Nothing reads a helper pane's exit code.
     # The BOM makes Windows PowerShell 5.1 read it as UTF-8; newline="" keeps a value's own newlines.
     launcher.write_text(f"# wb.py {tag} (#86)\n{call}\nexit $LASTEXITCODE\n", encoding="utf-8-sig", newline="")
-    shell = shutil.which("pwsh") or shutil.which("powershell.exe") or "powershell.exe"
+    shell = shutil.which("pwsh") or shutil.which("pwsh-preview") or shutil.which("powershell.exe") or "powershell.exe"
     return [shell, "-NoLogo", "-ExecutionPolicy", "Bypass", "-File", str(launcher)]
 
 

@@ -86,7 +86,7 @@ def command_for(argv: list[str]) -> list[str] | str:
     cannot be started directly and runs through cmd.exe, as one command line (a string). Anything
     else runs as the resolved path. An unresolved name is left as given: starting it reports why."""
     if argv and argv[0].lower().endswith(".ps1"):
-        shell = shutil.which("pwsh") or shutil.which("powershell.exe") or "powershell.exe"
+        shell = shutil.which("pwsh") or shutil.which("pwsh-preview") or shutil.which("powershell.exe") or "powershell.exe"
         return [shell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *argv]
     if not argv:
         return []

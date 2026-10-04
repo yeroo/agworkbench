@@ -1346,7 +1346,7 @@ class Worker:
         output = self.store.directory / f'launch-{m["number"]}-{m["attempt"]}.log'
         stream = open(output, 'wb')
         env = dict(os.environ, AGWORKBENCH_CONFIG=data['config'])
-        shell = shutil.which('pwsh') or shutil.which('powershell.exe')
+        shell = shutil.which('pwsh') or shutil.which('pwsh-preview') or shutil.which('powershell.exe')
         if not shell:
             stream.close()
             raise QueueError('PowerShell is not installed')

@@ -398,7 +398,7 @@ def wmi_create(command_line: str, cwd: str) -> int:
         return "'" + text.replace("'", "''") + "'"
     script = ('$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=' +
               quoted(command_line) + '; CurrentDirectory=' + quoted(cwd) + "}; 'rc=' + $r.ReturnValue + ' pid=' + $r.ProcessId")
-    shell = shutil.which('powershell.exe') or shutil.which('pwsh') or 'powershell.exe'
+    shell = shutil.which('powershell.exe') or shutil.which('pwsh') or shutil.which('pwsh-preview') or 'powershell.exe'
     done = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-Command', script], capture_output=True, text=True,
                           encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL, timeout=60)
     match = re.search(r'rc=0 pid=([0-9]+)', done.stdout)

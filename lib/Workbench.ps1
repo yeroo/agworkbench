@@ -88,6 +88,7 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
         if ($failure.Exception -is [AdoptRefused]) {
             $script:Launch.ExitCode = 2
             Write-Host "Adoption refused: $($failure.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "To open the issue in a new session instead, rerun with -NewSession." -ForegroundColor Yellow
             return $false
         }
         if ($failure.Exception -is [ImplementerConflict]) {
@@ -445,7 +446,9 @@ function Get-ToolchainVersions {
         } catch {
             $version = "error: $(($_.Exception.Message -split '\r?\n')[0])"
         }
-        [pscustomobject] @{ Name = $name; Version = $version }
+        $label = $name
+        if ($name -eq 'agwinterm' -and $script:OnAgterm) { $label = 'agterm' }
+        [pscustomobject] @{ Name = $label; Version = $version }
     }
 }
 
@@ -961,7 +964,7 @@ function Get-ClaudeQuietSettings([string] $Checkout) {
 function Get-ShellScriptPolicies {
     # The effective execution policy of each installed PowerShell, as that shell reports it.
     $policies = [ordered]@{}
-    foreach ($shell in @('pwsh', 'powershell.exe')) {
+    foreach ($shell in @('pwsh', 'pwsh-preview', 'powershell.exe')) {
         if (-not (Get-Command $shell -CommandType Application -ErrorAction SilentlyContinue)) { continue }
         $policies[$shell] = (& $shell -NoLogo -NoProfile -NonInteractive -Command 'Get-ExecutionPolicy' 2>$null | Select-Object -Last 1)
     }
@@ -2279,6 +2282,7 @@ function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments, [string[]]
     # Restricted still runs the pane script - `& 'x.ps1'` alone would be refused there.
     $shell = 'powershell.exe'
     if (Get-Command pwsh -ErrorAction SilentlyContinue) { $shell = 'pwsh' }
+    elseif (Get-Command pwsh-preview -ErrorAction SilentlyContinue) { $shell = 'pwsh-preview' }  # PowerShell Preview only (#60)
     $prefix = @('-NoLogo', '-ExecutionPolicy', 'Bypass', '-File')
     $scriptPath = Join-Path $script:Lib $Script
     $parameters = @()
@@ -2366,8 +2370,10 @@ function Invoke-LauncherBody {
     # --- 1. the terminal --------------------------------------------------------------------------
     Set-LaunchStage terminal
     if (Test-InsideAgwinterm) {
-        if ($adoptionPlan) { Write-Step "inside agwinterm: adopting session $($adoptionPlan.Session.id)" }
-        else { Write-Step "inside agwinterm: opening the session in this window" }
+        $terminal = 'agwinterm'
+        if ($script:OnAgterm) { $terminal = 'agterm' }
+        if ($adoptionPlan) { Write-Step "inside ${terminal}: adopting session $($adoptionPlan.Session.id)" }
+        else { Write-Step "inside ${terminal}: opening the session in this window" }
     } elseif (Get-AgwintermCtl) {
         if ($DryRun) { Write-Step "would start agwinterm if it is not running" }
         elseif (-not (Test-AgwintermRunning)) { Start-AgwintermApp }
@@ -2449,7 +2455,7 @@ function Invoke-LauncherBody {
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
         if ($resolved.Tool -ne 'codex') { $relayTool = " --implementer-tool $($resolved.Tool)" }
-        Write-Step "relay:      python $(Join-Path 'lib' 'relay.py') --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
+        Write-Step "relay:      $script:Python $(Join-Path 'lib' 'relay.py') --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
         return
     }
 
