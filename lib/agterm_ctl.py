@@ -147,6 +147,13 @@ def _session_node(session: dict[str, Any]) -> dict[str, Any]:
     if split:
         node["axis"] = session.get("splitAxis") or "vertical"
         node["paneCwds"] = [session.get("cwd", ""), session.get("splitCwd", session.get("cwd", ""))]
+    # What each pane runs in front of its shell; None when the pane is at its shell prompt. agterm
+    # omits `foreground` exactly then, so this tells "ready shell" apart without reading the prompt,
+    # which a themed shell (oh-my-posh, a custom PS1) can draw any way it likes.
+    fg = {panes[0]: session.get("foreground") or None}
+    if split:
+        fg[panes[1]] = session.get("splitForeground") or None
+    node["paneForeground"] = fg
     for key in ("context", "status", "statusChangedAt"):
         if key in session:
             node[key] = session[key]

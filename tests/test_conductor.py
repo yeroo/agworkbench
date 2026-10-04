@@ -891,7 +891,11 @@ class QueueCase(unittest.TestCase):
         data = self.store.load()
         m = dict(self.member(1), token=str(uuid.uuid4()))
         worker = q.Worker(self.store, data['owner']['token'], gh=self.gh, clock=lambda: self.now)
-        with patch.object(q.subprocess, 'Popen') as popen:
+        # The arguments are the subject, not the machine: a PowerShell is found whether or not one
+        # is installed (macOS has none by default, #60).
+        real_which = shutil.which
+        fake_which = lambda name, *a, **k: '/usr/bin/pwsh' if name in ('pwsh', 'powershell.exe') else real_which(name, *a, **k)
+        with patch.object(q.subprocess, 'Popen') as popen, patch.object(q.shutil, 'which', side_effect=fake_which):
             job = worker.spawn_launcher(data, m)
         job['stream'].close()
         return popen.call_args.args[0]
@@ -3798,7 +3802,11 @@ class NamedQueues(unittest.TestCase):
         data = store.load()
         m = dict(q.find_member(data, 1), token=str(uuid.uuid4()))
         worker = q.Worker(store, data['owner']['token'], gh=self.gh, clock=lambda: self.now)
-        with patch.object(q.subprocess, 'Popen') as popen:
+        # The arguments are the subject, not the machine: a PowerShell is found whether or not one
+        # is installed (macOS has none by default, #60).
+        real_which = shutil.which
+        fake_which = lambda name, *a, **k: '/usr/bin/pwsh' if name in ('pwsh', 'powershell.exe') else real_which(name, *a, **k)
+        with patch.object(q.subprocess, 'Popen') as popen, patch.object(q.shutil, 'which', side_effect=fake_which):
             job = worker.spawn_launcher(data, m)
         job['stream'].close()
         return popen.call_args.args[0]
