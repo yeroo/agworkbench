@@ -48,6 +48,10 @@ KIMI_IDLE = fixture('kimi/idle-fresh.txt')
 PS_COMMAND = '\nPS C:\\repo> npm test\n\n> repo@1.0.0 test\nrunning 120 tests...\n'
 BASH_COMMAND = '\nboris@host:~/repo$ npm test\n' + '\n'.join(f'  ok {i} - test' for i in range(20)) + '\n'
 BASH_PROMPT = '\nboris@host:~/repo$ \n'
+# Kimi's box with its one footer row, then a pwsh command waiting for input: three rows below the box.
+_kimi_rows = KIMI_IDLE.splitlines()
+_kimi_bottom = max(i for i, row in enumerate(_kimi_rows) if peerchat.KIMI_BOTTOM_RE.match(row))
+KIMI_PS_FOOTER = '\n'.join(_kimi_rows[:_kimi_bottom + 2]) + '\nPS C:\\repo> Read-Host name\nname: \n'
 
 
 class ExitFixture(unittest.TestCase):
@@ -648,6 +652,18 @@ class Latches(ExitFixture):
         self.assertIn('codex', self.r.state['exitGaveUp'])
         self.assertEqual(1, len(self.logged('[dry-run] would clear exitGaveUp for codex')))
 
+    def test_dry_run_logs_each_box_once(self):
+        # FIX r4 m1: two latched boxes alternated in the watch-wide note and re-logged every tick.
+        self.r.state['exitGaveUp'] = {'codex': 1_000_000.0}
+        self.r.state['exitNoPin'] = {'claude': 1_000_000.0}
+        self.r._save()
+        self.r = self.make_relay(dry_run=True)
+        self.agent(IMPLEMENTER, KIMI_IDLE)
+        self.agent(PLANNER, CLAUDE_IDLE)
+        self.run_until(5)                                            # eleven reads
+        self.assertEqual(1, len(self.logged('[dry-run] would clear exitGaveUp for codex')))
+        self.assertEqual(1, len(self.logged('[dry-run] would clear exitNoPin for claude')))
+
     def assert_kept(self, box, pane, text):
         self.r.state['exitGaveUp'] = {box: 1_000_000.0}
         self.text[pane] = text
@@ -668,6 +684,12 @@ class Latches(ExitFixture):
             with self.subTest(prompt=name):
                 self.assert_kept('codex', IMPLEMENTER, KIMI_IDLE + below)
                 self.assertFalse(relay.agent_in_view('codex', CODEX_IDLE + below))
+
+    def test_a_pwsh_command_in_kimis_footer_rows_does_not_clear_it(self):
+        # FIX r4 m2: within the rows kimi_box allows below the box, only SHELL_ROW_RE's pwsh branch sees the prompt.
+        self.assertTrue(peerchat.composer_content('kimi', KIMI_PS_FOOTER) is not None)
+        self.assertFalse(relay.agent_in_view('kimi', KIMI_PS_FOOTER))
+        self.assert_kept('codex', IMPLEMENTER, KIMI_PS_FOOTER)
 
     def test_a_live_claude_frame_twice_clears_it(self):
         self.r.state['exitGaveUp'] = {'claude': 1_000_000.0}

@@ -1026,7 +1026,9 @@ class ExitWatch:
         if self.agent_reads[peer.box] < LIMIT_READS or not self.latched(peer.box):
             return
         if self.relay.dry_run:
-            self.note(f"[dry-run] would clear {self.latched(peer.box)} for {peer.box}: it runs an agent again")
+            if self.agent_reads[peer.box] == LIMIT_READS:     # once per run of agent reads, per box
+                self.relay.log(f"exit watch: [dry-run] would clear {self.latched(peer.box)} for {peer.box}: "
+                               "it runs an agent again")
             return
         for key in self.LATCHES:
             self.relay.state.get(key, {}).pop(peer.box, None)
