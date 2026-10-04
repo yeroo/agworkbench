@@ -2281,8 +2281,12 @@ function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments, [string[]]
     # A shell executable run explicitly with -ExecutionPolicy Bypass, so a machine whose policy is
     # Restricted still runs the pane script - `& 'x.ps1'` alone would be refused there.
     $shell = 'powershell.exe'
-    if (Get-Command pwsh -ErrorAction SilentlyContinue) { $shell = 'pwsh' }
-    elseif (Get-Command pwsh-preview -ErrorAction SilentlyContinue) { $shell = 'pwsh-preview' }  # PowerShell Preview only (#60)
+    if ($script:OnAgterm) {
+        # The PowerShell running this, by full path (#60). A name is resolved again by the pane's own
+        # shell, whose PATH lacks $PSHOME: under PowerShell Preview `pwsh` resolves here (Preview's
+        # $PSHOME holds a binary of that name) and is "command not found" in the pane.
+        $shell = (Get-Process -Id $PID).Path
+    } elseif (Get-Command pwsh -ErrorAction SilentlyContinue) { $shell = 'pwsh' }
     $prefix = @('-NoLogo', '-ExecutionPolicy', 'Bypass', '-File')
     $scriptPath = Join-Path $script:Lib $Script
     $parameters = @()
@@ -2300,7 +2304,9 @@ function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments, [string[]]
 
 function Get-PaneLaunch([string] $Script, [hashtable] $Arguments, [string[]] $Switches = @()) {
     $launch = Get-PaneLaunchArgs $Script $Arguments -Switches $Switches
-    $parts = @($launch.Exe) + $launch.Prefix + @((Quote $launch.ScriptPath))
+    $exe = $launch.Exe
+    if ($script:OnAgterm) { $exe = Quote $exe }    # a full path under agterm, which may hold spaces
+    $parts = @($exe) + $launch.Prefix + @((Quote $launch.ScriptPath))
     foreach ($parameter in $launch.Parameters) {
         $parts += @($parameter.Name, (Quote $parameter.Value))
     }
