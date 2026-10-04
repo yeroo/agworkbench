@@ -177,7 +177,7 @@ if ($Cleanup -or $BuildOnly) {
     if ($Repo) { $cleanupArgs += @('--repo', $Repo) }
     if ($DryRun) { $cleanupArgs += '--dry-run' }
     if ($BuildOnly) { $cleanupArgs += '--build-only' }
-    & python @cleanupArgs
+    & $script:Python @cleanupArgs
     exit $LASTEXITCODE
 }
 
@@ -292,7 +292,7 @@ if ($PSBoundParameters.ContainsKey('Queue')) {
     }
     $env:AGWORKBENCH_QUEUE_SPEC = $Queue
     try {
-        & python @queueArgs
+        & $script:Python @queueArgs
         $code = $LASTEXITCODE
     } finally {
         Remove-Item Env:\AGWORKBENCH_QUEUE_SPEC -ErrorAction SilentlyContinue
@@ -320,7 +320,7 @@ if ($Triage -or $Retriage) {
         if ($DryRun) { $triageArgs += '--dry-run' }
     }
     if ($PSBoundParameters.ContainsKey('Limit')) { $triageArgs += @('--limit', "$Limit") }
-    & python @triageArgs
+    & $script:Python @triageArgs
     exit $LASTEXITCODE
 }
 if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune -or $FollowUps -or $KimiOnly -or $PSBoundParameters.ContainsKey('Limit') -or
@@ -356,7 +356,7 @@ if ($QueueMember) {
     try {
         $contextArgs = @((Join-Path $script:Lib 'conductor.py'), 'member-context', '--file', $QueueMember,
             '--number', "$memberNumber", '--attempt', "$QueueAttempt", '--token', $QueueToken)
-        $contextText = & python @contextArgs
+        $contextText = & $script:Python @contextArgs
         if ($LASTEXITCODE -ne 0) { exit 2 }
         $context = $contextText | ConvertFrom-Json
         if ($context.repo -ne $memberRepo) { Write-Host 'Queue repository mismatch'; exit 2 }
@@ -364,7 +364,7 @@ if ($QueueMember) {
         $env:AGWORKBENCH_CONFIG = $context.config
         # Reads have a short deadline; cloning uses the overall launcher deadline.
         function gh {
-            & python (Join-Path $script:Lib 'conductor.py') gh-proxy -- @args
+            & $script:Python (Join-Path $script:Lib 'conductor.py') gh-proxy -- @args
             $global:LASTEXITCODE = $LASTEXITCODE
         }
         Enable-LaunchLog
@@ -408,7 +408,7 @@ if ($QueueMember) {
             Write-AtomicJson $resultPath $result
             $resultArgs = @((Join-Path $script:Lib 'conductor.py'), 'member-result', '--file', $QueueMember,
                 '--number', "$memberNumber", '--attempt', "$QueueAttempt", '--token', $QueueToken, '--result-file', $resultPath)
-            & python @resultArgs
+            & $script:Python @resultArgs
             if ($LASTEXITCODE -ne 0) {
                 if ($script:Launch.Checkout) {
                     try { Close-QueueSessions $script:Launch.Checkout $QueueToken | Out-Null }

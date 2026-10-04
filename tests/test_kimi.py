@@ -146,7 +146,7 @@ class Prepare(Temp):
         checkout = self.clone()
         env = kimi.prepare(str(checkout), "o/repo#7", allow_network=False, dry_run=True, home=self.home)["env"]
         self.assertEqual("1", env["KIMI_CODE_NO_AUTO_UPDATE"])
-        self.assertTrue(env["KIMI_SHELL_PATH"].lower().endswith("\\bin\\bash.exe"))
+        self.assertTrue(env["KIMI_SHELL_PATH"].lower().endswith("\\bin\\bash.exe" if os.name == "nt" else "/bash"))
         self.assertTrue(env["BASH_ENV"].endswith("/.workbench/state/kimi-bin/env.sh"))
         self.assertEqual("agworkbench-refused", env["GH_TOKEN"])
         self.assertEqual("5", env["GIT_CONFIG_COUNT"])
@@ -183,6 +183,14 @@ if GIT:
         BASH = None
 
 
+# The git a push can reach past the shim with, and the git bash finds without BASH_ENV: Git Bash's
+# own on Windows, the system git on Linux/macOS (#60).
+if os.name == "nt":
+    BYPASS_GITS, PLAIN_GIT = ("git.exe", "/mingw64/bin/git", "cmd //c git"), "/mingw64/bin/git"
+else:
+    BYPASS_GITS, PLAIN_GIT = (GIT or "git", "command -p git"), GIT
+
+
 @unittest.skipUnless(BASH, "Git Bash not found")
 class GuardRails(Temp):
     """The shims and the backstop, run through Git Bash's launcher with the pane's environment."""
@@ -217,10 +225,12 @@ class GuardRails(Temp):
     def test_git_resolves_to_the_shim_in_kimis_shell(self):
         done = self.bash("command -v git")
         self.assertTrue(done.stdout.strip().endswith("/.workbench/state/kimi-bin/git"), done.stdout + done.stderr)
+        if os.name != "nt":
+            return  # only Git Bash's launcher moves its own git ahead of an inherited PATH (#60)
         # Without BASH_ENV, Git Bash's own git wins: the reason BASH_ENV is there.
         plain = subprocess.run([BASH, "-c", "command -v git"], env=dict(os.environ, PATH=str(self.checkout / ".workbench/state/kimi-bin") + os.pathsep + os.environ["PATH"]),
                                capture_output=True, text=True)
-        self.assertEqual("/mingw64/bin/git", plain.stdout.strip())
+        self.assertEqual(PLAIN_GIT, plain.stdout.strip())
 
     def test_push_in_any_spelling_the_shim_sees_is_refused(self):
         for command in ("git push origin HEAD", "git -C . push", "git -c a.b=c push origin HEAD",
@@ -231,8 +241,7 @@ class GuardRails(Temp):
                 self.assertIn("refused in the Kimi implementer's pane", done.stderr)
 
     def test_the_backstop_stops_a_push_that_gets_past_the_shim(self):
-        for command in ("git.exe push origin HEAD", "/mingw64/bin/git push origin HEAD",
-                        "cmd //c git push origin HEAD"):
+        for command in (f"{bypass} push origin HEAD" for bypass in BYPASS_GITS):
             with self.subTest(command=command):
                 done = self.bash(command)
                 self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
@@ -242,13 +251,13 @@ class GuardRails(Temp):
                     "ssh://git@github.com/o/repo.git"):
             with self.subTest(url=url):
                 git(self.checkout, "remote", "set-url", "origin", url)
-                done = self.bash("git.exe push origin HEAD")
+                done = self.bash(f"{BYPASS_GITS[0]} push origin HEAD")
                 self.assertNotEqual(0, done.returncode)
                 self.assertIn("agworkbench-push-refused", done.stderr)
         git(self.checkout, "remote", "set-url", "origin", "https://github.com/o/repo.git")
         # Fetch URLs are not rewritten.
-        self.assertIn("https://github.com/o/repo.git (fetch)", self.bash("git.exe remote -v").stdout)
-        self.assertIn("agworkbench-push-refused://o/repo.git (push)", self.bash("git.exe remote -v").stdout)
+        self.assertIn("https://github.com/o/repo.git (fetch)", self.bash(f"{BYPASS_GITS[0]} remote -v").stdout)
+        self.assertIn("agworkbench-push-refused://o/repo.git (push)", self.bash(f"{BYPASS_GITS[0]} remote -v").stdout)
 
     def test_ordinary_git_passes_through(self):
         self.assertEqual(0, self.bash("git status --short").returncode)

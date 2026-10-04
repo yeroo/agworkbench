@@ -137,6 +137,12 @@ def git_bash(git: str | None) -> str:
     git.exe on PATH. Pinned through KIMI_SHELL_PATH so we know which shell runs, and BASH_ENV works."""
     if not git:
         raise Refused("git is not on PATH, so neither Kimi's shell (Git Bash) nor its git shim can be set up")
+    if os.name != "nt":
+        # Linux and macOS (#60): Kimi runs the system bash, which reads BASH_ENV like Git Bash does.
+        bash = shutil.which("bash") or "/bin/bash"
+        if not Path(bash).is_file():
+            raise Refused("bash was not found; Kimi's shell tool needs it")
+        return bash
     root = Path(git).resolve().parent.parent          # <root>\cmd\git.exe or <root>\bin\git.exe
     # ...or <root>\mingw64\bin\git.exe, one level deeper
     for candidate in (root / "bin" / "bash.exe", root.parent / "bin" / "bash.exe"):
@@ -222,6 +228,8 @@ def prepare(checkout: str, issue: str, allow_network: bool, dry_run: bool = Fals
               {"REAL_GIT": msys_path(git), "SHIM_DIR": msys_path(str(shim_dir))}.items()}
     for name in ("git", "gh", "env.sh"):
         _write_lf(shim_dir / name, _render(TEMPLATES / "bin" / name, values))
+        if name != "env.sh" and os.name != "nt":
+            (shim_dir / name).chmod(0o755)  # found on PATH only when executable, off Windows (#60)
     result["trust"] = grant_trust(str(root), home)
     return result
 

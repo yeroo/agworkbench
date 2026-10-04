@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import agterm_ctl
+
+agterm_ctl.bridge_env()  # inside agterm, the AGWINTERM_* names below (#60)
+
 def hub_root() -> Path:
     """Where the hub lives. `AI_HUB` overrides it, so a test can point the registry and the
     mailbox at a temp directory instead of the real one."""

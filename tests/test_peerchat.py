@@ -414,6 +414,10 @@ class Submission(unittest.TestCase):
 
 
 class CursorTransport(unittest.TestCase):
+    def setUp(self):
+        # These exercise agwinterm's own pipe/CLI transport, not the agterm bridge (#60).
+        self.enterContext(patch.object(agw, 'use_agterm', return_value=False))
+
     def test_non_object_envelopes_on_pipe_are_refused_without_cli_fallback(self):
         for raw in [b'[]', b'null', b'"text"']:
             with self.subTest(raw=raw), patch.object(agw, '_open_pipe', return_value=io.BytesIO()), \

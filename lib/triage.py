@@ -1076,7 +1076,7 @@ def open_watch_session(product: str, limit: int) -> int:
     if any(session.get('name') == name for _, session in agw.sessions(agw.tree())):
         print(f'{name} is already running')
         return 0
-    line = '& ' + conductor.command_line([sys.executable, str(HERE / 'triage.py'), 'watch', '--repo', product,
+    line = conductor.call_line([sys.executable, str(HERE / 'triage.py'), 'watch', '--repo', product,
                                           '--limit', str(limit)])
     session = agw.request('session.new', args={'name': name, 'cwd': str(HERE.parent), 'command': line})
     print(f'{name} running in session {str(session).split()[0] if session else "?"}')

@@ -253,7 +253,8 @@ class Pieces(unittest.TestCase):
                          command[1:])
         self.assertRegex(Path(command[0]).name.lower(), r'^(pwsh|powershell)(\.exe)?$')
         # r2 G1: a bare name resolves on PATH (PATHEXT honoured).
-        self.assertEqual([shutil.which('python'), '-m', 'unittest'], run_helper.command_for(['python', '-m', 'unittest']))
+        name = 'python' if shutil.which('python') else 'python3'      # macOS has only python3 (#60)
+        self.assertEqual([shutil.which(name), '-m', 'unittest'], run_helper.command_for([name, '-m', 'unittest']))
         self.assertEqual(['no-such-command-xyz', 'a'], run_helper.command_for(['no-such-command-xyz', 'a']))
 
     def test_decoder_choice(self):

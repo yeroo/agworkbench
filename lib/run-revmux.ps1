@@ -76,7 +76,7 @@ Write-Host "revmux round $Round (run $run), profile $Profile -> $report" -Foregr
 $code = $LASTEXITCODE
 $verdict = switch ($code) { 0 { 'clean' } 1 { 'findings reported' } default { "tool error (exit $code)" } }
 
-$out = & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender revmux --kind review `
+$out = & $script:Python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender revmux --kind review `
     --subject "revmux round ${Round}: $verdict" --body-file $report
 $postExit = $LASTEXITCODE
 $out | Out-Host
@@ -93,7 +93,7 @@ if ($postExit -eq 0) {
     # Never end silently (#45): the planner waits on this mail, not on a watcher of its own.
     if (-not $posted) {
         if ($null -eq $why) { $why = if ($null -ne $code) { "revmux exit $code" } else { 'it did not finish' } }
-        $out = & python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender helper --kind note `
+        $out = & $script:Python (Join-Path $script:Lib 'post.py') --hub $hubDir --to claude --sender helper --kind note `
             --subject "revmux round ${Round}: ended without a report ($why)" `
             --text "run-revmux.ps1 for round $Round ended without posting its report ($why). Look at the '#N revmux r$Round' session and $report."
         # Not a result (#84 r1): the note sends Claude to this session, so its marker names no mail
@@ -109,6 +109,6 @@ if ($postExit -eq 0) {
     # failed, or whose review run was a tool error, keeps its session: its pane holds revmux's stderr,
     # the only record of the error. The tool-error mail is still posted; it is just not a result.
     if ($posted -and $mail -and ($code -eq 0 -or $code -eq 1)) { $doneArgs += @('--mail', $mail, '--to', 'claude') }
-    & python @doneArgs
+    & $script:Python @doneArgs
 }
 if (-not $posted) { exit 1 }

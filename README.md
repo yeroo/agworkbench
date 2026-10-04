@@ -1020,6 +1020,7 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the next tool in `failoverOrder`; `false` only reports |
 | `failoverOrder` | `["claude", "codex", "kimi"]` | the tools a failover (and a queue with a limited tool) tries, in order: the first that is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools |
 | `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
+| `kimiApproval` | `"ask"` | the Kimi implementer's approval mode: `ask` runs `kimi --yolo` (it stops for commands it rates dangerous and waits for a human); `never` runs `kimi --auto` (no stops, as the Claude agents under `--dangerously-skip-permissions`; the push, `gh` and web guards stay) |
 | `kimiArgs` | `[]` | extra arguments for `kimi` (e.g. `["-m", "<model alias>"]`); approval-mode, session, agent and directory flags are refused in every spelling |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
 | `triage` | none | per product repo: `{"owner/repo": {"specRepos": [...], "model": "...", "kimiLabel": false}}`, the private spec repos `-Triage` judges against, and whether it also sets the `kimi` label (see Issue triage) |

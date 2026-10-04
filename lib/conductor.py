@@ -9,6 +9,7 @@ import math
 import os
 import getpass
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -855,12 +856,20 @@ def awaits_triage(data, m):
 
 
 def command_line(parts):
-    # Commands supplied to a terminal shell use PowerShell quoting; subprocess argv never does.
+    # Commands supplied to a terminal shell use that shell's quoting - PowerShell under agwinterm,
+    # sh under agterm (#60); subprocess argv never does.
+    if agw.use_agterm():
+        return shlex.join(str(p) for p in parts)
     return ' '.join("'" + str(p).replace("'", "''") + "'" for p in parts)
 
 
+def call_line(parts):
+    """A session command that runs `parts`: PowerShell needs its call operator, sh does not."""
+    return command_line(parts) if agw.use_agterm() else '& ' + command_line(parts)
+
+
 def conductor_command(store, token):
-    return '& ' + command_line([sys.executable, str(HERE / 'conductor.py'), 'run', '--file', str(store.path), '--token', token])
+    return call_line([sys.executable, str(HERE / 'conductor.py'), 'run', '--file', str(store.path), '--token', token])
 
 
 def pin_conductor(store, owner):

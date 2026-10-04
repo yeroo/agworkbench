@@ -70,8 +70,14 @@ function Install-GoTool([string] $Module, [string] $Name) {
     if (-not $gobin) { $gobin = Join-Path (& go env GOPATH).Trim() 'bin' }
     & go install "$Module@latest"
     if ($LASTEXITCODE -ne 0) { throw "go install $Module failed" }
-    # umputun's tools keep their main package in app/, so go names the binary app.exe
-    Move-Item -Force -LiteralPath (Join-Path $gobin 'app.exe') -Destination (Join-Path $gobin "$Name.exe")
+    # go names the binary after the main package's directory: app for revmux (its main package is
+    # app/), revdiff for revdiff (app/revdiff/ since 1.13). Rename only when that is not the tool's name.
+    $ext = ''
+    if ($env:OS -eq 'Windows_NT') { $ext = '.exe' }
+    $built = ($Module -split '/')[-1]
+    if ($built -ne $Name) {
+        Move-Item -Force -LiteralPath (Join-Path $gobin "$built$ext") -Destination (Join-Path $gobin "$Name$ext")
+    }
     Add-UserPath $gobin
     Write-Done "$Name built into $gobin"
 }
@@ -109,7 +115,7 @@ if (-not $SkipTools) {
     }
 
     Install-GoTool 'github.com/umputun/revmux/app' 'revmux'
-    Install-GoTool 'github.com/umputun/revdiff/app' 'revdiff'
+    Install-GoTool 'github.com/umputun/revdiff/app/revdiff' 'revdiff'
 
     if (Test-Tool gh) {
         & gh auth status *> $null

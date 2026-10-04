@@ -4,6 +4,22 @@
 $script:Lib = $PSScriptRoot
 $script:Root = Split-Path -Parent $PSScriptRoot
 
+# agterm (Linux, macOS) instead of agwinterm (#60): lib/agwintermctl speaks agwinterm's control
+# dialect on top of agtermctl, and an agterm pane gets the AGWINTERM_* names everything here reads.
+# The Python to run: `python3` off Windows (macOS has no `python`), `python` on Windows, where
+# `python3` may be the Microsoft Store stub. A bare name, so it also works inside a typed line (#60).
+$script:Python = 'python'
+if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows -and (Get-Command python3 -CommandType Application -ErrorAction SilentlyContinue)) {
+    $script:Python = 'python3'
+}
+$script:OnAgterm = if ($env:AGW_TERMINAL) { $env:AGW_TERMINAL -eq 'agterm' } else { -not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' }
+if ($script:OnAgterm -and $env:AGTERM_SESSION_ID -and -not $env:AGWINTERM_SESSION_ID) {
+    foreach ($line in @(& python3 (Join-Path $PSScriptRoot 'agterm_ctl.py') env)) {
+        $name, $value = "$line" -split '=', 2
+        if ($name -and $value) { Set-Item -Path "Env:$name" -Value $value }
+    }
+}
+
 class AdoptRefused : System.Exception {
     AdoptRefused([string] $Message) : base($Message) {}
 }
@@ -115,6 +131,9 @@ function Get-WorkbenchConfig {
                         claude-only with claude, kimi-mixed with kimi when revmux has it, #66)
          kimiPath       kimi.exe to run when implementer is kimi (default: PATH, then
                         ~\.kimi-code\bin\kimi.exe)
+         kimiApproval   the Kimi implementer's approval mode: "ask" (default, --yolo: Kimi stops for
+                        commands it rates dangerous) or "never" (--auto: it never stops, like the
+                        Claude agents under --dangerously-skip-permissions; the push/gh guards stay)
          kimiArgs       extra arguments for kimi (policy and session flags are refused - see
                         pane-implementer-kimi.ps1)
          failoverOrder  the tools -Failover and the queue try, in order, when the implementer is
@@ -146,12 +165,12 @@ function Get-WorkbenchConfig {
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
-                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @();
+                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask';
                  failoverOrder = @('claude', 'codex', 'kimi'); limitRetryMinutes = 30; reviewOnLimit = 'wait';
                  closeHelpers = $true; restartExited = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -161,6 +180,7 @@ function Get-WorkbenchConfig {
     if ($null -ne $config.kimiPath -and ($config.kimiPath -isnot [string] -or -not $config.kimiPath.Trim())) {
         throw "kimiPath in '$path' must be the path of kimi.exe (got '$($config.kimiPath)')"
     }
+    if ($config.kimiApproval -cnotin @('ask', 'never')) { throw "kimiApproval in '$path' must be ""ask"" or ""never"" (got '$($config.kimiApproval)')" }
     $config.kimiArgs = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
     foreach ($argument in $config.kimiArgs) {
         if ($argument -isnot [string]) { throw "kimiArgs in '$path' must be a list of strings (got '$argument')" }
@@ -259,6 +279,7 @@ function Find-KimiExe($Config) {
     $onPath = Find-Tool kimi
     if ($onPath) { return $onPath }
     $installed = Join-Path $HOME '.kimi-code\bin\kimi.exe'
+    if ($script:OnAgterm) { $installed = Join-Path $HOME '.kimi-code/bin/kimi' }
     if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
     return $null
 }
@@ -307,10 +328,10 @@ function Get-KimiProblem {
     }
     $guard = @('web-guard')
     if ($Config.allowNetwork) { $guard += '--allow-network' }
-    $said = & python (Join-Path $script:Lib 'kimi.py') @guard 2>&1
+    $said = & $script:Python (Join-Path $script:Lib 'kimi.py') @guard 2>&1
     if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
     if ($Checkout) {
-        $said = & python (Join-Path $script:Lib 'kimi.py') prepare --checkout $Checkout --issue 'check' --dry-run 2>&1
+        $said = & $script:Python (Join-Path $script:Lib 'kimi.py') prepare --checkout $Checkout --issue 'check' --dry-run 2>&1
         if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
     }
     return $null
@@ -326,6 +347,11 @@ function Assert-KimiReady($Config, [string] $Checkout) {
 function Get-AgwintermCtl {
     $candidates = @()
     if ($env:AGWINTERMCTL) { $candidates += $env:AGWINTERMCTL }
+    if ($script:OnAgterm) {
+        $candidates += (Join-Path $script:Lib 'agwintermctl')
+        foreach ($candidate in $candidates) { if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate } }
+        return $null
+    }
     $onPath = Get-Command agwintermctl -ErrorAction SilentlyContinue
     if ($onPath) { $candidates += $onPath.Source }
     $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\agwinterm\agwintermctl.exe')
@@ -428,6 +454,11 @@ function Get-ToolchainVersions {
 }
 
 function Get-AgwintermApp {
+    if ($script:OnAgterm) {
+        $app = Get-Command agterm-linux, agterm -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($app) { return $app.Source }
+        return $null
+    }
     # The installer ships Agwinterm.Win32.exe; the scoop manifest exposes agwinterm.exe.
     foreach ($candidate in @(
             (Join-Path $env:LOCALAPPDATA 'Programs\agwinterm\Agwinterm.Win32.exe'),
@@ -478,6 +509,7 @@ function Test-InsideAgwinterm {
 
 function Install-Agwinterm {
     param([switch] $Yes)
+    if ($script:OnAgterm) { throw "agterm is not installed or not answering: install agterm (Linux: agterm-linux package) and start it" }
     Write-Host "agwinterm is not installed." -ForegroundColor Yellow
     if (-not $Yes) {
         $answer = Read-Host "Install it with scoop from github.com/yeroo/scoop-bucket? [y/N]"
@@ -504,6 +536,13 @@ function Install-Agwinterm {
 
 function Install-AgwintermIntegrations {
     # The terminal's own agent skill and status hooks: sidebar dots, and agents that know the API.
+    if ($script:OnAgterm) {
+        foreach ($what in @('hooks', 'skill')) {
+            try { & agtermctl integration install $what | Out-Null; Write-Done "agterm: installed $what" }
+            catch { Write-Warning "agterm integration install $what failed: $_" }
+        }
+        return
+    }
     $ctl = Get-AgwintermCtl
     if (-not $ctl) { return }
     foreach ($what in @('skill', 'hooks')) {
@@ -517,7 +556,8 @@ function Start-AgwintermApp {
     $app = Get-AgwintermApp
     if (-not $app) { throw "agwinterm is installed but its executable was not found" }
     Write-Step "starting agwinterm"
-    Start-Process -FilePath $app | Out-Null
+    if ($script:OnAgterm) { Start-Process -FilePath 'setsid' -ArgumentList @($app) | Out-Null }
+    else { Start-Process -FilePath $app | Out-Null }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         if (Test-AgwintermRunning) { return }
@@ -671,6 +711,10 @@ function Test-ShellReady([string] $Text) {
     if ($frame -match ('(?m)^\s*[-' + [char]0x2500 + [char]0x2501 + [char]0x2014 + ']{10,}\s*$')) { return $false }
     $last = $rows[-1]
     if ($last -match '^PS [A-Za-z]:\\[^>]*> ?$') { return $true }
+    # Under agterm (#60): bash's user@host:path$ (or #), the default Debian/Ubuntu prompt, and zsh's
+    # user@host dir % (or #), the default macOS prompt.
+    if ($script:OnAgterm -and $last -match '^[\w.-]+@[\w.-]+:[^$#]*[$#] ?$') { return $true }
+    if ($script:OnAgterm -and $last -match '^[\w.-]+@[\w.-]+ [^%#]*[%#] ?$') { return $true }
     if ($last -match ('^\s*' + [char]0x276F + '\s*$') -and $rows.Count -ge 2) {
         return ($rows[-2] -match '(\d+(\.\d+)?(ms|s)|\d\d:\d\d(:\d\d)?)\s*$')
     }
@@ -686,6 +730,27 @@ function Test-ImplementerRunningFrame([string] $Text, [string] $Tool) {
     return $frame -match 'bypass permissions|for shortcuts|esc to interrupt'
 }
 
+function Test-PaneAtShell([string] $Pane) {
+    <# Under agterm (#60): $true when the pane sits at its shell prompt, $false when something runs
+       in front of it, from the tree's paneForeground - no prompt text involved. $null elsewhere, or
+       when the tree does not say, and the caller falls back to reading the pane. #>
+    if (-not $script:OnAgterm) { return $null }
+    foreach ($ws in (Get-Tree).workspaces) {
+        foreach ($s in $ws.sessions) {
+            if ($null -eq $s.PSObject.Properties['paneForeground']) { continue }
+            $entry = $s.paneForeground.PSObject.Properties[$Pane.ToLowerInvariant()]
+            if ($entry) { return ($null -eq $entry.Value) }
+        }
+    }
+    return $null
+}
+
+function Test-PaneShellReady([string] $Pane, [string] $Text) {
+    $atShell = Test-PaneAtShell $Pane
+    if ($null -ne $atShell) { return $atShell }
+    return Test-ShellReady $Text
+}
+
 function Wait-ShellPrompt {
     <# Newly created panes use the prompt-glyph rule. Adopted panes require Test-ShellReady's
        recognized empty shell frame; a lone glyph is refused. Empty text never permits typing. #>
@@ -697,7 +762,9 @@ function Wait-ShellPrompt {
     while ((Get-Date) -lt $deadline) {
         $text = Invoke-Ctl session text --target $Pane
         $tail = ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
-        if ($Adopted) { $ready = Test-ShellReady $text }
+        $atShell = Test-PaneAtShell $Pane
+        if ($null -ne $atShell) { $ready = $atShell -and [bool]$tail }
+        elseif ($Adopted) { $ready = Test-ShellReady $text }
         else { $ready = $tail -and $tail -match $prompt }
         if ($ready) {
             Write-LaunchLog prompt-decision "$Pane proven last-row=$tail waited=$([math]::Round(((Get-Date) - $started).TotalSeconds, 2))s"
@@ -1039,7 +1106,7 @@ function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $P
     }
     if (-not $record) {
         $recovered = $null
-        if ($ExistingPane -and -not $CallerIdentity -and -not (Test-ShellReady (Invoke-Ctl session text --target $Pane))) {
+        if ($ExistingPane -and -not $CallerIdentity -and -not (Test-PaneShellReady $Pane (Invoke-Ctl session text --target $Pane))) {
             if ($Role -eq 'implementer') {
                 # No implementer Claude predates its record, so there is nothing legacy to recover;
                 # guessing from transcripts could hand it the planner's conversation.
@@ -1148,7 +1215,7 @@ function Resolve-Implementer {
         }
         $live = $false
         if ($pane -and -not $NoProbe -and (Find-SessionByPane $Tree $pane)) {
-            $live = -not (Test-ShellReady (Invoke-Ctl session text --target $pane))
+            $live = -not (Test-PaneShellReady $pane (Invoke-Ctl session text --target $pane))
         } elseif ($pane -and $NoProbe) { $live = $true }
         if ($live) {
             $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
@@ -1275,7 +1342,7 @@ function Get-PaneLimit([string] $Text, [string] $Tool) {
     $previous = $global:OutputEncoding
     try {
         $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false
-        $json = $Text | & python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
+        $json = $Text | & $script:Python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
     } finally { $global:OutputEncoding = $previous }
     if ($LASTEXITCODE -ne 0) { throw "limits.py could not classify the $Tool pane" }
     return ($json | ConvertFrom-Json)
@@ -1283,11 +1350,35 @@ function Get-PaneLimit([string] $Text, [string] $Tool) {
 
 function Get-AgentProcesses {
     # The process-table boundary; tests replace it.
+    if ($script:OnAgterm) {
+        # Same shape as Win32_Process. Names keep the Windows spelling (claude.exe, kimi.exe, pwsh.exe)
+        # so the matching below is shared; Claude Code's native binary is already claude.exe here.
+        # The name is the basename of argv[0], not `comm`: BSD ps cuts comm to 16 characters of the
+        # path it was started by (/usr/local/bin/p...), and a login shell's argv[0] starts with '-'.
+        return @(& ps -eo 'pid=,ppid=,args=' -ww | ForEach-Object {
+            if ("$_" -match '^\s*(\d+)\s+(\d+)\s+(\S+)(.*)$') {
+                $row = @{ ProcessId = [int]$Matches[1]; ParentProcessId = [int]$Matches[2]; Name = $Matches[3]; CommandLine = $Matches[3] + $Matches[4] }
+                $row.Name = ($row.Name -split '/')[-1].TrimStart('-')
+                if (-not $row.Name.EndsWith('.exe')) { $row.Name = "$($row.Name).exe" }
+                [pscustomobject]$row
+            }
+        })
+    }
     return @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine)
 }
 
 function Stop-AgentTree([int] $ProcessId) {
     # The stop boundary; tests replace it. The tree is the agent and its helpers, never the pane's shell.
+    if ($script:OnAgterm) {
+        $all = @(Get-AgentProcesses)
+        $tree = @($ProcessId)
+        for ($i = 0; $i -lt $tree.Count; $i++) {
+            $tree += @($all | Where-Object { $_.ParentProcessId -eq $tree[$i] } | ForEach-Object { $_.ProcessId })
+        }
+        [array]::Reverse($tree)
+        foreach ($id in $tree) { & kill -KILL $id 2>$null }
+        return
+    }
     & taskkill.exe /T /F /PID $ProcessId | Out-Null
 }
 
@@ -1306,7 +1397,8 @@ function Find-AgentRoot([string] $Checkout, [string] $Tool) {
         $pane = '(?i)pane-implementer-kimi\.ps1.*-Checkout\s+["'']?' + [regex]::Escape($Checkout) + '["'']?(\s|$)'
         $shells = @($processes | Where-Object { $_.Name -in @('pwsh.exe', 'powershell.exe') -and $_.CommandLine -match $pane } |
             ForEach-Object { $_.ProcessId })
-        $matched = @($processes | Where-Object { $_.Name -eq 'kimi.exe' -and $shells -contains $_.ParentProcessId })
+        # Off Windows Kimi retitles itself kimi-code (#60).
+        $matched = @($processes | Where-Object { $_.Name -in @('kimi.exe', 'kimi-code.exe') -and $shells -contains $_.ParentProcessId })
     } else {
         $id = Get-RecordedClaudeSessionId $Checkout 'implementer'
         if (-not $id) { return @() }
@@ -1393,7 +1485,7 @@ function Invoke-Failover {
     $text = Invoke-Ctl session text --target $pane
     $seen = Get-PaneLimit $text $saved
     $lock = Join-Path $Checkout '.git\index.lock'
-    if (-not (Test-ShellReady $text)) {
+    if (-not (Test-PaneShellReady $pane $text)) {
         # Codex's warning chooser (#61) is as final as its limit: the chooser waits, nobody answers it.
         if ($seen.kind -notin @('limited', 'warning')) {
             throw [ImplementerConflict]::new("failover refused: the $saved pane is neither showing its own usage-limit message or warning chooser nor at a shell prompt")
@@ -1432,7 +1524,9 @@ function Invoke-Failover {
     if (-not $kind) { $kind = 'limited' }
     Set-ImplementerLimit $Checkout $saved ([pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); line = $line; kind = $kind })
     # The old tool's limit text must not greet the new agent: its relay would read it as its own.
-    Invoke-Ctl session type "Clear-Host`n" --target $pane | Out-Null
+    $clear = 'Clear-Host'
+    if ($script:OnAgterm) { $clear = 'clear' }
+    Invoke-Ctl session type "$clear`n" --target $pane | Out-Null
     if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
         throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> -Implementer $target once it is")
     }
@@ -1651,7 +1745,7 @@ function Start-WorkbenchSessionCore {
     } else { $session = Find-IssueSession $tree $WorkspaceName $Number $Slug $registry }
     if ($script:Launch.QueueContext) {
         $context = $script:Launch.QueueContext
-        $check = & python (Join-Path $script:Lib 'conductor.py') member-context --file $context.queue `
+        $check = & $script:Python (Join-Path $script:Lib 'conductor.py') member-context --file $context.queue `
             --number $context.number --attempt $context.attempt --token $context.token
         if ($LASTEXITCODE -ne 0) { throw 'queue launch authorization changed before setup' }
         $membershipPath = Join-Path $Checkout '.workbench\state\queue-member.json'
@@ -2144,7 +2238,7 @@ import hub; hub.reload_paths()
 hub.register('claude', tool='claude', pane=sys.argv[3], role='planner and reviewer', cwd=sys.argv[2])
 hub.register('codex', tool=sys.argv[5], pane=sys.argv[4], role='implementer', cwd=sys.argv[2])
 "@
-    $py | & python - $script:Lib $Checkout $ClaudePane $CodexPane $CodexTool | Out-Null
+    $py | & $script:Python - $script:Lib $Checkout $ClaudePane $CodexPane $CodexTool | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not initialise the workbench mailbox" }
     return $hub
 }
@@ -2171,14 +2265,18 @@ function Grant-ClaudeTrust {
     <# Claude Code's folder-trust dialog is not skipped by --dangerously-skip-permissions, and its
        default is "No, exit". See lib/trust.py for why and how the entry is written. #>
     param([string] $Dir)
-    $result = & python (Join-Path $script:Lib 'trust.py') --claude $Dir 2>&1
+    $result = & $script:Python (Join-Path $script:Lib 'trust.py') --claude $Dir 2>&1
     if ($LASTEXITCODE -eq 0) { Write-Step "claude: $result (this clone only)" }
     else { Write-Warning "claude trust not recorded ($result) - answer its trust prompt in the left pane yourself" }
 }
 
 # --- launcher entry --------------------------------------------------------------------------
 
-function Quote([string] $Value) { return "'" + $Value.Replace("'", "''") + "'" }
+function Quote([string] $Value) {
+    # Lines typed into a pane are read by its shell: PowerShell under agwinterm, bash under agterm (#60).
+    if ($script:OnAgterm) { return Quote-Bash $Value }
+    return "'" + $Value.Replace("'", "''") + "'"
+}
 
 function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments, [string[]] $Switches = @()) {
     # A shell executable run explicitly with -ExecutionPolicy Bypass, so a machine whose policy is
@@ -2355,13 +2453,13 @@ function Invoke-LauncherBody {
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
         if ($resolved.Tool -ne 'codex') { $relayTool = " --implementer-tool $($resolved.Tool)" }
-        Write-Step "relay:      python lib\relay.py --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
+        Write-Step "relay:      python $(Join-Path 'lib' 'relay.py') --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
         return
     }
 
     $relayBuilder = {
         param($Hub, $Left, $Right)
-        'python ' + (Quote (Join-Path $script:Lib 'relay.py')) + ' --hub ' + (Quote $Hub) +
+        $script:Python + ' ' + (Quote (Join-Path $script:Lib 'relay.py')) + ' --hub ' + (Quote $Hub) +
             ' --claude-pane ' + (Quote $Left) + ' --codex-pane ' + (Quote $Right) +
             ' --repo ' + (Quote $ref.Repo) + ' --branch ' + (Quote $co.Branch) + $relayTool
     }
