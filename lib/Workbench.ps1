@@ -157,6 +157,8 @@ function Get-WorkbenchConfig {
                         round a reviewer's limit stopped is rerun (default 30, more than 0)
          closeHelpers   the relay closes a finished revmux or suite helper session once its result mail
                         has been read (#84; default true, false keeps them all)
+         restartExited  the relay restarts an agent that exited to its pane's shell with the pane's
+                        pinned command, at most 3 times an hour (#98; default true, false never types)
          reviewOnLimit  a revmux round a reviewer's usage limit degraded, with -WaitOnLimit (#77): wait
                         (default) reruns it after limitRetryMinutes, fallback reruns it now with
                         claude-only #>
@@ -166,10 +168,10 @@ function Get-WorkbenchConfig {
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
                  cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask';
                  failoverOrder = @('claude', 'codex', 'kimi'); limitRetryMinutes = 30; reviewOnLimit = 'wait';
-                 closeHelpers = $true }
+                 closeHelpers = $true; restartExited = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -219,6 +221,8 @@ function Get-WorkbenchConfig {
     }
     # The relay reads this itself (#84, relay.close_helpers_setting); a bad value fails here, at launch.
     if ($config.closeHelpers -isnot [bool]) { throw "closeHelpers in '$path' must be true or false (got '$($config.closeHelpers)')" }
+    # The relay reads this itself (#98, relay.restart_exited_setting); a bad value fails here, at launch.
+    if ($config.restartExited -isnot [bool]) { throw "restartExited in '$path' must be true or false (got '$($config.restartExited)')" }
     if ($config.reviewOnLimit -isnot [string] -or $config.reviewOnLimit -cnotin @('wait', 'fallback')) {
         throw "reviewOnLimit in '$path' must be wait or fallback (got '$($config.reviewOnLimit)')"
     }

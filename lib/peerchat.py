@@ -254,8 +254,17 @@ class ClaudeComposer:
     prompt_column: int
 
 
+def at_shell(text: str) -> bool:
+    """#98: the last row is a pwsh prompt, with or without a command typed after it. The agent exited (or
+    crashed, leaving its frame above the prompt): no composer is visible, whatever the rows above show."""
+    filled = [row for row in (text or "").splitlines() if row.strip()]
+    return bool(filled) and bool(limits.SHELL_PS_COMMAND_RE.match(filled[-1]))
+
+
 def parse_claude_composer(text: str) -> ClaudeComposer | None:
     """Read content and geometry together from the same pair of composer rules."""
+    if at_shell(text):
+        return None
     lines = text.splitlines()[-BOX_LINES:]
     rules = [i for i, line in enumerate(lines) if RULE_RE.match(line)]
     if len(rules) < 2:
@@ -284,6 +293,8 @@ def codex_composer(text: str) -> str | None:
     content, so a shell line is never a target, and any row the parser does not recognise resets it
     too: an unread frame must refuse, not send.
     """
+    if at_shell(text):
+        return None
     rows: list[str] | None = None
     for line in trailing_block(text):
         if CODEX_SHELL_PROMPT_RE.match(line):
@@ -327,6 +338,8 @@ def kimi_composer(text: str) -> str | None:
     """Kimi Code's composer content: the `> ` row plus its wrapped rows, joined. None when the box is
     not visible, or holds anything the parser does not recognise (shell mode, a picker): an unread
     frame must refuse, not send."""
+    if at_shell(text):
+        return None
     box = kimi_box(text)
     if box is None:
         return None

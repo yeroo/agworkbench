@@ -256,6 +256,23 @@ the loop blocked itself. It sets the blocked sound status, writes waiting.json (
 mode reports `loop-state blocked` with a reason starting `stalled:`. To continue after that, run
 `wb.py status active`, plus `wb.py loop-state resumed` in queue mode.
 
+## Exited agents (the relay's `exit` mail)
+
+When an agent's process exits or crashes and its pane falls back to the pwsh prompt, the relay
+restarts it. It waits until the pane has been unchanged for 2 minutes, then types the pane's pinned
+restore command, which resumes the conversation, and logs `agent exited; restarted with resume`.
+Once the agent's composer is up, it types one `Chat from Workbench:` pointer saying so. A restarted
+Claude may therefore get a second, short "continue" turn after its own resume turn. You need to do
+nothing for a restart; mail held for the dead pane is rung once its agent is back.
+
+The relay restarts a pane at most 3 times an hour. When it gives up, or the pane has no pin, it
+notifies the human on your pane and, when the dead pane is the implementer's, mails you from
+`relay`, kind `exit`. Only giving up also sets the blocked sound status, writes waiting.json and,
+in queue mode, reports `loop-state blocked` with cause `environment`. Do not restart the agent yourself. Say in one line that the implementer keeps
+exiting, and leave it to the human. Once the human has restarted it with the pane's pinned command,
+run `wb.py status active` (plus `wb.py loop-state resumed` in queue mode). The human turns
+restarting off with `restartExited: false` in `~/.agworkbench.json`.
+
 ## Adopted session
 
 If the launcher printed `WORKBENCH ADOPTED`, this existing Claude session now owns that issue.

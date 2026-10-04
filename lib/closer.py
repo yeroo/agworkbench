@@ -709,6 +709,10 @@ def idle_blockers(peer, text: str) -> list[str]:
     empty. Empty only when it is idle. Shared by the close and the relay's stall watch (#45), so the
     two can never disagree about what idle means."""
     import peerchat
+    if limits.ps_prompt_last(text):
+        # #98: no agent is left to be busy or to hold a draft, so the pane is idle. The close may close
+        # it, and when the exit watch may not restart it the stall watch's pointer names it.
+        return []
     reasons = []
     if agent_busy(peer, text):
         reasons.append(f'{peer.box} is running a turn')

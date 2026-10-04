@@ -950,6 +950,48 @@ changes. After two periods of silence it no longer does, and the pointer names i
 It only mails, and it never answers a prompt. The sidebar status is not used: agwinterm's agent
 hooks rewrite it on every turn.
 
+### Exited agents: the relay restarts a pane that fell back to its shell (#98)
+
+An agent that exits or crashes leaves its pane at the root pwsh prompt. Its mail is held (a shell is
+not an agent), and the stall watch used to read the pane as not idle, so the loop sat there until
+someone noticed. On the same 30 s reads the relay now looks for it in every state of the loop.
+A pane counts as exited when agwinterm reports a live root shell with no child in it
+(`foregroundShells`) and its last row is a bare `PS X:\...> ` prompt. The rows above are not read,
+since a crash leaves the agent's frame there.
+
+- If the pane stays unchanged for 2 minutes, the relay types the pane's pinned restore command
+  into it, the one agwinterm would run on restart. Every pin resumes the conversation: `pane-claude.ps1`,
+  `pane-implementer-claude.ps1`, and `-Resume` for Codex and Kimi. The relay logs `agent exited;
+  restarted with resume: <box> (<tool>) attempt k/3`. Anything typed at the prompt, or any new
+  output, restarts the 2 minutes, so a human who quit the agent on purpose is not fought.
+- Once the agent's composer is idle and empty, the relay types one pointer, `Chat from Workbench:
+  your agent process exited and the relay restarted it; continue where you left off ...`. A Claude
+  pin already starts a resume turn, so for Claude this pointer is a second, short turn. If the pane
+  is not idle within 10 minutes, the pointer is dropped and logged.
+- The relay restarts a pane at most 3 times an hour. The relay.json records the restarts, so a
+  relay restart keeps the count. On the 4th exit the human is alerted: the planner's pane gets the
+  blocked sound status and a notification, `waiting.json` is written, and in queue mode the loop is
+  reported `loop-state blocked` with cause `environment`, so it keeps its slot. When the dead pane
+  is the implementer, the planner also gets mail from `relay` (kind `exit`). The relay then leaves
+  that pane alone until it is seen running an agent again: relay.json records the give-up
+  (`exitGaveUp`), so commands the human runs in that shell and a relay restart do not re-arm it.
+  Only an agent's composer at the bottom of the pane, with no shell prompt below it, seen on two
+  reads in a row, clears it. A crashed agent's frame above a command running in the shell does
+  not. To fix it, restart the agent with the pane's pinned command, then run `wb.py status active`.
+- A pane with no pinned command is not typed into. The relay notifies the planner's pane once and,
+  when the dead pane is the implementer, mails the planner (kind `exit`). The loop is not reported
+  blocked. The alert is latched the same way (`exitNoPin`).
+- An exited pane counts as idle: the close may close it. When the relay may not restart it, the
+  stall watch's pointer comes as usual and names the pane as being at a shell prompt.
+- In these cases the relay leaves the pane alone and logs why, once:
+  - `restartExited: false` is set in `~/.agworkbench.json`. Any spelling of the key set to anything
+    but true or null turns it off, and so does an unreadable config.
+  - A launcher holds `launch.lock`, which includes a `-Failover`.
+  - The loop is done, or the PR is finished and its close owns the panes.
+  - A usage-limit episode owns the pane.
+  - `state/implementer.json` records the implementer's tool as limited, or names a different tool
+    than the one the relay rings. This happens when a failover did not finish.
+
 **Suites and builds finish visibly.** `wb.py suite --label <sha7> -- <command>` runs a long command
 in its own `#N suite <label>` session in direct mode (`lib/run_helper.py`). The command runs with
 no shell: its first word is found on PATH, a `.ps1` runs under pwsh, and a `.cmd` or `.bat` shim
@@ -992,6 +1034,7 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
 | `limitRetryMinutes` | `30` | with `-WaitOnLimit`: minutes between the relay's probes of an agent waiting out its usage limit, and the wait before rerunning a review round a reviewer's limit stopped (more than 0; see A slow queue that waits out usage limits) |
 | `closeHelpers` | `true` | the relay closes a finished revmux or suite helper session once its result mail has been read (see Finished helpers, before the merge); `false` keeps them until the loop's close |
+| `restartExited` | `true` | the relay restarts an agent that exited to its pane's shell with the pane's pinned command, at most 3 times an hour (see Exited agents); `false` leaves the pane alone |
 | `reviewOnLimit` | `"wait"` | with `-WaitOnLimit`, a review round a reviewer's usage limit degraded: `wait` reruns it after `limitRetryMinutes`, `fallback` reruns it at once with `claude-only` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 

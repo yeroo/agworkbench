@@ -384,6 +384,23 @@ class KimiTodoPanel(unittest.TestCase):
                 self.assertIsNone(limits.classify(kimi_docked(above[:3], panel), "kimi"))
 
 
+
+class PsPromptLast(unittest.TestCase):
+    """#98: the relay's exit watch reads only the last row: a crash leaves the agent's frame above it."""
+
+    def test_table(self):
+        prompt = "PS C:\\Users\\boris\\source\\workbench\\repo-issue-7> "
+        kimi = (FIXTURES.parent / "kimi" / "idle-after-turn.txt").read_text(encoding="utf-8")
+        for text, expected in ((prompt, True), (prompt.rstrip(), True), (prompt + "   \n\n", True),
+                               ("To resume this session: kimi -r s\n" + prompt, True),
+                               (kimi + "\n" + prompt, True),            # a crashed agent's frame above it
+                               (prompt + "git status", False), ("PS C:\\x> pwsh -File pane-codex.ps1", False),
+                               (prompt + "\nOverwrite? [y/N]", False), (kimi, False), ("❯ ", False),
+                               ("PS /home/x> ", False), ("", False), (None, False)):
+            with self.subTest(text=(text or "")[-40:]):
+                self.assertIs(expected, limits.ps_prompt_last(text))
+
+
 class Cli(unittest.TestCase):
     def test_classify_prints_json(self):
         done = subprocess.run([sys.executable, str(ROOT / "lib" / "limits.py"), "classify", "--tool", "codex"],

@@ -730,3 +730,43 @@ class Rescue(unittest.TestCase):
         with self.assertRaises(peerchat.Refused):
             self.clear(fake)
         self.assertEqual([peerchat.CLEAR_KEY], fake.keys)
+
+
+class ExitedAgent(unittest.TestCase):
+    """#98 FIX r1: an agent that crashed leaves its frame above the shell prompt. Nothing may read a
+    composer out of it: mail typed there would land on the pwsh command line."""
+
+    PROMPT = '\nPS C:\\repo-issue-7> '
+
+    def setUp(self):
+        self.clock = Clock()
+
+    def run_in(self, fake, call):
+        with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'cursor_column', fake.cursor_column), \
+                patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
+                patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
+            return call()
+
+    def frames(self):
+        return (('claude', CLAUDE_IDLE), ('claude', claude(TEXT)), ('codex', CODEX_IDLE), ('codex', codex(TEXT)),
+                ('kimi', kimi_frame('idle-after-turn')), ('kimi', kimi(TEXT)))
+
+    def test_no_composer_above_a_shell_prompt(self):
+        for tool, frame in self.frames():
+            for row in (self.PROMPT, self.PROMPT + 'git status'):
+                with self.subTest(tool=tool, frame=frame[-40:], row=row):
+                    self.assertTrue(peerchat.at_shell(frame + row))
+                    self.assertIsNone(peerchat.composer_content(tool, frame + row))
+            self.assertFalse(peerchat.at_shell(frame))
+
+    def test_nothing_is_typed_into_a_dead_pane(self):
+        for tool, frame in self.frames():
+            for call in (lambda p: peerchat.send('pane', p, TEXT, dry_run=False, retry=False),
+                         lambda p: peerchat.resubmit('pane', p, TEXT),
+                         lambda p: peerchat.clear_pointer('pane', p, TEXT)):
+                with self.subTest(tool=tool, frame=frame[-40:]):
+                    fake = FakeAgw(tool, frames=[frame + self.PROMPT])
+                    with self.assertRaises(peerchat.Refused):
+                        self.run_in(fake, lambda: call(peerchat.PROFILES[tool]))
+                    self.assertEqual([], fake.keys)

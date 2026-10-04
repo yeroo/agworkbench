@@ -323,6 +323,20 @@ class Progress(StallFixture):
         self.assertEqual(2, len(self.stall_mail()))                 # a fresh period from minute 30
 
 
+class ExitedAgent(StallFixture):
+    def test_an_exited_agent_is_idle_and_the_pointer_names_it(self):
+        # #98 FIX r1 M3: a crashed Kimi left its frame above the prompt, and the exit watch may not restart
+        # it (restartExited off): the stall watch still points, and says why the pane is quiet.
+        kimi = (Path(__file__).resolve().parent / 'fixtures' / 'kimi' / 'draft-wrapped.txt').read_text(encoding='utf-8')
+        self.r.peers[1] = relay.Peer('codex', 'kimi', IMPLEMENTER)
+        self.text[IMPLEMENTER] = kimi + '\nPS C:\\repo-issue-7> '
+        self.assertEqual([], self.r.stall.busy(self.r.read_panes()))
+        self.run_until(S)
+        mails = self.stall_mail()
+        self.assertEqual(1, len(mails))
+        self.assertIn('- codex is at a shell prompt (its agent exited)', mails[0]['body'])
+
+
 class NoFalseStalls(StallFixture):
     def assert_quiet(self, minutes=4 * S):
         self.run_until(minutes)
