@@ -75,7 +75,8 @@ Seven jobs, one loop, one process per issue, running in its own visible agwinter
    pointer. At most EXIT_RESTARTS per pane per hour (kept in relay.json); the next exit alerts the
    human and reports the loop blocked (waiting.json, queue cause `environment`), with `exit` mail to
    the planner when the implementer died, and the pane is left alone until it runs an agent again
-   (a latch in relay.json, cleared only by an agent's composer read in the pane twice in a row).
+   (a latch in relay.json, cleared only by an agent's composer read at the bottom of the pane, with
+   no shell prompt below it, twice in a row: commands run in the shell never clear it).
    An exited pane counts as idle (closer.idle_blockers): the close may close it, and the stall
    pointer names it when the exit watch may not restart it. Never while `restartExited` is off, a launcher holds
    launch.lock, the loop is done or closing, or a usage limit owns the pane (the episode, or
@@ -879,6 +880,31 @@ class StallWatch:
                 self.relay.log(f"could not notify: {err}")
 
 
+# A shell prompt row, with or without a command after it: pwsh's `PS X:\...>` or a bash/zsh `user@host:dir$`.
+SHELL_ROW_RE = re.compile(r"^(?:PS [A-Za-z]:\\[^>]*>|[\w.-]+@[\w.-]+:\S*[$#%](?: |$))")
+
+
+def agent_in_view(tool: str, text: str) -> bool:
+    """#98: an agent's composer is the frame's bottom - not a crashed agent's frame with a shell below it.
+    Codex's composer is the pane's trailing block, and any other row there resets it. Kimi's box allows a
+    few footer rows below it and Claude's two rules may sit anywhere in the bottom BOX_LINES rows, so the
+    rows below those must be no shell prompt, and for Claude only its two-space-indented footer."""
+    import peerchat
+    if peerchat.composer_content(tool, text) is None:
+        return False
+    below: list[str] = []
+    if tool == "claude":
+        lines = text.splitlines()[-peerchat.BOX_LINES:]
+        rules = [i for i, line in enumerate(lines) if peerchat.RULE_RE.match(line)]
+        below = [row for row in lines[rules[-1] + 1:] if row.strip()]
+        if not all(peerchat.FOOTER_RE.match(row) for row in below):
+            return False
+    elif tool == "kimi":
+        lines, _, bottom = peerchat.kimi_box(text)
+        below = lines[bottom + 1:]
+    return not any(SHELL_ROW_RE.match(row.strip()) for row in below)
+
+
 class ExitWatch:
     """#98: an agent whose process exited (or crashed) leaves its pane at the root shell's prompt, and
     nothing else in the loop notices: peerchat holds its mail, and before #98 the stall watch read it as not idle.
@@ -893,9 +919,10 @@ class ExitWatch:
 
     Giving up, and the alert for a pane with no pin, are latched per box in relay.json (`exitGaveUp`,
     `exitNoPin`): the human was told to take the pane, so neither a command they run in its shell nor a
-    relay restart re-arms it. Only an agent's composer read in the pane LIMIT_READS times in a row
-    clears the latch. is_busy is not enough: the busy row of a crashed agent's frame stays in view above
-    the prompt."""
+    relay restart re-arms it. Only an agent's composer at the bottom of the pane, with no shell prompt
+    below it (agent_in_view), read LIMIT_READS times in a row clears the latch. is_busy is not enough:
+    the busy row of a crashed agent's frame stays in view above the prompt, and so do its composer
+    rules while a command runs below them."""
 
     LATCHES = ("exitGaveUp", "exitNoPin")
 
@@ -990,13 +1017,16 @@ class ExitWatch:
         self.relay._save()
 
     def seen_agent(self, peer: Peer, text: str) -> None:
-        """Count the reads with an agent's composer in the pane; LIMIT_READS of them clear its latches."""
-        import peerchat
-        if peerchat.composer_content(peer.tool, text) is None:
+        """Count the reads with an agent in view; LIMIT_READS of them clear its latches. A dry run reads the
+        live relay.json and never writes it."""
+        if not agent_in_view(peer.tool, text):
             self.agent_reads.pop(peer.box, None)
             return
         self.agent_reads[peer.box] = self.agent_reads.get(peer.box, 0) + 1
         if self.agent_reads[peer.box] < LIMIT_READS or not self.latched(peer.box):
+            return
+        if self.relay.dry_run:
+            self.note(f"[dry-run] would clear {self.latched(peer.box)} for {peer.box}: it runs an agent again")
             return
         for key in self.LATCHES:
             self.relay.state.get(key, {}).pop(peer.box, None)

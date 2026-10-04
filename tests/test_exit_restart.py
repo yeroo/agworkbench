@@ -44,6 +44,10 @@ def at_prompt(above='To resume this session: kimi -r session_0f0e2a55'):
 
 
 KIMI_IDLE = fixture('kimi/idle-fresh.txt')
+# A command the human runs in the shell below a crashed agent's frame (FIX r3 M2).
+PS_COMMAND = '\nPS C:\\repo> npm test\n\n> repo@1.0.0 test\nrunning 120 tests...\n'
+BASH_COMMAND = '\nboris@host:~/repo$ npm test\n' + '\n'.join(f'  ok {i} - test' for i in range(20)) + '\n'
+BASH_PROMPT = '\nboris@host:~/repo$ \n'
 
 
 class ExitFixture(unittest.TestCase):
@@ -630,6 +634,62 @@ class Latches(ExitFixture):
         self.run_until(5)
         self.assertNotIn('exitGaveUp', self.r.state)
         self.assertEqual([], self.exit_mail())
+
+    def test_dry_run_never_clears_the_latch(self):
+        # FIX r3 M1: a dry run that sees the agent back must not write its stale state over relay.json.
+        self.r.state['exitGaveUp'] = {'codex': 1_000_000.0}
+        self.r._save()
+        path = self.hub_dir / 'state' / 'relay.json'
+        before = path.read_bytes()
+        self.r = self.make_relay(dry_run=True)
+        self.agent(IMPLEMENTER, KIMI_IDLE)
+        self.run_until(3)
+        self.assertEqual(before, path.read_bytes())
+        self.assertIn('codex', self.r.state['exitGaveUp'])
+        self.assertEqual(1, len(self.logged('[dry-run] would clear exitGaveUp for codex')))
+
+    def assert_kept(self, box, pane, text):
+        self.r.state['exitGaveUp'] = {box: 1_000_000.0}
+        self.text[pane] = text
+        self.session['foregroundShells'][self.session['paneIds'].index(pane)] = 'pwsh'
+        self.run_until(2)                                            # five reads
+        self.assertIn(box, self.r.state['exitGaveUp'])
+
+    def test_a_command_below_a_crashed_claude_frame_does_not_clear_it(self):
+        # FIX r3 M2: Claude's rules stay in the bottom rows above the command and its output.
+        for name, below in (('pwsh', PS_COMMAND), ('bash', BASH_COMMAND), ('bash, bare', BASH_PROMPT)):
+            for frame in (CLAUDE_IDLE, CLAUDE_RUNNING):
+                with self.subTest(prompt=name, frame=frame[-40:]):
+                    self.assertEqual('', peerchat.composer_content('claude', frame + below))
+                    self.assert_kept('claude', PLANNER, frame + below)
+
+    def test_a_command_below_a_crashed_kimi_or_codex_frame_does_not_clear_it(self):
+        for name, below in (('pwsh', PS_COMMAND), ('bash', BASH_COMMAND), ('bash, bare', BASH_PROMPT)):
+            with self.subTest(prompt=name):
+                self.assert_kept('codex', IMPLEMENTER, KIMI_IDLE + below)
+                self.assertFalse(relay.agent_in_view('codex', CODEX_IDLE + below))
+
+    def test_a_live_claude_frame_twice_clears_it(self):
+        self.r.state['exitGaveUp'] = {'claude': 1_000_000.0}
+        self.agent(PLANNER, CLAUDE_IDLE)
+        self.tick(0)
+        self.assertIn('claude', self.r.state['exitGaveUp'])
+        self.tick(0.5)
+        self.assertEqual({}, self.r.state['exitGaveUp'])
+
+
+class AgentInView(unittest.TestCase):
+    def test_live_frames(self):
+        for tool, frame in (('claude', CLAUDE_IDLE), ('claude', CLAUDE_RUNNING), ('codex', CODEX_IDLE),
+                            ('kimi', KIMI_IDLE), ('kimi', fixture('kimi/running-tool.txt'))):
+            with self.subTest(tool=tool, frame=frame[-40:]):
+                self.assertTrue(relay.agent_in_view(tool, frame))
+
+    def test_a_shell_below_the_frame(self):
+        for tool, frame in (('claude', CLAUDE_IDLE), ('codex', CODEX_IDLE), ('kimi', KIMI_IDLE)):
+            for below in (PS_COMMAND, BASH_COMMAND, BASH_PROMPT, '\n' + PROMPT):
+                with self.subTest(tool=tool, below=below[:30]):
+                    self.assertFalse(relay.agent_in_view(tool, frame + below))
 
 
 class Pointer(ExitFixture):

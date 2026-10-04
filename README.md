@@ -975,8 +975,9 @@ since a crash leaves the agent's frame there.
   is the implementer, the planner also gets mail from `relay` (kind `exit`). The relay then leaves
   that pane alone until it is seen running an agent again: relay.json records the give-up
   (`exitGaveUp`), so commands the human runs in that shell and a relay restart do not re-arm it.
-  Only an agent's composer, seen in the pane on two reads in a row, clears it. To fix it, restart
-  the agent with the pane's pinned command, then run `wb.py status active`.
+  Only an agent's composer at the bottom of the pane, with no shell prompt below it, seen on two
+  reads in a row, clears it. A crashed agent's frame above a command running in the shell does
+  not. To fix it, restart the agent with the pane's pinned command, then run `wb.py status active`.
 - A pane with no pinned command is not typed into. The relay notifies the planner's pane once and,
   when the dead pane is the implementer, mails the planner (kind `exit`). The loop is not reported
   blocked. The alert is latched the same way (`exitNoPin`).
