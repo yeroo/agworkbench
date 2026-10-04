@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# github-workbench <issue> - the POSIX entry point (Linux/macOS with agterm, #60).
+# Arguments reach the launcher as a JSON array in a one-off environment variable, exactly as
+# github-workbench-entry.ps1 does on Windows, so a -Queue 'where: ...' query keeps its quotes.
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+name="AGWORKBENCH_ARGS_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+export "$name=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")"
+exec pwsh -NoLogo -NoProfile -File "$here/lib/github-workbench.ps1" -ArgsEnv "$name"

@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""agwintermctl stand-in on agterm (Linux/macOS): see agterm_ctl.py."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import agterm_ctl  # noqa: E402
+
+sys.exit(agterm_ctl.main())
