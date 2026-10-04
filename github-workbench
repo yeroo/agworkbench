@@ -5,4 +5,5 @@
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 name="AGWORKBENCH_ARGS_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 export "$name=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")"
-exec pwsh -NoLogo -NoProfile -File "$here/lib/github-workbench.ps1" -ArgsEnv "$name"
+pwsh=$(command -v pwsh || command -v pwsh-preview) || { echo "github-workbench: PowerShell 7 (pwsh) is not installed" >&2; exit 127; }
+exec "$pwsh" -NoLogo -NoProfile -File "$here/lib/github-workbench.ps1" -ArgsEnv "$name"
