@@ -74,7 +74,8 @@ Seven jobs, one loop, one process per issue, running in its own visible agwinter
    command (every pin resumes the conversation), and once the agent's composer is idle one resume
    pointer. At most EXIT_RESTARTS per pane per hour (kept in relay.json); the next exit alerts the
    human and reports the loop blocked (waiting.json, queue cause `environment`), with `exit` mail to
-   the planner when the implementer died, and the pane is left alone until it runs an agent again.
+   the planner when the implementer died, and the pane is left alone until it runs an agent again
+   (a latch in relay.json, cleared only by an agent's composer read in the pane twice in a row).
    An exited pane counts as idle (closer.idle_blockers): the close may close it, and the stall
    pointer names it when the exit watch may not restart it. Never while `restartExited` is off, a launcher holds
    launch.lock, the loop is done or closing, or a usage limit owns the pane (the episode, or
@@ -88,7 +89,9 @@ push to it.
 
 Typing into a pane goes through `peerchat` (vendored, fail-closed): a composer that is not
 provably empty, a dialog on screen, or a pane that is not an agent is a refusal, never a send. A
-refusal before typing is retried on the next tick. Submit keys are verified and retried by
+refusal before typing is retried on the next tick. The one exception is the exit watch's restart:
+it types the pane's pin into a bare shell prompt, which has no composer for peerchat to read, after
+re-reading the pane and finding the very frame that sat out the grace period. Submit keys are verified and retried by
 peerchat; a failed ring is announced only after a later send succeeds from an empty composer, or
 after the pointer rescue (#96) submits it. Every `--limit-interval` seconds, watching and draining,
 and on every pass of the autonomous close, the relay looks for its own pointer still sitting in an
@@ -362,12 +365,12 @@ def stall_setting() -> float:
     return float(value)
 
 
-def close_helpers_setting() -> tuple[bool, str]:
-    """(`closeHelpers` from ~/.agworkbench.json, why it is off) (#84). On when the file or the key is
-    missing, or the key is null (the launcher skips null too). Fails closed: a config it cannot read or
-    parse (locked, half-written, `//` comments), or a value that is not true or false, closes nothing.
-    The key is matched in any case, as PowerShell's launcher reads it: any spelling set to anything but
-    true or null turns closing off, so `"CloseHelpers": false` or two spellings that disagree keep all."""
+def _bool_setting(key: str) -> tuple[bool, str]:
+    """(a switch from ~/.agworkbench.json, why it is off). On when the file or the key is missing, or the
+    key is null (the launcher skips null too). Fails closed: a config it cannot read or parse (locked,
+    half-written, `//` comments), or a value that is not true or false, turns it off. The key is
+    matched in any case, as PowerShell's launcher reads it: any spelling set to anything but true or
+    null turns it off, so `"CloseHelpers": false` or two spellings that disagree mean off."""
     path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -377,29 +380,20 @@ def close_helpers_setting() -> tuple[bool, str]:
         return False, f'config {path} unreadable: {err}'
     if not isinstance(config, dict):
         return False, f'config {path} is not a JSON object'
-    for key, value in config.items():
-        if key.casefold() == "closehelpers" and value is not None and value is not True:
-            return False, f'{key}: {json.dumps(value)}'
+    for name, value in config.items():
+        if name.casefold() == key.casefold() and value is not None and value is not True:
+            return False, f'{name}: {json.dumps(value)}'
     return True, ''
+
+
+def close_helpers_setting() -> tuple[bool, str]:
+    """`closeHelpers` (#84): off closes no finished helper."""
+    return _bool_setting("closeHelpers")
 
 
 def restart_exited_setting() -> tuple[bool, str]:
-    """(`restartExited` from ~/.agworkbench.json, why it is off) (#98), read like `closeHelpers`: on when
-    the file or the key is missing or null; off for a config it cannot read and for any spelling of the
-    key set to anything but true or null."""
-    path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
-    try:
-        config = json.loads(path.read_text(encoding="utf-8-sig"))
-    except FileNotFoundError:
-        return True, ''
-    except (OSError, ValueError) as err:
-        return False, f'config {path} unreadable: {err}'
-    if not isinstance(config, dict):
-        return False, f'config {path} is not a JSON object'
-    for key, value in config.items():
-        if key.casefold() == "restartexited" and value is not None and value is not True:
-            return False, f'{key}: {json.dumps(value)}'
-    return True, ''
+    """`restartExited` (#98): off restarts no exited agent."""
+    return _bool_setting("restartExited")
 
 
 def limit_retry_setting() -> float:
@@ -887,7 +881,7 @@ class StallWatch:
 
 class ExitWatch:
     """#98: an agent whose process exited (or crashed) leaves its pane at the root shell's prompt, and
-    nothing else in the loop notices: peerchat holds its mail, the stall watch reads it as not idle.
+    nothing else in the loop notices: peerchat holds its mail, and before #98 the stall watch read it as not idle.
 
     One `tick` per limit interval, with the pane texts the limit check read and one tree snapshot. A pane
     is exited when the terminal reports a live root shell with no child in it (`foregroundShells`) and its
@@ -895,11 +889,20 @@ class ExitWatch:
     frame there. Unchanged for EXIT_GRACE_MINUTES (a human who quit on purpose types, and the clock
     restarts), the pane gets its pinned restore command - every pin resumes the conversation - and, once
     the agent's composer is idle, one resume pointer. EXIT_RESTARTS per hour, then the human is told and
-    the loop reported blocked. An episode ends when the pane reads not exited twice in a row."""
+    the loop reported blocked. An episode ends when the pane reads not exited twice in a row.
+
+    Giving up, and the alert for a pane with no pin, are latched per box in relay.json (`exitGaveUp`,
+    `exitNoPin`): the human was told to take the pane, so neither a command they run in its shell nor a
+    relay restart re-arms it. Only an agent's composer read in the pane LIMIT_READS times in a row
+    clears the latch. is_busy is not enough: the busy row of a crashed agent's frame stays in view above
+    the prompt."""
+
+    LATCHES = ("exitGaveUp", "exitNoPin")
 
     def __init__(self, relay: "Relay"):
         self.relay = relay
         self.episodes: dict[str, dict] = {}     # box -> {tail, since, misses, notes}
+        self.agent_reads: dict[str, int] = {}   # box -> consecutive reads with an agent's composer in the pane
         self.pointers: dict[str, float] = {}    # box -> wall time of the restart awaiting its pointer
         self.last_note: str | None = None
 
@@ -953,6 +956,8 @@ class ExitWatch:
             return
         for peer in self.relay.peers:
             text = texts.get(peer.box)
+            if isinstance(text, str):
+                self.seen_agent(peer, text)
             state, pin = self.exited(peer, snapshot, text)
             if state is None:
                 continue        # unknown: the grace clock neither advances nor resets
@@ -975,6 +980,28 @@ class ExitWatch:
                 episode.update(tail=tail, since=wall())
             if wall() - episode["since"] >= EXIT_GRACE_MINUTES * 60:
                 self.restart(peer, episode, pin)
+
+    # --- the latches ----------------------------------------------------------------------------
+    def latched(self, box: str) -> str | None:
+        return next((key for key in self.LATCHES if box in self.relay.state.get(key, {})), None)
+
+    def latch(self, key: str, box: str) -> None:
+        self.relay.state.setdefault(key, {})[box] = wall()
+        self.relay._save()
+
+    def seen_agent(self, peer: Peer, text: str) -> None:
+        """Count the reads with an agent's composer in the pane; LIMIT_READS of them clear its latches."""
+        import peerchat
+        if peerchat.composer_content(peer.tool, text) is None:
+            self.agent_reads.pop(peer.box, None)
+            return
+        self.agent_reads[peer.box] = self.agent_reads.get(peer.box, 0) + 1
+        if self.agent_reads[peer.box] < LIMIT_READS or not self.latched(peer.box):
+            return
+        for key in self.LATCHES:
+            self.relay.state.get(key, {}).pop(peer.box, None)
+        self.relay._save()
+        self.relay.log(f"exit watch: {peer.box} runs an agent again; a later exit is restarted again")
 
     # --- acting ---------------------------------------------------------------------------------
     def blocked_by(self, peer: Peer) -> str | None:
@@ -1012,9 +1039,12 @@ class ExitWatch:
         if why:
             self.once(episode, f"not restarting {label}: {why}")
             return
-        if "budget" in episode["notes"]:
-            # The relay gave up on this episode and told the human so: only the pane seen running an
-            # agent again (a new episode) brings the budget back into play.
+        latched = self.latched(peer.box)
+        if latched:
+            # The human was told to take this pane: only an agent seen running in it again (seen_agent)
+            # brings the restarts back into play.
+            self.once(episode, f"not restarting {label}: {latched} is set in relay.json; "
+                               "the pane is the human's until it runs an agent again")
             return
         recent = self.recent(peer.box)
         if self.relay.dry_run:
@@ -1025,16 +1055,22 @@ class ExitWatch:
             self.once(episode, f"[dry-run] would {what}")
             return
         if not pin:
-            if "no pin" not in episode["notes"]:
-                episode["notes"].add("no pin")
-                self.alert(peer, f"agent exited and its pane has no pinned restore command: {label}, pane {peer.pane}",
-                           "tell the human; they restart the agent in that pane by hand.")
+            self.latch("exitNoPin", peer.box)
+            self.alert(peer, f"agent exited and its pane has no pinned restore command: {label}, pane {peer.pane}",
+                       "tell the human; they restart the agent in that pane by hand.")
             return
         if len(recent) >= EXIT_RESTARTS:
-            episode["notes"].add("budget")
+            self.latch("exitGaveUp", peer.box)
             self.give_up(peer, len(recent))
             return
         try:
+            # The tick's read may be seconds old (the limit check ran since): type only into the very
+            # frame that sat out the grace period.
+            fresh = agw.pane_text(peer.pane)
+            if not limits.ps_prompt_last(fresh) or limits.tail_hash(fresh) != episode["tail"]:
+                self.relay.log(f"exit watch: {label} changed just before its restart; the grace starts again")
+                episode.update(tail=None, since=None)
+                return
             agw.type_into(peer.pane, pin + "\n")
         except (agw.CtlError, OSError) as err:
             self.once(episode, f"could not restart {label}: {err}")

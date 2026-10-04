@@ -953,8 +953,8 @@ hooks rewrite it on every turn.
 ### Exited agents: the relay restarts a pane that fell back to its shell (#98)
 
 An agent that exits or crashes leaves its pane at the root pwsh prompt. Its mail is held (a shell is
-not an agent), and the stall watch only sees a pane that is not idle, so the loop used to sit there
-until someone noticed. On the same 30 s reads the relay now looks for it in every state of the loop.
+not an agent), and the stall watch used to read the pane as not idle, so the loop sat there until
+someone noticed. On the same 30 s reads the relay now looks for it in every state of the loop.
 A pane counts as exited when agwinterm reports a live root shell with no child in it
 (`foregroundShells`) and its last row is a bare `PS X:\...> ` prompt. The rows above are not read,
 since a crash leaves the agent's frame there.
@@ -973,11 +973,13 @@ since a crash leaves the agent's frame there.
   blocked sound status and a notification, `waiting.json` is written, and in queue mode the loop is
   reported `loop-state blocked` with cause `environment`, so it keeps its slot. When the dead pane
   is the implementer, the planner also gets mail from `relay` (kind `exit`). The relay then leaves
-  that pane alone until it is seen running an agent again. To fix it, restart the agent with the
-  pane's pinned command, then run `wb.py status active`.
+  that pane alone until it is seen running an agent again: relay.json records the give-up
+  (`exitGaveUp`), so commands the human runs in that shell and a relay restart do not re-arm it.
+  Only an agent's composer, seen in the pane on two reads in a row, clears it. To fix it, restart
+  the agent with the pane's pinned command, then run `wb.py status active`.
 - A pane with no pinned command is not typed into. The relay notifies the planner's pane once and,
   when the dead pane is the implementer, mails the planner (kind `exit`). The loop is not reported
-  blocked.
+  blocked. The alert is latched the same way (`exitNoPin`).
 - An exited pane counts as idle: the close may close it. When the relay may not restart it, the
   stall watch's pointer comes as usual and names the pane as being at a shell prompt.
 - In these cases the relay leaves the pane alone and logs why, once:

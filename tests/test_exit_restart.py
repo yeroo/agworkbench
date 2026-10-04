@@ -220,6 +220,22 @@ class Restart(ExitFixture):
         self.assertEqual(2, len(self.restarts()))
         self.assertEqual(1, len(self.logged('attempt 2/3')))
 
+    def test_a_pane_that_changes_before_the_restart_is_not_typed_into(self):
+        # FIX r2 m1: the tick's read is seconds old by the time the restart types; the pane is re-read.
+        self.exit()
+        self.run_until(1.5)
+        texts = self.r.read_panes()
+        self.t = 2 * MIN
+        self.text[IMPLEMENTER] = at_prompt() + 'git st'              # the human starts typing meanwhile
+        self.r.exits.tick(texts)
+        self.assertEqual([], self.restarts())
+        self.assertEqual(1, len(self.logged('changed just before its restart')))
+        self.exit()                                                  # a fresh grace, then the restart
+        self.run_until(4, start=2.5)
+        self.assertEqual([], self.restarts())
+        self.run_until(5, start=4.5)
+        self.assertEqual(1, len(self.restarts()))
+
     def test_the_watch_is_wired_into_the_relay_loop(self):
         self.exit()
         calls = []
@@ -504,6 +520,116 @@ class Alerts(ExitFixture):
         self.exit()
         self.run_until(15, start=11.5)
         self.assertEqual(2, len(self.logged('exited 4 times')))
+
+
+class Latches(ExitFixture):
+    """FIX r2 M1: giving up and the no-pin alert hold until an agent is seen in the pane again, whatever
+    the human runs in its shell meanwhile, and across a relay restart."""
+    SPENT = [1_000_000 + 0.0, 1_000_000 + 60.0, 1_000_000 + 120.0]    # the hour frees up at minute 62
+
+    def give_up(self):
+        self.r.state['restarts'] = {'codex': list(self.SPENT)}
+        self.exit()
+        self.run_until(5)
+        self.assertEqual(1, len(self.exit_mail()))
+        self.assertIn('codex', self.r.state['exitGaveUp'])
+
+    def no_pin(self):
+        del self.session['restoreCommands'][IMPLEMENTER]
+        self.exit()
+        self.run_until(5)
+        self.notify.assert_called_once()
+        self.assertIn('codex', self.r.state['exitNoPin'])
+
+    def human_uses_the_shell(self, start):
+        """A command typed (two not-exited reads end the episode), then its output and a bare prompt."""
+        self.exit(text=at_prompt() + 'git status')
+        self.run_until(start + 0.5, start=start)
+        self.assertNotIn('codex', self.r.exits.episodes)
+        self.exit(text=at_prompt('On branch issue-7-fix\nnothing to commit, working tree clean'))
+        self.run_until(70, start=start + 1)
+
+    def assert_left_alone(self):
+        self.assertEqual([], self.restarts())
+        self.assertEqual(1, len(self.exit_mail()))
+        self.notify.assert_called_once()
+
+    def test_a_command_in_the_shell_after_giving_up_rearms_nothing(self):
+        self.give_up()
+        self.human_uses_the_shell(6)
+        self.assert_left_alone()
+        self.status.assert_called_once()
+        self.assertTrue(self.logged('not restarting codex (kimi): exitGaveUp is set in relay.json'))
+
+    def test_a_new_relay_after_giving_up_rearms_nothing(self):
+        self.give_up()
+        self.r = self.make_relay()
+        self.run_until(70, start=6)
+        self.assert_left_alone()
+        self.assertEqual(1, len(self.logged('exitGaveUp is set in relay.json')))
+
+    def test_a_crashed_agents_busy_row_does_not_clear_it(self):
+        self.give_up()
+        crashed = at_prompt(fixture('kimi/running-tool.txt'))
+        self.assertTrue(peerchat.is_busy(crashed))
+        self.exit(text=crashed)
+        self.run_until(70, start=6)
+        self.assert_left_alone()
+
+    def test_an_agent_seen_twice_clears_it(self):
+        self.give_up()
+        self.agent(IMPLEMENTER, KIMI_IDLE)                           # one read: still latched
+        self.tick(5.5)
+        self.assertIn('codex', self.r.state['exitGaveUp'])
+        self.exit()
+        self.run_until(10, start=6)
+        self.agent(IMPLEMENTER, KIMI_IDLE)                           # two reads: cleared, also on disk
+        self.run_until(11, start=10.5)
+        self.assertEqual({}, self.r.state['exitGaveUp'])
+        saved = json.loads((self.hub_dir / 'state' / 'relay.json').read_text(encoding='utf-8'))
+        self.assertEqual({}, saved['exitGaveUp'])
+        self.exit()                                                  # judged afresh: the hour is still spent
+        self.run_until(15, start=11.5)
+        self.assertEqual(2, len(self.exit_mail()))
+        self.agent(IMPLEMENTER, KIMI_IDLE)
+        self.run_until(61, start=15.5)
+        self.exit()                                                  # past the hour: restarted
+        self.run_until(64, start=61.5)
+        self.assertEqual(1, len(self.restarts()))
+
+    def test_a_command_in_the_shell_after_the_no_pin_alert_rearms_nothing(self):
+        self.no_pin()
+        self.human_uses_the_shell(6)
+        self.notify.assert_called_once()
+        self.assertEqual(1, len(self.exit_mail()))
+
+    def test_a_new_relay_after_the_no_pin_alert_rearms_nothing(self):
+        self.no_pin()
+        self.r = self.make_relay()
+        self.run_until(30, start=6)
+        self.notify.assert_called_once()
+        self.assertEqual(1, len(self.exit_mail()))
+
+    def test_an_agent_seen_twice_clears_the_no_pin_alert(self):
+        self.no_pin()
+        self.agent(IMPLEMENTER, KIMI_IDLE)
+        self.run_until(6, start=5.5)
+        self.assertEqual({}, self.r.state['exitNoPin'])
+        self.exit()
+        self.run_until(10, start=6.5)
+        self.assertEqual(2, self.notify.call_count)
+        self.assertEqual([], self.typed.call_args_list)
+
+    def test_dry_run_reads_the_latch_and_writes_none(self):
+        self.r.state['exitGaveUp'] = {'codex': 1_000_000.0}
+        self.r._save()
+        self.r = self.make_relay(dry_run=True)
+        self.r.state.pop('exitGaveUp')
+        self.r.state['restarts'] = {'codex': list(self.SPENT)}
+        self.exit()
+        self.run_until(5)
+        self.assertNotIn('exitGaveUp', self.r.state)
+        self.assertEqual([], self.exit_mail())
 
 
 class Pointer(ExitFixture):

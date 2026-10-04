@@ -336,6 +336,8 @@ class ExitedAgent(StallFixture):
         self.assertEqual(1, len(mails))
         self.assertIn('- codex is at a shell prompt (its agent exited)', mails[0]['body'])
 
+
+class NoFalseStalls(StallFixture):
     def assert_quiet(self, minutes=4 * S):
         self.run_until(minutes)
         self.assertEqual([], self.stall_mail())
