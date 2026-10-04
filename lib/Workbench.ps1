@@ -125,6 +125,9 @@ function Get-WorkbenchConfig {
                         claude-only with claude, kimi-mixed with kimi when revmux has it, #66)
          kimiPath       kimi.exe to run when implementer is kimi (default: PATH, then
                         ~\.kimi-code\bin\kimi.exe)
+         kimiApproval   the Kimi implementer's approval mode: "ask" (default, --yolo: Kimi stops for
+                        commands it rates dangerous) or "never" (--auto: it never stops, like the
+                        Claude agents under --dangerously-skip-permissions; the push/gh guards stay)
          kimiArgs       extra arguments for kimi (policy and session flags are refused - see
                         pane-implementer-kimi.ps1)
          failoverOrder  the tools -Failover and the queue try, in order, when the implementer is
@@ -154,12 +157,12 @@ function Get-WorkbenchConfig {
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
-                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @();
+                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask';
                  failoverOrder = @('claude', 'codex', 'kimi'); limitRetryMinutes = 30; reviewOnLimit = 'wait';
                  closeHelpers = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -169,6 +172,7 @@ function Get-WorkbenchConfig {
     if ($null -ne $config.kimiPath -and ($config.kimiPath -isnot [string] -or -not $config.kimiPath.Trim())) {
         throw "kimiPath in '$path' must be the path of kimi.exe (got '$($config.kimiPath)')"
     }
+    if ($config.kimiApproval -cnotin @('ask', 'never')) { throw "kimiApproval in '$path' must be ""ask"" or ""never"" (got '$($config.kimiApproval)')" }
     $config.kimiArgs = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
     foreach ($argument in $config.kimiArgs) {
         if ($argument -isnot [string]) { throw "kimiArgs in '$path' must be a list of strings (got '$argument')" }

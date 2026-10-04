@@ -5,11 +5,13 @@
 .DESCRIPTION
   The sibling of pane-codex.ps1 and pane-implementer-claude.ps1. Launch policy, and why:
 
-  --yolo ("Ask When Needed"), never --auto
+  --yolo ("Ask When Needed") by default; --auto only with "kimiApproval": "never"
       Routine edits and commands run on their own; Kimi still stops for commands it rates dangerous,
       sensitive files and .git control paths. Our own guards cover only push, gh and the web, so
-      --auto ("Never Ask") would remove the only stop left. A pane on an approval prompt shows up as
-      a dialog to the relay (mail is held) and in the stall watch.
+      --auto ("Never Ask") removes the only stop left. A pane on an approval prompt shows up as a
+      dialog to the relay (mail is held) and in the stall watch - and waits for a human. A machine
+      that runs its loops unattended, where the Claude agents already run with
+      --dangerously-skip-permissions, can choose "kimiApproval": "never" instead.
   No --agent-file
       Kimi Code 2.1.1 ignores --agent-file and --agent in interactive mode: only -p binds the profile.
       The role is <checkout>\.kimi-code\AGENTS.md instead, which Kimi loads next to the repository's
@@ -82,7 +84,9 @@ if ($Resume) {
         $resumed = $true
     }
 }
-$kimiArgs = @('--yolo') + $modeArgs + $extra
+$approval = '--yolo'
+if ($config.kimiApproval -eq 'never') { $approval = '--auto' }
+$kimiArgs = @($approval) + $modeArgs + $extra
 
 $shimDir = [string]$prepared.shimDir
 $environment = [ordered]@{ AGWORKBENCH = $script:Root; AI_HUB = (Join-Path $Checkout '.workbench'); AI_BOX = 'codex' }
