@@ -697,8 +697,10 @@ function Test-ShellReady([string] $Text) {
     if ($frame -match ('(?m)^\s*[-' + [char]0x2500 + [char]0x2501 + [char]0x2014 + ']{10,}\s*$')) { return $false }
     $last = $rows[-1]
     if ($last -match '^PS [A-Za-z]:\\[^>]*> ?$') { return $true }
-    # bash under agterm (#60): user@host:path$ (or #), the default Debian/Ubuntu prompt.
+    # Under agterm (#60): bash's user@host:path$ (or #), the default Debian/Ubuntu prompt, and zsh's
+    # user@host dir % (or #), the default macOS prompt.
     if ($script:OnAgterm -and $last -match '^[\w.-]+@[\w.-]+:[^$#]*[$#] ?$') { return $true }
+    if ($script:OnAgterm -and $last -match '^[\w.-]+@[\w.-]+ [^%#]*[%#] ?$') { return $true }
     if ($last -match ('^\s*' + [char]0x276F + '\s*$') -and $rows.Count -ge 2) {
         return ($rows[-2] -match '(\d+(\.\d+)?(ms|s)|\d\d:\d\d(:\d\d)?)\s*$')
     }
