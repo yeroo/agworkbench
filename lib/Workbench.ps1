@@ -6,6 +6,12 @@ $script:Root = Split-Path -Parent $PSScriptRoot
 
 # agterm (Linux, macOS) instead of agwinterm (#60): lib/agwintermctl speaks agwinterm's control
 # dialect on top of agtermctl, and an agterm pane gets the AGWINTERM_* names everything here reads.
+# The Python to run: `python3` off Windows (macOS has no `python`), `python` on Windows, where
+# `python3` may be the Microsoft Store stub. A bare name, so it also works inside a typed line (#60).
+$script:Python = 'python'
+if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows -and (Get-Command python3 -CommandType Application -ErrorAction SilentlyContinue)) {
+    $script:Python = 'python3'
+}
 $script:OnAgterm = if ($env:AGW_TERMINAL) { $env:AGW_TERMINAL -eq 'agterm' } else { -not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' }
 if ($script:OnAgterm -and $env:AGTERM_SESSION_ID -and -not $env:AGWINTERM_SESSION_ID) {
     foreach ($line in @(& python3 (Join-Path $PSScriptRoot 'agterm_ctl.py') env)) {
@@ -318,10 +324,10 @@ function Get-KimiProblem {
     }
     $guard = @('web-guard')
     if ($Config.allowNetwork) { $guard += '--allow-network' }
-    $said = & python (Join-Path $script:Lib 'kimi.py') @guard 2>&1
+    $said = & $script:Python (Join-Path $script:Lib 'kimi.py') @guard 2>&1
     if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
     if ($Checkout) {
-        $said = & python (Join-Path $script:Lib 'kimi.py') prepare --checkout $Checkout --issue 'check' --dry-run 2>&1
+        $said = & $script:Python (Join-Path $script:Lib 'kimi.py') prepare --checkout $Checkout --issue 'check' --dry-run 2>&1
         if ($LASTEXITCODE -ne 0) { return (($said | ForEach-Object { "$_" }) -join "`n").Trim() }
     }
     return $null
@@ -720,6 +726,27 @@ function Test-ImplementerRunningFrame([string] $Text, [string] $Tool) {
     return $frame -match 'bypass permissions|for shortcuts|esc to interrupt'
 }
 
+function Test-PaneAtShell([string] $Pane) {
+    <# Under agterm (#60): $true when the pane sits at its shell prompt, $false when something runs
+       in front of it, from the tree's paneForeground - no prompt text involved. $null elsewhere, or
+       when the tree does not say, and the caller falls back to reading the pane. #>
+    if (-not $script:OnAgterm) { return $null }
+    foreach ($ws in (Get-Tree).workspaces) {
+        foreach ($s in $ws.sessions) {
+            if ($null -eq $s.PSObject.Properties['paneForeground']) { continue }
+            $entry = $s.paneForeground.PSObject.Properties[$Pane.ToLowerInvariant()]
+            if ($entry) { return ($null -eq $entry.Value) }
+        }
+    }
+    return $null
+}
+
+function Test-PaneShellReady([string] $Pane, [string] $Text) {
+    $atShell = Test-PaneAtShell $Pane
+    if ($null -ne $atShell) { return $atShell }
+    return Test-ShellReady $Text
+}
+
 function Wait-ShellPrompt {
     <# Newly created panes use the prompt-glyph rule. Adopted panes require Test-ShellReady's
        recognized empty shell frame; a lone glyph is refused. Empty text never permits typing. #>
@@ -731,7 +758,9 @@ function Wait-ShellPrompt {
     while ((Get-Date) -lt $deadline) {
         $text = Invoke-Ctl session text --target $Pane
         $tail = ($text -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1)
-        if ($Adopted) { $ready = Test-ShellReady $text }
+        $atShell = Test-PaneAtShell $Pane
+        if ($null -ne $atShell) { $ready = $atShell -and [bool]$tail }
+        elseif ($Adopted) { $ready = Test-ShellReady $text }
         else { $ready = $tail -and $tail -match $prompt }
         if ($ready) {
             Write-LaunchLog prompt-decision "$Pane proven last-row=$tail waited=$([math]::Round(((Get-Date) - $started).TotalSeconds, 2))s"
@@ -1073,7 +1102,7 @@ function Reserve-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $P
     }
     if (-not $record) {
         $recovered = $null
-        if ($ExistingPane -and -not $CallerIdentity -and -not (Test-ShellReady (Invoke-Ctl session text --target $Pane))) {
+        if ($ExistingPane -and -not $CallerIdentity -and -not (Test-PaneShellReady $Pane (Invoke-Ctl session text --target $Pane))) {
             if ($Role -eq 'implementer') {
                 # No implementer Claude predates its record, so there is nothing legacy to recover;
                 # guessing from transcripts could hand it the planner's conversation.
@@ -1182,7 +1211,7 @@ function Resolve-Implementer {
         }
         $live = $false
         if ($pane -and -not $NoProbe -and (Find-SessionByPane $Tree $pane)) {
-            $live = -not (Test-ShellReady (Invoke-Ctl session text --target $pane))
+            $live = -not (Test-PaneShellReady $pane (Invoke-Ctl session text --target $pane))
         } elseif ($pane -and $NoProbe) { $live = $true }
         if ($live) {
             $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
@@ -1309,7 +1338,7 @@ function Get-PaneLimit([string] $Text, [string] $Tool) {
     $previous = $global:OutputEncoding
     try {
         $global:OutputEncoding = New-Object System.Text.UTF8Encoding $false
-        $json = $Text | & python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
+        $json = $Text | & $script:Python (Join-Path $script:Lib 'limits.py') classify --tool $Tool
     } finally { $global:OutputEncoding = $previous }
     if ($LASTEXITCODE -ne 0) { throw "limits.py could not classify the $Tool pane" }
     return ($json | ConvertFrom-Json)
@@ -1320,9 +1349,12 @@ function Get-AgentProcesses {
     if ($script:OnAgterm) {
         # Same shape as Win32_Process. Names keep the Windows spelling (claude.exe, kimi.exe, pwsh.exe)
         # so the matching below is shared; Claude Code's native binary is already claude.exe here.
-        return @(& ps -eo 'pid=,ppid=,comm=,args=' -ww | ForEach-Object {
-            if ("$_" -match '^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$') {
-                $row = @{ ProcessId = [int]$Matches[1]; ParentProcessId = [int]$Matches[2]; Name = $Matches[3]; CommandLine = $Matches[4] }
+        # The name is the basename of argv[0], not `comm`: BSD ps cuts comm to 16 characters of the
+        # path it was started by (/usr/local/bin/p...), and a login shell's argv[0] starts with '-'.
+        return @(& ps -eo 'pid=,ppid=,args=' -ww | ForEach-Object {
+            if ("$_" -match '^\s*(\d+)\s+(\d+)\s+(\S+)(.*)$') {
+                $row = @{ ProcessId = [int]$Matches[1]; ParentProcessId = [int]$Matches[2]; Name = $Matches[3]; CommandLine = $Matches[3] + $Matches[4] }
+                $row.Name = ($row.Name -split '/')[-1].TrimStart('-')
                 if (-not $row.Name.EndsWith('.exe')) { $row.Name = "$($row.Name).exe" }
                 [pscustomobject]$row
             }
@@ -1361,7 +1393,8 @@ function Find-AgentRoot([string] $Checkout, [string] $Tool) {
         $pane = '(?i)pane-implementer-kimi\.ps1.*-Checkout\s+["'']?' + [regex]::Escape($Checkout) + '["'']?(\s|$)'
         $shells = @($processes | Where-Object { $_.Name -in @('pwsh.exe', 'powershell.exe') -and $_.CommandLine -match $pane } |
             ForEach-Object { $_.ProcessId })
-        $matched = @($processes | Where-Object { $_.Name -eq 'kimi.exe' -and $shells -contains $_.ParentProcessId })
+        # Off Windows Kimi retitles itself kimi-code (#60).
+        $matched = @($processes | Where-Object { $_.Name -in @('kimi.exe', 'kimi-code.exe') -and $shells -contains $_.ParentProcessId })
     } else {
         $id = Get-RecordedClaudeSessionId $Checkout 'implementer'
         if (-not $id) { return @() }
@@ -1448,7 +1481,7 @@ function Invoke-Failover {
     $text = Invoke-Ctl session text --target $pane
     $seen = Get-PaneLimit $text $saved
     $lock = Join-Path $Checkout '.git\index.lock'
-    if (-not (Test-ShellReady $text)) {
+    if (-not (Test-PaneShellReady $pane $text)) {
         # Codex's warning chooser (#61) is as final as its limit: the chooser waits, nobody answers it.
         if ($seen.kind -notin @('limited', 'warning')) {
             throw [ImplementerConflict]::new("failover refused: the $saved pane is neither showing its own usage-limit message or warning chooser nor at a shell prompt")
@@ -1708,7 +1741,7 @@ function Start-WorkbenchSessionCore {
     } else { $session = Find-IssueSession $tree $WorkspaceName $Number $Slug $registry }
     if ($script:Launch.QueueContext) {
         $context = $script:Launch.QueueContext
-        $check = & python (Join-Path $script:Lib 'conductor.py') member-context --file $context.queue `
+        $check = & $script:Python (Join-Path $script:Lib 'conductor.py') member-context --file $context.queue `
             --number $context.number --attempt $context.attempt --token $context.token
         if ($LASTEXITCODE -ne 0) { throw 'queue launch authorization changed before setup' }
         $membershipPath = Join-Path $Checkout '.workbench\state\queue-member.json'
@@ -2201,7 +2234,7 @@ import hub; hub.reload_paths()
 hub.register('claude', tool='claude', pane=sys.argv[3], role='planner and reviewer', cwd=sys.argv[2])
 hub.register('codex', tool=sys.argv[5], pane=sys.argv[4], role='implementer', cwd=sys.argv[2])
 "@
-    $py | & python - $script:Lib $Checkout $ClaudePane $CodexPane $CodexTool | Out-Null
+    $py | & $script:Python - $script:Lib $Checkout $ClaudePane $CodexPane $CodexTool | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not initialise the workbench mailbox" }
     return $hub
 }
@@ -2228,7 +2261,7 @@ function Grant-ClaudeTrust {
     <# Claude Code's folder-trust dialog is not skipped by --dangerously-skip-permissions, and its
        default is "No, exit". See lib/trust.py for why and how the entry is written. #>
     param([string] $Dir)
-    $result = & python (Join-Path $script:Lib 'trust.py') --claude $Dir 2>&1
+    $result = & $script:Python (Join-Path $script:Lib 'trust.py') --claude $Dir 2>&1
     if ($LASTEXITCODE -eq 0) { Write-Step "claude: $result (this clone only)" }
     else { Write-Warning "claude trust not recorded ($result) - answer its trust prompt in the left pane yourself" }
 }
@@ -2422,7 +2455,7 @@ function Invoke-LauncherBody {
 
     $relayBuilder = {
         param($Hub, $Left, $Right)
-        'python ' + (Quote (Join-Path $script:Lib 'relay.py')) + ' --hub ' + (Quote $Hub) +
+        $script:Python + ' ' + (Quote (Join-Path $script:Lib 'relay.py')) + ' --hub ' + (Quote $Hub) +
             ' --claude-pane ' + (Quote $Left) + ' --codex-pane ' + (Quote $Right) +
             ' --repo ' + (Quote $ref.Repo) + ' --branch ' + (Quote $co.Branch) + $relayTool
     }

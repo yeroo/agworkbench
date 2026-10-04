@@ -65,7 +65,7 @@ if (-not $WhatIfOnly) {
 $prepareArgs = @((Join-Path $script:Lib 'kimi.py'), 'prepare', '--checkout', $Checkout, '--issue', $Issue)
 if ($config.allowNetwork) { $prepareArgs += '--allow-network' }
 if ($WhatIfOnly) { $prepareArgs += '--dry-run' }
-$said = & python @prepareArgs
+$said = & $script:Python @prepareArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Cannot start the Kimi implementer: $(($said | ForEach-Object { "$_" }) -join ' ')"
     exit 1
@@ -126,7 +126,7 @@ Read your unread workbench mail (python "$script:Lib\agmsg.py" list), then conti
 "@
     $py = "import sys; sys.path.insert(0, sys.argv[1]); import hub; hub.reload_paths(); " +
           "hub.write_message(to='codex', sender='relay', kind='note', subject='resumed after restart', body=sys.stdin.read())"
-    $note | & python -c $py $script:Lib | Out-Null
+    $note | & $script:Python -c $py $script:Lib | Out-Null
 }
 
 Write-Host "agworkbench: Kimi implementer for $Issue in $Checkout - $($prepared.trust); git push and gh refused in its shell" -ForegroundColor DarkGray
