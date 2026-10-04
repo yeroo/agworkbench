@@ -231,6 +231,7 @@ class QueueReports(unittest.TestCase):
 class HelperWorkspace(unittest.TestCase):
     def setUp(self):
         self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(patch.object(agw, 'use_agterm', return_value=False))  # agwinterm env vars (#60)
         self.tree = self.enterContext(patch.object(agw, 'tree', return_value={
             'workspaces': [
                 {'id': 'active-workspace', 'active': True,

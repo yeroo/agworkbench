@@ -26,6 +26,10 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterator
 
+import agterm_ctl
+
+agterm_ctl.bridge_env()  # inside agterm, the AGWINTERM_* names everything below reads (#60)
+
 CANDIDATES = [
     Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "agwinterm" / "agwintermctl.exe",
     Path.home() / "source" / "agwinterm" / "src" / "Agwinterm.Ctl" / "bin" / "Release" / "net10.0-windows" / "agwintermctl.exe",
@@ -38,6 +42,16 @@ class CtlError(RuntimeError):
 
 
 # --- transport ------------------------------------------------------------------------------
+
+def use_agterm() -> bool:
+    """agterm (Linux, macOS) instead of agwinterm (#60): every platform but Windows, or when
+    AGW_TERMINAL says so. agterm_ctl translates the same requests onto agtermctl."""
+    chosen = os.environ.get("AGW_TERMINAL", "").lower()
+    if chosen:
+        return chosen == "agterm"
+    return os.name != "nt"
+
+
 
 def pipe_name() -> str:
     return os.environ.get("AGWINTERM_PIPE") or "agwinterm"
@@ -213,6 +227,11 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
         payload["target"] = target
     if args:
         payload["args"] = args
+    if use_agterm():
+        try:
+            return agterm_ctl.request(cmd, target=target, args=args)
+        except agterm_ctl.CtlError as err:
+            raise CtlError(str(err)) from err
     envelope = _via_pipe(payload, timeout)
     if envelope is None:
         envelope = _via_cli(payload, timeout)
@@ -273,6 +292,8 @@ def find_pane(pane_id: str, snapshot: dict[str, Any] | None = None):
 
 def my_pane() -> str | None:
     """This process's own pane. AGWINTERM_PANE_ID is per-pane, so a split never collides."""
+    if use_agterm():
+        return agterm_ctl.caller_pane()
     return os.environ.get("AGWINTERM_PANE_ID") or os.environ.get("AGWINTERM_SESSION_ID") or None
 
 

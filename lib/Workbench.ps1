@@ -4,6 +4,16 @@
 $script:Lib = $PSScriptRoot
 $script:Root = Split-Path -Parent $PSScriptRoot
 
+# agterm (Linux, macOS) instead of agwinterm (#60): lib/agwintermctl speaks agwinterm's control
+# dialect on top of agtermctl, and an agterm pane gets the AGWINTERM_* names everything here reads.
+$script:OnAgterm = if ($env:AGW_TERMINAL) { $env:AGW_TERMINAL -eq 'agterm' } else { -not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' }
+if ($script:OnAgterm -and $env:AGTERM_SESSION_ID -and -not $env:AGWINTERM_SESSION_ID) {
+    foreach ($line in @(& python3 (Join-Path $PSScriptRoot 'agterm_ctl.py') env)) {
+        $name, $value = "$line" -split '=', 2
+        if ($name -and $value) { Set-Item -Path "Env:$name" -Value $value }
+    }
+}
+
 class AdoptRefused : System.Exception {
     AdoptRefused([string] $Message) : base($Message) {}
 }
@@ -255,6 +265,7 @@ function Find-KimiExe($Config) {
     $onPath = Find-Tool kimi
     if ($onPath) { return $onPath }
     $installed = Join-Path $HOME '.kimi-code\bin\kimi.exe'
+    if ($script:OnAgterm) { $installed = Join-Path $HOME '.kimi-code/bin/kimi' }
     if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
     return $null
 }
@@ -322,6 +333,11 @@ function Assert-KimiReady($Config, [string] $Checkout) {
 function Get-AgwintermCtl {
     $candidates = @()
     if ($env:AGWINTERMCTL) { $candidates += $env:AGWINTERMCTL }
+    if ($script:OnAgterm) {
+        $candidates += (Join-Path $script:Lib 'agwintermctl')
+        foreach ($candidate in $candidates) { if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate } }
+        return $null
+    }
     $onPath = Get-Command agwintermctl -ErrorAction SilentlyContinue
     if ($onPath) { $candidates += $onPath.Source }
     $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\agwinterm\agwintermctl.exe')
@@ -424,6 +440,11 @@ function Get-ToolchainVersions {
 }
 
 function Get-AgwintermApp {
+    if ($script:OnAgterm) {
+        $app = Get-Command agterm-linux, agterm -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($app) { return $app.Source }
+        return $null
+    }
     # The installer ships Agwinterm.Win32.exe; the scoop manifest exposes agwinterm.exe.
     foreach ($candidate in @(
             (Join-Path $env:LOCALAPPDATA 'Programs\agwinterm\Agwinterm.Win32.exe'),
@@ -474,6 +495,7 @@ function Test-InsideAgwinterm {
 
 function Install-Agwinterm {
     param([switch] $Yes)
+    if ($script:OnAgterm) { throw "agterm is not installed or not answering: install agterm (Linux: agterm-linux package) and start it" }
     Write-Host "agwinterm is not installed." -ForegroundColor Yellow
     if (-not $Yes) {
         $answer = Read-Host "Install it with scoop from github.com/yeroo/scoop-bucket? [y/N]"
@@ -500,6 +522,13 @@ function Install-Agwinterm {
 
 function Install-AgwintermIntegrations {
     # The terminal's own agent skill and status hooks: sidebar dots, and agents that know the API.
+    if ($script:OnAgterm) {
+        foreach ($what in @('hooks', 'skill')) {
+            try { & agtermctl integration install $what | Out-Null; Write-Done "agterm: installed $what" }
+            catch { Write-Warning "agterm integration install $what failed: $_" }
+        }
+        return
+    }
     $ctl = Get-AgwintermCtl
     if (-not $ctl) { return }
     foreach ($what in @('skill', 'hooks')) {
@@ -513,7 +542,8 @@ function Start-AgwintermApp {
     $app = Get-AgwintermApp
     if (-not $app) { throw "agwinterm is installed but its executable was not found" }
     Write-Step "starting agwinterm"
-    Start-Process -FilePath $app | Out-Null
+    if ($script:OnAgterm) { Start-Process -FilePath 'setsid' -ArgumentList @($app) | Out-Null }
+    else { Start-Process -FilePath $app | Out-Null }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         if (Test-AgwintermRunning) { return }
@@ -667,6 +697,8 @@ function Test-ShellReady([string] $Text) {
     if ($frame -match ('(?m)^\s*[-' + [char]0x2500 + [char]0x2501 + [char]0x2014 + ']{10,}\s*$')) { return $false }
     $last = $rows[-1]
     if ($last -match '^PS [A-Za-z]:\\[^>]*> ?$') { return $true }
+    # bash under agterm (#60): user@host:path$ (or #), the default Debian/Ubuntu prompt.
+    if ($script:OnAgterm -and $last -match '^[\w.-]+@[\w.-]+:[^$#]*[$#] ?$') { return $true }
     if ($last -match ('^\s*' + [char]0x276F + '\s*$') -and $rows.Count -ge 2) {
         return ($rows[-2] -match '(\d+(\.\d+)?(ms|s)|\d\d:\d\d(:\d\d)?)\s*$')
     }
@@ -1279,11 +1311,32 @@ function Get-PaneLimit([string] $Text, [string] $Tool) {
 
 function Get-AgentProcesses {
     # The process-table boundary; tests replace it.
+    if ($script:OnAgterm) {
+        # Same shape as Win32_Process. Names keep the Windows spelling (claude.exe, kimi.exe, pwsh.exe)
+        # so the matching below is shared; Claude Code's native binary is already claude.exe here.
+        return @(& ps -eo 'pid=,ppid=,comm=,args=' -ww | ForEach-Object {
+            if ("$_" -match '^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$') {
+                $row = @{ ProcessId = [int]$Matches[1]; ParentProcessId = [int]$Matches[2]; Name = $Matches[3]; CommandLine = $Matches[4] }
+                if (-not $row.Name.EndsWith('.exe')) { $row.Name = "$($row.Name).exe" }
+                [pscustomobject]$row
+            }
+        })
+    }
     return @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine)
 }
 
 function Stop-AgentTree([int] $ProcessId) {
     # The stop boundary; tests replace it. The tree is the agent and its helpers, never the pane's shell.
+    if ($script:OnAgterm) {
+        $all = @(Get-AgentProcesses)
+        $tree = @($ProcessId)
+        for ($i = 0; $i -lt $tree.Count; $i++) {
+            $tree += @($all | Where-Object { $_.ParentProcessId -eq $tree[$i] } | ForEach-Object { $_.ProcessId })
+        }
+        [array]::Reverse($tree)
+        foreach ($id in $tree) { & kill -KILL $id 2>$null }
+        return
+    }
     & taskkill.exe /T /F /PID $ProcessId | Out-Null
 }
 
@@ -1428,7 +1481,9 @@ function Invoke-Failover {
     if (-not $kind) { $kind = 'limited' }
     Set-ImplementerLimit $Checkout $saved ([pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); line = $line; kind = $kind })
     # The old tool's limit text must not greet the new agent: its relay would read it as its own.
-    Invoke-Ctl session type "Clear-Host`n" --target $pane | Out-Null
+    $clear = 'Clear-Host'
+    if ($script:OnAgterm) { $clear = 'clear' }
+    Invoke-Ctl session type "$clear`n" --target $pane | Out-Null
     if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
         throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> -Implementer $target once it is")
     }
@@ -2174,7 +2229,11 @@ function Grant-ClaudeTrust {
 
 # --- launcher entry --------------------------------------------------------------------------
 
-function Quote([string] $Value) { return "'" + $Value.Replace("'", "''") + "'" }
+function Quote([string] $Value) {
+    # Lines typed into a pane are read by its shell: PowerShell under agwinterm, bash under agterm (#60).
+    if ($script:OnAgterm) { return Quote-Bash $Value }
+    return "'" + $Value.Replace("'", "''") + "'"
+}
 
 function Get-PaneLaunchArgs([string] $Script, [hashtable] $Arguments, [string[]] $Switches = @()) {
     # A shell executable run explicitly with -ExecutionPolicy Bypass, so a machine whose policy is
@@ -2351,7 +2410,7 @@ function Invoke-LauncherBody {
         Write-Step "right pane: $codexLaunch"
         $relayTool = ''
         if ($resolved.Tool -ne 'codex') { $relayTool = " --implementer-tool $($resolved.Tool)" }
-        Write-Step "relay:      python lib\relay.py --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
+        Write-Step "relay:      python $(Join-Path 'lib' 'relay.py') --hub $hubDir --repo $($ref.Repo) --branch $($co.Branch)$relayTool"
         return
     }
 
