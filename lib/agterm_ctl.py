@@ -302,6 +302,19 @@ def realize_all() -> list[str]:
     return started
 
 
+def _type(sid: str, slot: str, text: str) -> None:
+    """Type like agwinterm does: a newline is Enter. agterm delivers one injection containing a
+    newline as a paste, which a TUI such as Claude Code keeps in its composer instead of
+    submitting, so each line goes in on its own and every newline is a separate Enter."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            agtermctl("session", "type", "--stdin", "--target", sid, "--pane", slot, stdin=line)
+        if i < len(lines) - 1:
+            time.sleep(0.05)  # let the TUI take the text before the key that submits it
+            agtermctl("session", "type", "--stdin", "--target", sid, "--pane", slot, stdin="\r")
+
+
 def _pane_args(target: str | None) -> list[str]:
     sid, slot = resolve(target)
     return ["--target", sid, "--pane", slot]
@@ -323,12 +336,12 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
     if cmd in ("session.type", "session.write", "session.paste"):
         sid, slot = resolve(target)
         try:
-            agtermctl("session", "type", "--stdin", "--target", sid, "--pane", slot, stdin=str(args.get("text", "")))
+            _type(sid, slot, str(args.get("text", "")))
         except CtlError as err:
             if "not realized" not in str(err):
                 raise
             _realize(sid)
-            agtermctl("session", "type", "--stdin", "--target", sid, "--pane", slot, stdin=str(args.get("text", "")))
+            _type(sid, slot, str(args.get("text", "")))
         return "typed"
     if cmd == "session.text":
         argv = ["session", "text", *_pane_args(target)]
