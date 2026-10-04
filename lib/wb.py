@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -139,7 +140,8 @@ def open_session(name: str, cwd: Path, argv: list[str], select: bool) -> str:
     refusal = fits_host(argv)
     if refusal:
         raise SystemExit(f"wb: helper command exceeds agwinterm's session.new limits ({HOST_LIMITS}): {refusal}")
-    args = {"name": name, "cwd": str(cwd), "command": subprocess.list2cmdline(argv), "command-mode": "direct"}
+    line = shlex.join(argv) if agw.use_agterm() else subprocess.list2cmdline(argv)  # sh under agterm (#60)
+    args = {"name": name, "cwd": str(cwd), "command": line, "command-mode": "direct"}
     pane = agw.my_pane()
     found = agw.find_pane(pane, agw.tree()) if pane else None
     workspace = found[0].get('id') if found else None
