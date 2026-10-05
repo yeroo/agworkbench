@@ -11,7 +11,9 @@ What it does not leave to the model:
 - only roster entries whose tool has no recorded usage limit are offered;
 - Kimi is offered only when the issue carries triage's `kimi` label and is not P0/P1; a Kimi answer for any
   other issue is replaced by the first offered non-Kimi entry, rule `kimi-guard`;
-- an `impl:<id>` label naming a roster entry is the owner's override: the model is not called.
+- an `impl:<id>` label naming a roster entry is the owner's override (a label the router did not write itself,
+  see route-labels.jsonl): the model is not called. The router's own earlier label is kept only while its entry
+  would still be offered; otherwise it is stale and the router chooses again.
 A failure raises RouteError: the caller refuses or defers, never launches on a silent default.
 Past outcomes (route-outcomes.jsonl, appended when a loop ends) are summarised into the facts.
 """
@@ -83,33 +85,42 @@ def outcomes_path() -> Path:
 
 def labels_path() -> Path:
     """Where the labels the router itself wrote are recorded: beside the outcomes (one root override for tests)."""
-    return outcomes_path().with_name('route-labels.json')
+    return outcomes_path().with_name('route-labels.jsonl')
 
 
 def read_labels() -> dict:
-    """{'owner/name#N': {'id': roster id, 'at': time}}: the `impl:<id>` labels this router wrote. They look like the
-    owner's, so only this record tells them apart: an unrecorded label is an order, a recorded one a memory."""
+    """{'owner/name#n': {'id': roster id, 'at': time}}: the `impl:<id>` labels this router wrote, the last record
+    of an issue winning. They look like the owner's, so only this record tells them apart: an unrecorded label is
+    an order, a recorded one a memory. A JSON-lines file that is only ever appended to: two processes (a
+    conductor tick, a detached cleanup) never overwrite each other's lines."""
+    labels = {}
     try:
-        data = json.loads(labels_path().read_text(encoding='utf-8-sig'))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        lines = labels_path().read_text(encoding='utf-8-sig').splitlines()
+    except OSError:
+        return labels
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get('key'), str) and isinstance(record.get('id'), str):
+            labels[record['key']] = record
+    return labels
 
 
 def own_label(repo: str, number: int) -> str | None:
-    entry = read_labels().get(f'{repo}#{number}'.casefold())
-    return entry.get('id') if isinstance(entry, dict) and isinstance(entry.get('id'), str) else None
+    record = read_labels().get(f'{repo}#{number}'.casefold())
+    return record['id'] if record else None
 
 
 def record_label(repo: str, number: int, ident: str, now=None) -> None:
-    """Remember that the router wrote `impl:<ident>` on this issue (atomic: a temporary file, then a rename)."""
-    data = read_labels()
-    data[f'{repo}#{number}'.casefold()] = dict(id=ident, at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now or time.time())))
+    """Remember that the router wrote `impl:<ident>` on this issue: one line appended."""
     path = labels_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
-    temp.write_text(json.dumps(data, indent=1), encoding='utf-8')
-    os.replace(temp, path)
+    record = dict(key=f'{repo}#{number}'.casefold(), id=ident,
+                  at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now or time.time())))
+    with open(path, 'a', encoding='utf-8') as stream:
+        stream.write(json.dumps(record, separators=(',', ':')) + '\n')
 
 
 # --- what may be offered -------------------------------------------------------------------------
@@ -129,20 +140,22 @@ def offered(roster, limited, labels, priority) -> list[dict]:
     return [e for e in roster if e['tool'] not in limited and (e['tool'] != 'kimi' or eligible)]
 
 
-def label_override(labels, roster, limited, own=None) -> tuple[dict | None, str | None, str | None, list[str]]:
+def label_override(labels, roster, limited, own=None, priority=None) -> tuple[dict | None, str | None, str | None, list[str]]:
     """The `impl:<id>` label of an issue: (entry, source, stale id, warnings); no entry when there is no order.
-    The owner's label is an order (source 'label'): a label naming no roster entry is ignored with a warning;
-    two naming entries, or one naming an entry whose tool is limited, is a RouteError. `own` is the id the
-    router itself wrote (route-labels.json): that label is the router's memory, not an order. It is kept (source
-    'router-label') while its tool is free of a limit and the roster still has it, and otherwise stale: skipped,
-    and the router asked again. A different label on the issue is the owner's, as always."""
+    The owner's label (one the router did not write) is an order, source 'label', whatever the router's own rules
+    say: a label naming no roster entry is ignored with a warning; two naming entries, or one naming an entry
+    whose tool is limited, is a RouteError. `own` is the id the router itself wrote (route-labels.jsonl): that
+    label is the router's memory, not an order. It is kept (source 'router-label') only while its entry would
+    still be offered to the router (its tool free of a limit, Kimi only for an eligible issue, still in the
+    roster) and otherwise it is stale: skipped, and the router asked again. A different label is the owner's."""
     warnings, named, stale = [], [], None
+    still_offered = {e['id'] for e in offered(roster, limited, labels, priority)}
     for name in labels:
         if not name.casefold().startswith(IMPL_PREFIX):
             continue
         entry = rosters.entry_of(roster, name[len(IMPL_PREFIX):])
         if own and name == f'{IMPL_PREFIX}{own}':
-            if entry is None or entry['tool'] in limited:
+            if entry is None or entry['id'] not in still_offered:
                 stale = own
             else:
                 named.append((name, entry, 'router-label'))
@@ -172,13 +185,18 @@ def read_outcomes(path: Path | None = None) -> list[dict]:
         return []
     except OSError as err:
         raise RouteError(f'cannot read {path}: {err}') from err
+    seen = set()
     for line in lines:
         try:
             record = json.loads(line)
         except ValueError:
             continue
         if isinstance(record, dict) and record.get('rosterId'):
-            records.append(record)
+            # Once per issue: two processes can both pass the check before either appends, so the first record wins.
+            key = (str(record.get('repo')).casefold(), record.get('number'))
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
     return records
 
 
@@ -303,11 +321,11 @@ def read_issue(repo: str, number: int, gh) -> dict:
 def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage.real_gh, model=triage.real_model,
                 records=None, issue=None, label=False) -> dict:
     """The roster entry for one issue, as a dict with `implementer` (a roster id), `tool`, `model` (when the
-    entry has one), `reason`, `rule`, `source` ('label' or 'router') and `warnings`. Raises RouteError: a bad
+    entry has one), `reason`, `rule`, `source` ('label', 'router-label' or 'router') and `warnings`. Raises RouteError: a bad
     roster, no usable claude and a failed judgment all arrive as one.
     `label`: write the router's own answer as the issue's `impl:<id>` label (never for the owner's label) and
     remember that it was the router's; a label that cannot be written is a warning, not an error. The router's
-    own earlier label (route-labels.json) is kept while it is usable ('router-label', no model call) and
+    own earlier label (route-labels.jsonl) is kept while it is usable ('router-label', no model call) and
     replaced when it is stale: its tool has a recorded limit, or the roster lost it."""
     try:
         roster = rosters.load(settings)
@@ -317,7 +335,7 @@ def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage
     issue = issue or read_issue(repo, number, gh)
     labels = triage.label_names(issue)
     priority = triage.priority_of(issue.get('labels'))
-    entry, source, stale, warnings = label_override(labels, roster, limited, own_label(repo, number))
+    entry, source, stale, warnings = label_override(labels, roster, limited, own_label(repo, number), priority)
     if entry is not None:
         if source == 'label':
             out = result_of(entry, f"the owner's {IMPL_PREFIX}{entry['id']} label on the issue", 'label-override', 'label')
@@ -541,6 +559,8 @@ def record_outcome(checkout, outcome: str, *, pr=None, settings=None, path=None,
                       wallSeconds=wall_seconds(state, now), claudeOutputTokens=output, claudeCacheReadTokens=cache,
                       labels=labels, priority=priority, changedLines=lines, sizeBucket=bucket,
                       at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)))
+        if any(r.get('repo') == repo and r.get('number') == number for r in read_outcomes(target)):
+            return None                                     # another process recorded it while this one gathered
         target.parent.mkdir(parents=True, exist_ok=True)
         with open(target, 'a', encoding='utf-8') as stream:
             stream.write(json.dumps(record, separators=(',', ':')) + '\n')

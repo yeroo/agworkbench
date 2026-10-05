@@ -1384,7 +1384,7 @@ class Worker:
     def route_issue(self, repo, number, settings, limited):
         """The router (#109) for one member; tests replace it. A router answer, or router.RouteError. The
         choice is also written as the issue's impl:<id> label (replacing the router's own stale one in a
-        re-route, which route-labels.json tells from the owner's), so the owner sees it; a label that cannot be
+        re-route, which route-labels.jsonl tells from the owner's), so the owner sees it; a label that cannot be
         written is a warning in the answer."""
         config = read_json(settings['config']) if Path(settings['config']).exists() else {}
         return router.route_issue(repo, number, settings=config, limited=limited, label=True)

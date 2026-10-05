@@ -285,7 +285,54 @@ class LabelOverride(Fixtures):
         route.record_label('o/r', 5, 'codex-sol')                  # a checkout, a member or a queue that no longer exists
         self.labels('impl:codex-sol')
         self.assertEqual('claude-sonnet', self.route_with_label(limited={'codex'})['implementer'])
-        self.assertEqual('codex-sol', self.route_with_label()['implementer'] if False else 'codex-sol')
+        self.model_calls.clear()
+        route.record_label('o/r', 5, 'codex-sol')
+        self.labels('impl:codex-sol')
+        got = self.route_with_label()                              # the limit is gone: the same label is kept
+        self.assertEqual(('codex-sol', 'router-label'), (got['implementer'], got['source']))
+        self.assertFalse(self.model_calls)
+
+    def test_a_kept_kimi_label_follows_the_kimi_guard_like_every_offered_entry(self):
+        for labels, kept in ((['impl:kimi', 'priority:P2', 'kimi'], True), (['impl:kimi', 'priority:P1', 'kimi'], False),
+                             (['impl:kimi', 'priority:P0', 'kimi'], False), (['impl:kimi', 'priority:P2'], False),
+                             (['impl:kimi'], False)):
+            with self.subTest(labels=labels):
+                route.record_label('o/r', 5, 'kimi')
+                self.labels(*labels)
+                self.model_calls.clear()
+                got = self.route_with_label()
+                if kept:
+                    self.assertEqual(('kimi', 'router-label'), (got['implementer'], got['source']))
+                    self.assertFalse(self.model_calls)
+                else:
+                    self.assertEqual(('router', 'claude-sonnet'), (got['source'], got['implementer']))   # asked again
+                    self.assertEqual(1, len(self.model_calls))
+                    self.assertEqual('claude-sonnet', route.own_label('o/r', 5))                         # label replaced
+
+    def test_an_owners_kimi_label_still_overrides_the_guard(self):
+        self.labels('impl:kimi', 'priority:P1')                     # nothing recorded: the owner wrote it
+        got = self.route_with_label()
+        self.assertEqual(('kimi', 'label'), (got['implementer'], got['source']))
+
+    def test_label_records_are_appended_and_the_last_one_wins(self):
+        route.record_label('o/r', 5, 'kimi')
+        route.record_label('o/r', 5, 'codex-sol')
+        route.record_label('o/r', 6, 'claude-opus')
+        self.assertEqual(3, len(route.labels_path().read_text(encoding='utf-8').splitlines()))
+        self.assertEqual(('codex-sol', 'claude-opus'), (route.own_label('o/r', 5), route.own_label('o/r', 6)))
+        with open(route.labels_path(), 'a', encoding='utf-8') as stream:
+            stream.write('garbage\n[]\n{"key": 3}\n')
+        self.assertEqual('codex-sol', route.own_label('o/r', 5))
+
+    def test_two_processes_writing_labels_at_once_lose_nothing(self):
+        script = ("import sys; sys.path.insert(0, %r); import route\n"
+                  "for n in range(40): route.record_label('o/r', int(sys.argv[1]) * 100 + n, 'kimi')\n") % str(ROOT / 'lib')
+        procs = [subprocess.Popen([sys.executable, '-c', script, str(k)], env=dict(os.environ)) for k in (1, 2, 3)]
+        for proc in procs:
+            self.assertEqual(0, proc.wait(timeout=60))
+        labels = route.read_labels()
+        self.assertEqual(120, len(labels))
+        self.assertTrue(all(len(json.loads(line)) == 3 for line in route.labels_path().read_text(encoding='utf-8').splitlines()))
 
     def test_an_owner_label_on_a_limited_tool_still_refuses_beside_a_stale_one(self):
         route.record_label('o/r', 5, 'codex-sol')
@@ -372,6 +419,14 @@ class PastOutcomes(Fixtures):
         self.assertEqual([1, 2], [c['number'] for c in past['comparable']])
         self.assertNotIn('kimi', past['perRoster'])        # a docs P3 loop is not comparable to a bug P2
 
+    def test_the_first_record_of_an_issue_wins_when_two_processes_both_appended(self):
+        first = dict(self.RECORDS[0])
+        second = dict(self.RECORDS[0], outcome='closed', reviewRounds=9)
+        (self.temp / 'outcomes.jsonl').write_text('\n'.join(json.dumps(r) for r in (first, second, dict(first, repo='O/R'))) + '\n', encoding='utf-8')
+        got = route.read_outcomes()
+        self.assertEqual([('merged', 2)], [(r['outcome'], r['reviewRounds']) for r in got])
+        self.assertEqual(1, route.summarize(got)['claude-sonnet']['merged'] + route.summarize(got)['claude-sonnet']['notMerged'])
+
     def test_read_outcomes_skips_bad_lines_and_a_missing_file(self):
         self.assertEqual([], route.read_outcomes())
         (self.temp / 'outcomes.jsonl').write_text('not json\n' + json.dumps(self.RECORDS[0]) + '\n[]\n{"x": 1}\n', encoding='utf-8')
@@ -427,6 +482,15 @@ class Outcomes(Fixtures):
         self.assertIsNotNone(self.record())
         self.assertIsNone(self.record())
         self.assertEqual(1, len(route.read_outcomes()))
+
+    def test_a_record_that_appears_while_this_one_is_gathered_is_not_duplicated(self):
+        def other_process(checkout):
+            with open(route.outcomes_path(), 'a', encoding='utf-8') as stream:
+                stream.write(json.dumps(dict(repo='o/r', number=5, rosterId='claude-sonnet', outcome='merged')) + '\n')
+            return 0, 0
+        with unittest.mock.patch.object(route, 'claude_tokens', side_effect=other_process):
+            self.assertIsNone(self.record())
+        self.assertEqual(1, len(route.outcomes_path().read_text(encoding='utf-8').splitlines()))
 
     def test_wall_time_runs_from_the_first_launch_log_line(self):
         start = __import__('time').mktime(__import__('time').strptime('2026-10-05T10:00:00', '%Y-%m-%dT%H:%M:%S'))

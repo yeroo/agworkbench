@@ -4137,7 +4137,7 @@ class AutoRouting(unittest.TestCase):
 
     def route_again(self, route_record, issue_labels, own=None):
         """Route member 1 once, then make its recorded choice `route_record`, limit codex and route again.
-        `own` is the id the router is recorded to have written on the issue (route-labels.json)."""
+        `own` is the id the router is recorded to have written on the issue (route-labels.jsonl)."""
         calls, patched = self.default_route_with(issue_labels)
         with patched:
             w = self.default_worker()

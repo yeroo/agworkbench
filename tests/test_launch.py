@@ -4802,8 +4802,9 @@ class AutoImplementerLaunch(ImplementerCheckout):
         self.assertFalse(self.gh_log.exists())
 
     def routed_before(self, ident):
-        """The router wrote impl:<ident> on this issue earlier (route-labels.json, beside the outcomes file)."""
-        (self.temp / "route-labels.json").write_text(json.dumps({"o/repo#7": {"id": ident, "at": "2026-10-04T00:00:00Z"}}), encoding="utf-8")
+        """The router wrote impl:<ident> on this issue earlier (route-labels.jsonl, beside the outcomes file)."""
+        (self.temp / "route-labels.jsonl").write_text(
+            json.dumps({"key": "o/repo#7", "id": ident, "at": "2026-10-04T00:00:00Z"}) + "\n", encoding="utf-8")
         self.issue["labels"] = [{"name": "priority:P2"}, {"name": "impl:" + ident}]
         self.fake_gh()
 
@@ -4818,7 +4819,8 @@ class AutoImplementerLaunch(ImplementerCheckout):
         self.assertEqual(("claude", "claude-sonnet"), (got["Tool"], got["RosterId"]))
         log = self.gh_log.read_text(encoding="utf-8")
         self.assertIn("--add-label impl:claude-sonnet --remove-label impl:codex-sol", log)
-        self.assertEqual("claude-sonnet", json.loads((self.temp / "route-labels.json").read_text(encoding="utf-8"))["o/repo#7"]["id"])
+        lines = (self.temp / "route-labels.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual("claude-sonnet", json.loads(lines[-1])["id"])             # appended: the last record wins
 
     def test_with_the_limit_cleared_the_routers_own_label_is_kept_without_a_model_call(self):
         self.record(tool="claude")
