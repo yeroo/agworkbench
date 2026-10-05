@@ -313,17 +313,17 @@ class Remove(Clones):
 class RouterOutcome(Clones):
     """#109: the router's statistics need what the checkout holds, so cleanup records before it deletes."""
 
-    def clean(self, checkout, mode, pr_head=None, outcome=None, issue=7):
+    def clean(self, checkout, mode, pr_head=None, outcome=None, issue=7, pr=None):
         return cleanup.clean(checkout, repo='o/repo', issue=issue, root=self.root, mode=mode, tree=EMPTY_TREE, pr_head=pr_head,
-                             pause=lambda s: None, outcome=outcome)
+                             pause=lambda s: None, outcome=outcome, pr=pr)
 
     def test_a_merged_checkout_is_recorded_before_it_is_deleted(self):
         checkout = self.clone()
         seen = []
-        with patch.object(route, 'record_outcome', side_effect=lambda *a, **k: seen.append((a, checkout.exists()))):
+        with patch.object(route, 'record_outcome', side_effect=lambda *a, **k: seen.append(((a, k), checkout.exists()))):
             deleted, reasons, _ = self.clean(checkout, 'merged', pr_head=run(checkout, 'rev-parse', 'HEAD'), outcome='merged')
         self.assertTrue(deleted, reasons)
-        self.assertEqual([((checkout, 'merged'), True)], seen)
+        self.assertEqual([((checkout, 'merged'), True)], [(a, exists) for (a, k), exists in seen])
 
     def test_the_outcome_is_the_callers_never_guessed_from_the_pr_head(self):
         checkout = self.clone()
@@ -332,12 +332,18 @@ class RouterOutcome(Clones):
             record.assert_not_called()                                    # a build cleanup keeps the checkout
             deleted, _, _ = self.clean(checkout, 'merged', pr_head=None, outcome='closed')
         self.assertTrue(deleted)
-        record.assert_called_once_with(checkout, 'closed')
+        record.assert_called_once_with(checkout, 'closed', pr=None)
         unknown = self.clone(number=9)
         with patch.object(route, 'record_outcome') as record:
             deleted, _, _ = self.clean(unknown, 'merged', pr_head=None, issue=9)    # the caller could not tell: nothing recorded
         self.assertTrue(deleted)
         record.assert_not_called()
+
+    def test_the_pr_number_goes_with_the_record_so_the_size_bucket_exists_for_single_launches(self):
+        checkout = self.clone()
+        with patch.object(route, 'record_outcome') as record:
+            self.clean(checkout, 'merged', pr_head=run(checkout, 'rev-parse', 'HEAD'), outcome='merged', pr=42)
+        record.assert_called_once_with(checkout, 'merged', pr=42)
 
     def test_a_kept_checkout_records_nothing(self):
         kept = self.clone(number=8, pushed=False)
@@ -405,7 +411,7 @@ class AfterClose(Clones):
                 if expected is None:
                     record.assert_not_called()
                 else:
-                    record.assert_called_once_with(checkout, expected)
+                    record.assert_called_once_with(checkout, expected, pr=pr)
 
     def test_no_pr_after_close_uses_only_remote_tracking_refs(self):
         checkout = self.clone()
@@ -638,6 +644,13 @@ class Sweep(Clones):
         self.assertEqual({self.root / 'not-a-checkout', other, still_open, reopened, dirty},
                          {p for p in self.root.iterdir() if p.is_dir() and not p.name.startswith('.')})
         self.assertIn('deleted (merged)', (self.root / cleanup.LOG_NAME).read_text(encoding='utf-8'))
+
+    def test_the_sweep_records_what_the_lookup_showed_with_the_merged_pr_number(self):
+        merged, still_open, dirty, closed_issue, reopened, other, leftover = self.fixture()
+        with patch.object(route, 'record_outcome') as record:
+            self.sweep(repo='o/repo')
+        self.assertEqual({(merged, 'merged', 40), (closed_issue, 'closed', None)},
+                         {(c.args[0], c.args[1], c.kwargs['pr']) for c in record.call_args_list})
 
     def test_a_closed_issue_with_an_open_pr_is_skipped(self):
         # r1 m4: an open PR on the branch wins over a closed issue.

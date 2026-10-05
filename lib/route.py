@@ -42,7 +42,7 @@ LABEL_COLOR = '1D76DB'
 BODY_LIMIT = 20000
 COMPARABLE = 10          # the most recent comparable loops shown to the router
 REASON_MAX = 1000
-RULE_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,63}')
+RULE_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,63}$')    # a JSON-schema pattern too: the model is told what validate() will accept
 
 
 class RouteError(Exception):
@@ -81,6 +81,37 @@ def outcomes_path() -> Path:
     return Path(os.environ.get('AGWORKBENCH_ROUTE_OUTCOMES', Path.home() / '.agworkbench' / 'route-outcomes.jsonl'))
 
 
+def labels_path() -> Path:
+    """Where the labels the router itself wrote are recorded: beside the outcomes (one root override for tests)."""
+    return outcomes_path().with_name('route-labels.json')
+
+
+def read_labels() -> dict:
+    """{'owner/name#N': {'id': roster id, 'at': time}}: the `impl:<id>` labels this router wrote. They look like the
+    owner's, so only this record tells them apart: an unrecorded label is an order, a recorded one a memory."""
+    try:
+        data = json.loads(labels_path().read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def own_label(repo: str, number: int) -> str | None:
+    entry = read_labels().get(f'{repo}#{number}'.casefold())
+    return entry.get('id') if isinstance(entry, dict) and isinstance(entry.get('id'), str) else None
+
+
+def record_label(repo: str, number: int, ident: str, now=None) -> None:
+    """Remember that the router wrote `impl:<ident>` on this issue (atomic: a temporary file, then a rename)."""
+    data = read_labels()
+    data[f'{repo}#{number}'.casefold()] = dict(id=ident, at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now or time.time())))
+    path = labels_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    temp.write_text(json.dumps(data, indent=1), encoding='utf-8')
+    os.replace(temp, path)
+
+
 # --- what may be offered -------------------------------------------------------------------------
 
 def kimi_eligible(labels, priority) -> tuple[bool, str]:
@@ -98,29 +129,36 @@ def offered(roster, limited, labels, priority) -> list[dict]:
     return [e for e in roster if e['tool'] not in limited and (e['tool'] != 'kimi' or eligible)]
 
 
-def label_override(labels, roster, limited, ignore=None) -> tuple[dict | None, list[str]]:
-    """The owner's `impl:<id>` label: (entry, warnings). A label naming no roster entry is ignored with a
-    warning; two naming entries, or one naming an entry whose tool is limited, is a RouteError. `ignore` is
-    the id of the router's own earlier label (a re-route after a limit): that one label is stale, not an order."""
-    warnings, named = [], []
+def label_override(labels, roster, limited, own=None) -> tuple[dict | None, str | None, str | None, list[str]]:
+    """The `impl:<id>` label of an issue: (entry, source, stale id, warnings); no entry when there is no order.
+    The owner's label is an order (source 'label'): a label naming no roster entry is ignored with a warning;
+    two naming entries, or one naming an entry whose tool is limited, is a RouteError. `own` is the id the
+    router itself wrote (route-labels.json): that label is the router's memory, not an order. It is kept (source
+    'router-label') while its tool is free of a limit and the roster still has it, and otherwise stale: skipped,
+    and the router asked again. A different label on the issue is the owner's, as always."""
+    warnings, named, stale = [], [], None
     for name in labels:
-        if ignore and name == f'{IMPL_PREFIX}{ignore}':
+        if not name.casefold().startswith(IMPL_PREFIX):
             continue
-        if name.casefold().startswith(IMPL_PREFIX):
-            entry = rosters.entry_of(roster, name[len(IMPL_PREFIX):])
-            if entry is None:
-                warnings.append(f"label '{name}' names no implementerRoster entry; ignored")
+        entry = rosters.entry_of(roster, name[len(IMPL_PREFIX):])
+        if own and name == f'{IMPL_PREFIX}{own}':
+            if entry is None or entry['tool'] in limited:
+                stale = own
             else:
-                named.append((name, entry))
+                named.append((name, entry, 'router-label'))
+        elif entry is None:
+            warnings.append(f"label '{name}' names no implementerRoster entry; ignored")
+        else:
+            named.append((name, entry, 'label'))
     if len(named) > 1:
-        raise RouteError('the issue carries more than one impl: label (' + ', '.join(n for n, _ in named) +
+        raise RouteError('the issue carries more than one impl: label (' + ', '.join(n for n, _, _ in named) +
                          '); keep one')
     if not named:
-        return None, warnings
-    name, entry = named[0]
+        return None, None, stale, warnings
+    name, entry, source = named[0]
     if entry['tool'] in limited:
         raise RouteError(f"label '{name}' asks for {entry['tool']}, which has a recorded usage limit")
-    return entry, warnings
+    return entry, source, stale, warnings
 
 
 # --- past outcomes -------------------------------------------------------------------------------
@@ -201,8 +239,8 @@ def build_facts(repo: str, issue: dict, roster_offered, records, kimi_note: str,
 def schema_for(ids) -> dict:
     return {'type': 'object', 'additionalProperties': False, 'required': ['implementer', 'reason', 'rule'],
             'properties': {'implementer': {'type': 'string', 'enum': list(ids)},
-                           'reason': {'type': 'string', 'maxLength': REASON_MAX},
-                           'rule': {'type': 'string', 'maxLength': 64}}}
+                           'reason': {'type': 'string', 'minLength': 1, 'maxLength': REASON_MAX},
+                           'rule': {'type': 'string', 'pattern': RULE_RE.pattern}}}
 
 
 def prompt_text(facts_file: Path) -> str:
@@ -247,7 +285,10 @@ def result_of(entry, reason, rule, source) -> dict:
 
 
 def read_issue(repo: str, number: int, gh) -> dict:
-    done = gh('api', f'repos/{repo}/issues/{number}')
+    try:
+        done = gh('api', f'repos/{repo}/issues/{number}')
+    except (OSError, subprocess.SubprocessError) as err:
+        raise RouteError(f'cannot read {repo}#{number}: {err}') from err
     if done.returncode != 0:
         raise RouteError(f'cannot read {repo}#{number}: {(done.stderr or done.stdout).strip()[-300:]}')
     try:
@@ -260,13 +301,14 @@ def read_issue(repo: str, number: int, gh) -> dict:
 
 
 def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage.real_gh, model=triage.real_model,
-                records=None, issue=None, label=False, ignore_label=None) -> dict:
+                records=None, issue=None, label=False) -> dict:
     """The roster entry for one issue, as a dict with `implementer` (a roster id), `tool`, `model` (when the
     entry has one), `reason`, `rule`, `source` ('label' or 'router') and `warnings`. Raises RouteError: a bad
     roster, no usable claude and a failed judgment all arrive as one.
-    `label`: write the router's own answer as the issue's `impl:<id>` label (never for the owner's label); a
-    label that cannot be written is a warning, not an error. `ignore_label`: the id of the router's own earlier
-    label, stale in a re-route: it is skipped, and the new label replaces it."""
+    `label`: write the router's own answer as the issue's `impl:<id>` label (never for the owner's label) and
+    remember that it was the router's; a label that cannot be written is a warning, not an error. The router's
+    own earlier label (route-labels.json) is kept while it is usable ('router-label', no model call) and
+    replaced when it is stale: its tool has a recorded limit, or the roster lost it."""
     try:
         roster = rosters.load(settings)
     except rosters.RosterError as err:
@@ -275,9 +317,12 @@ def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage
     issue = issue or read_issue(repo, number, gh)
     labels = triage.label_names(issue)
     priority = triage.priority_of(issue.get('labels'))
-    entry, warnings = label_override(labels, roster, limited, ignore_label)
+    entry, source, stale, warnings = label_override(labels, roster, limited, own_label(repo, number))
     if entry is not None:
-        out = result_of(entry, f"the owner's {IMPL_PREFIX}{entry['id']} label on the issue", 'label-override', 'label')
+        if source == 'label':
+            out = result_of(entry, f"the owner's {IMPL_PREFIX}{entry['id']} label on the issue", 'label-override', 'label')
+        else:
+            out = result_of(entry, f"the router's earlier choice, kept: {IMPL_PREFIX}{entry['id']}", 'router-label', 'router-label')
         out['warnings'] = warnings
         return out
     roster_offered = offered(roster, limited, labels, priority)
@@ -319,8 +364,8 @@ def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage
         out['warnings'] = warnings
         if label:
             try:
-                apply_label(repo, number, out['implementer'], gh, replace=ignore_label)
-            except RouteError as err:
+                apply_label(repo, number, out['implementer'], gh, replace=stale)
+            except (RouteError, OSError, subprocess.SubprocessError) as err:
                 warnings.append(f'the impl: label was not written: {err}')
         return out
     finally:
@@ -339,6 +384,7 @@ def apply_label(repo: str, number: int, ident: str, gh=triage.real_gh, replace=N
     edit = gh('issue', 'edit', str(number), '--repo', repo, '--add-label', name, *swap)
     if edit.returncode != 0:
         raise RouteError(f"cannot label {repo}#{number} '{name}': {(edit.stderr or edit.stdout).strip()[-200:]}")
+    record_label(repo, number, ident)
 
 
 # --- outcomes and stats --------------------------------------------------------------------------

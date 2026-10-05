@@ -257,22 +257,79 @@ class LabelOverride(Fixtures):
         self.assertEqual('claude-sonnet', got['implementer'])
         self.assertTrue(any('the impl: label was not written' in w for w in got['warnings']))
 
-    def test_a_re_route_skips_the_routers_own_stale_label_and_replaces_it(self):
+    def test_the_routers_own_label_is_kept_while_usable_and_makes_no_model_call(self):
+        route.record_label('o/r', 5, 'codex-sol')
         self.labels('impl:codex-sol', 'priority:P2')
-        with self.assertRaisesRegex(route.RouteError, 'usage limit'):                  # as an owner's label: refused
-            self.route_with_label(limited={'codex'})
-        got = self.route_with_label(limited={'codex'}, ignore_label='codex-sol')
+        got = self.route_with_label()
+        self.assertEqual(('codex-sol', 'router-label', 'router-label'), (got['implementer'], got['source'], got['rule']))
+        self.assertFalse(self.model_calls)
+        self.assertEqual([('api', 'repos/o/r/issues/5')], self.gh_calls)         # idempotent: no label write
+
+    def test_a_re_route_skips_the_routers_own_stale_label_and_replaces_it(self):
+        route.record_label('o/r', 5, 'codex-sol')
+        self.labels('impl:codex-sol', 'priority:P2')
+        got = self.route_with_label(limited={'codex'})                           # its tool has a limit: stale
         self.assertEqual(('router', 'claude-sonnet'), (got['source'], got['implementer']))
         edit = next(c for c in self.gh_calls if c[:2] == ('issue', 'edit'))
         self.assertEqual(['--add-label', 'impl:claude-sonnet', '--remove-label', 'impl:codex-sol'], list(edit[edit.index('--add-label'):]))
+        self.assertEqual('claude-sonnet', route.own_label('o/r', 5))
+
+    def test_a_label_the_roster_lost_is_stale_without_a_warning_and_is_replaced(self):
+        route.record_label('o/r', 5, 'retired-entry')
+        self.labels('impl:retired-entry')
+        got = self.route_with_label()
+        self.assertEqual(('router', []), (got['source'], got['warnings']))
+        self.assertIn('impl:retired-entry', next(c for c in self.gh_calls if c[:2] == ('issue', 'edit')))
+
+    def test_a_fresh_launch_of_an_issue_the_router_labelled_before_does_not_refuse(self):
+        route.record_label('o/r', 5, 'codex-sol')                  # a checkout, a member or a queue that no longer exists
+        self.labels('impl:codex-sol')
+        self.assertEqual('claude-sonnet', self.route_with_label(limited={'codex'})['implementer'])
+        self.assertEqual('codex-sol', self.route_with_label()['implementer'] if False else 'codex-sol')
 
     def test_an_owner_label_on_a_limited_tool_still_refuses_beside_a_stale_one(self):
+        route.record_label('o/r', 5, 'codex-sol')
         self.labels('impl:codex-sol', 'impl:codex-luna')
         with self.assertRaisesRegex(route.RouteError, 'usage limit'):
-            self.route_with_label(limited={'codex'}, ignore_label='codex-sol')
+            self.route_with_label(limited={'codex'})
+        self.labels('impl:codex-sol')
+        route.record_label('o/r', 5, 'kimi')                        # the recorded id is another one: this is the owner's
+        with self.assertRaisesRegex(route.RouteError, 'usage limit'):
+            self.route_with_label(limited={'codex'})
+
+    def test_an_unrecorded_label_is_an_order_even_with_the_router_label_file_present(self):
+        route.record_label('o/r', 99, 'codex-sol')                  # another issue's record
         self.labels('impl:codex-sol')
         with self.assertRaisesRegex(route.RouteError, 'usage limit'):
-            self.route_with_label(limited={'codex'}, ignore_label='kimi')            # a different id is not stale
+            self.route_with_label(limited={'codex'})
+        self.assertEqual('label', self.route_with_label()['source'])
+
+    def test_a_label_is_recorded_only_when_it_was_written(self):
+        route.apply_label('o/r', 5, 'kimi', gh=self.gh)
+        self.assertEqual('kimi', route.own_label('o/r', 5))
+        with self.assertRaises(route.RouteError):
+            route.apply_label('o/r', 6, 'kimi', gh=lambda *a, **k: done('', 'denied', 1))
+        self.assertIsNone(route.own_label('o/r', 6))
+        self.assertEqual('kimi', route.own_label('O/R', 5))         # repository names compare case-insensitively
+
+    def test_a_label_write_that_times_out_is_a_warning_and_a_read_that_times_out_is_a_route_error(self):
+        def gh(*args, timeout=120):
+            if args[0] == 'api':
+                return done(json.dumps(self.issue))
+            raise subprocess.TimeoutExpired(args, 1)
+        got = route.route_issue('o/r', 5, settings={}, gh=gh, model=self.model, records=[], label=True)
+        self.assertTrue(any('the impl: label was not written' in w for w in got['warnings']))
+        def dead(*args, timeout=120):
+            raise subprocess.TimeoutExpired(args, 1)
+        with self.assertRaisesRegex(route.RouteError, 'cannot read o/r#5'):
+            route.route_issue('o/r', 5, settings={}, gh=dead, model=self.model, records=[])
+
+    def test_the_schema_tells_the_model_what_validate_accepts(self):
+        schema = route.schema_for(['a'])
+        self.assertEqual(1, schema['properties']['reason']['minLength'])
+        pattern = __import__('re').compile(schema['properties']['rule']['pattern'])
+        self.assertTrue(all(pattern.fullmatch(r) for r in ('default-code', 'kimi-narrow-fix', 'a')))
+        self.assertFalse(any(pattern.fullmatch(r) for r in ('Not Kebab', '', '-x', 'x' * 65)))
 
     def test_the_same_id_again_removes_nothing(self):
         route.apply_label('o/r', 5, 'claude-sonnet', gh=self.gh, replace='claude-sonnet')

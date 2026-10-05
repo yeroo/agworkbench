@@ -188,10 +188,10 @@ function Get-WorkbenchConfig {
     if ($null -ne $config.kimiPath -and ($config.kimiPath -isnot [string] -or -not $config.kimiPath.Trim())) {
         throw "kimiPath in '$path' must be the path of kimi.exe (got '$($config.kimiPath)')"
     }
-    if ($null -ne $config.claudeImplementerModel -and ($config.claudeImplementerModel -isnot [string] -or $config.claudeImplementerModel -notmatch $script:ModelNamePattern)) {
-        throw "claudeImplementerModel in '$path' must be a model name such as ""claude-sonnet-5-5"" (got '$($config.claudeImplementerModel)')"
+    if ($null -ne $config.claudeImplementerModel) {
+        $modelProblem = Get-ModelProblem $config.claudeImplementerModel
+        if ($modelProblem) { throw "claudeImplementerModel in '$path': $modelProblem" }
     }
-    if ($config.claudeImplementerModel -match $script:RefusedModelPattern) { throw "claudeImplementerModel in '$path': $(Get-RefusedModelMessage $config.claudeImplementerModel)" }
     if ($config.kimiApproval -cnotin @('ask', 'never')) { throw "kimiApproval in '$path' must be ""ask"" or ""never"" (got '$($config.kimiApproval)')" }
     $config.kimiArgs = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
     foreach ($argument in $config.kimiArgs) {
@@ -301,9 +301,8 @@ function Get-RosterProblem($Roster) {
         $tool = & $get 'tool'
         if (-not (Test-ImplementerTool $tool)) { return "entry '$id': tool must be codex, claude or kimi (got '$tool')" }
         if ($names -ccontains 'model') {
-            $model = & $get 'model'
-            if ($model -isnot [string] -or $model -notmatch $script:ModelNamePattern) { return "entry '$id': model must be a model name such as ""claude-sonnet-5-5"" (got '$model')" }
-            if ($model -match $script:RefusedModelPattern) { return "entry '$id': $(Get-RefusedModelMessage $model)" }
+            $modelProblem = Get-ModelProblem (& $get 'model')
+            if ($modelProblem) { return "entry '$id': $modelProblem" }
         }
         $note = & $get 'note'
         # Code points, as lib/roster.py counts them: a character outside the BMP is two UTF-16 units, one low surrogate.

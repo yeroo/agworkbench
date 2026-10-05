@@ -4801,6 +4801,43 @@ class AutoImplementerLaunch(ImplementerCheckout):
         self.assertEqual(("claude", "claude-opus-5-5", "claude-opus"), (got["Tool"], got["Model"], got["RosterId"]))
         self.assertFalse(self.gh_log.exists())
 
+    def routed_before(self, ident):
+        """The router wrote impl:<ident> on this issue earlier (route-labels.json, beside the outcomes file)."""
+        (self.temp / "route-labels.json").write_text(json.dumps({"o/repo#7": {"id": ident, "at": "2026-10-04T00:00:00Z"}}), encoding="utf-8")
+        self.issue["labels"] = [{"name": "priority:P2"}, {"name": "impl:" + ident}]
+        self.fake_gh()
+
+    def test_after_a_bare_failover_the_routers_own_label_on_a_limited_tool_is_stale_not_an_order(self):
+        # the checkout failed over from codex to a bare claude: its rosterId is gone, codex is recorded limited
+        self.record(tool="claude", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.routed_before("codex-sol")
+        self.fake_claude({"implementer": "claude-sonnet", "reason": "codex is out", "rule": "default-code"})
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("claude", "claude-sonnet"), (got["Tool"], got["RosterId"]))
+        log = self.gh_log.read_text(encoding="utf-8")
+        self.assertIn("--add-label impl:claude-sonnet --remove-label impl:codex-sol", log)
+        self.assertEqual("claude-sonnet", json.loads((self.temp / "route-labels.json").read_text(encoding="utf-8"))["o/repo#7"]["id"])
+
+    def test_with_the_limit_cleared_the_routers_own_label_is_kept_without_a_model_call(self):
+        self.record(tool="claude")
+        self.routed_before("codex-sol")
+        self.fake_claude({"implementer": "claude-sonnet", "reason": "never asked", "rule": "x"}, code=1)      # would fail
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("codex", "gpt-6.1-sol", "codex-sol"), (got["Tool"], got["Model"], got["RosterId"]))
+        self.assertNotIn("issue edit", self.gh_log.read_text(encoding="utf-8"))
+
+    def test_an_owner_label_on_a_limited_tool_still_refuses_a_single_launch(self):
+        self.record(tool="claude", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.issue["labels"] = [{"name": "impl:codex-sol"}]                 # nothing recorded: the owner wrote it
+        self.fake_gh()
+        out = self.auto()
+        self.assertNotEqual(0, out.returncode)
+        self.assertIn("usage limit", out.stdout + out.stderr)
+
     def test_a_dry_run_routes_and_labels_nothing(self):
         out = self.auto("-DryRun")
         self.assertEqual(0, out.returncode, out.stdout + out.stderr)

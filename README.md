@@ -769,8 +769,11 @@ The rules the router does not leave to the model:
   offered non-Kimi entry, rule `kimi-guard`.
 - A tool with a recorded usage limit has no entry in what the router is offered (and an answer naming one is
   an error). With Claude limited, or every entry on a limited tool, a queue pauses as usual.
-- **The owner decides.** The choice is written on the issue as the label `impl:<roster id>`. Change that label
-  before the launch and it wins: the router is not called. A label naming no roster entry is ignored with a
+- **The owner decides.** The choice is written on the issue as the label `impl:<roster id>`, and remembered in
+  `~/.agworkbench/route-labels.json` so the router's own label can be told from one you wrote. Change that label
+  before the launch and it wins: the router is not called. The router's own label is kept (no model call) while its
+  tool is free of a limit and the roster still has it; once its tool is limited it is stale, and the router chooses
+  again and replaces it. A label naming no roster entry is ignored with a
   warning; two `impl:` labels that name roster entries, or one naming a limited tool, refuse the launch.
 
 A queue routes each member once, before its launch, and records the answer on the member (`route`): a restart

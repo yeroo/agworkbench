@@ -1381,12 +1381,13 @@ class Worker:
         except (OSError, ValueError, StateError) as err:
             self.error('route outcomes', err)
 
-    def route_issue(self, repo, number, settings, limited, ignore_label=None):
+    def route_issue(self, repo, number, settings, limited):
         """The router (#109) for one member; tests replace it. A router answer, or router.RouteError. The
         choice is also written as the issue's impl:<id> label (replacing the router's own stale one in a
-        re-route), so the owner sees it; a label that cannot be written is a warning in the answer."""
+        re-route, which route-labels.json tells from the owner's), so the owner sees it; a label that cannot be
+        written is a warning in the answer."""
         config = read_json(settings['config']) if Path(settings['config']).exists() else {}
-        return router.route_issue(repo, number, settings=config, limited=limited, label=True, ignore_label=ignore_label)
+        return router.route_issue(repo, number, settings=config, limited=limited, label=True)
 
     def routed_settings(self, settings, m):
         """The queue's settings for one member of an `implementer: auto` queue: the router runs once per
@@ -1399,17 +1400,15 @@ class Worker:
             recorded = (member or {}).get('route')
             if recorded and recorded.get('tool') in limits:
                 member.pop('route')
-                if recorded.get('source') == 'router':
-                    member['routeStale'] = recorded['implementer']     # its own label: no order, until a route succeeds
                 recorded = None
-            stale = (member or {}).get('routeStale')
         if not recorded:
             try:
-                answer = self.route(settings['repo'], m['number'], settings, sorted(limits), ignore_label=stale)
+                answer = self.route(settings['repo'], m['number'], settings, sorted(limits))
                 for warning in answer.get('warnings', []):
                     print(f'{self.tag}#{m["number"]}: route: {warning}', flush=True)
                 recorded = {key: answer[key] for key in ('implementer', 'tool', 'model', 'reason', 'rule', 'source') if key in answer}
-            except (router.RouteError, rosters.RosterError, triage.TriageError, OSError, ValueError) as err:
+            except (router.RouteError, rosters.RosterError, triage.TriageError, OSError, ValueError,
+                    subprocess.SubprocessError) as err:
                 reason = f'launch deferred: route: {err}'
                 with self.store.transaction() as data:
                     member = find_member(data, m['number'])
@@ -1420,7 +1419,6 @@ class Worker:
                 member = find_member(data, m['number'])
                 if member:
                     member['route'] = recorded
-                    member.pop('routeStale', None)
             print(f'{self.tag}#{m["number"]}: route: {recorded["implementer"]} ({recorded["rule"]}) - {recorded["reason"]}', flush=True)
         chosen = dict(settings, implementer=recorded['tool'], rosterId=recorded['implementer'])
         chosen.pop('implementerModel', None)
