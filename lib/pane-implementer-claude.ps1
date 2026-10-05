@@ -46,6 +46,9 @@ foreach ($argument in $claudeArgs) {
         throw "claudeArgs: '$argument' would re-decide the Claude implementer's tool policy"
     }
 }
+# "claudeImplementerModel": the implementer alone on another model (the planner keeps claudeArgs').
+# Last on the line, so it wins over a --model in claudeArgs.
+if ($config.claudeImplementerModel) { $claudeArgs += @('--model', [string]$config.claudeImplementerModel) }
 
 # Claude Code on Windows runs commands through two tools, Bash and PowerShell; each is denied by name.
 $denied = @('Bash(git push:*)', 'Bash(gh:*)', 'PowerShell(git push:*)', 'PowerShell(gh:*)')

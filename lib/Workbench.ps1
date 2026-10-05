@@ -124,6 +124,8 @@ function Invoke-LaunchSafely([scriptblock] $Body) {
 function Get-WorkbenchConfig {
     <# ~/.agworkbench.json, all keys optional:
          claudeArgs     extra arguments for claude, e.g. ["--dangerously-skip-permissions"]
+         claudeImplementerModel  the model of the Claude implementer only (--model), e.g.
+                        "claude-sonnet-5-5" to spend less on implementing; the planner keeps its own
          codexArgs      extra arguments for codex (policy flags are refused - see pane-codex.ps1)
          checkoutRoot   where per-issue clones go (default ~/source/workbench)
          allowNetwork   let Codex's sandbox reach the network (default false)
@@ -166,12 +168,12 @@ function Get-WorkbenchConfig {
     if ($env:AGWORKBENCH_CONFIG) { $path = $env:AGWORKBENCH_CONFIG }   # tests point this elsewhere
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
-                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask';
+                 cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask'; claudeImplementerModel = $null;
                  failoverOrder = @('claude', 'codex', 'kimi'); limitRetryMinutes = 30; reviewOnLimit = 'wait';
                  closeHelpers = $true; restartExited = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -180,6 +182,9 @@ function Get-WorkbenchConfig {
     }
     if ($null -ne $config.kimiPath -and ($config.kimiPath -isnot [string] -or -not $config.kimiPath.Trim())) {
         throw "kimiPath in '$path' must be the path of kimi.exe (got '$($config.kimiPath)')"
+    }
+    if ($null -ne $config.claudeImplementerModel -and ($config.claudeImplementerModel -isnot [string] -or $config.claudeImplementerModel -notmatch '^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$')) {
+        throw "claudeImplementerModel in '$path' must be a model name such as ""claude-sonnet-5-5"" (got '$($config.claudeImplementerModel)')"
     }
     if ($config.kimiApproval -cnotin @('ask', 'never')) { throw "kimiApproval in '$path' must be ""ask"" or ""never"" (got '$($config.kimiApproval)')" }
     $config.kimiArgs = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
