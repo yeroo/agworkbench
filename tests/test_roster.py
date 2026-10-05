@@ -51,9 +51,11 @@ class Validation(unittest.TestCase):
 class Failover(unittest.TestCase):
     ROSTER = roster.DEFAULT_ROSTER
 
-    def test_a_tool_name_stands_for_the_first_entry_of_that_tool(self):
+    def test_a_tool_name_is_the_bare_tool_with_no_model_and_a_roster_id_is_its_entry(self):
         got = roster.resolve_order(['claude', 'codex', 'kimi'], self.ROSTER)
-        self.assertEqual(['claude-sonnet', 'codex-sol', 'kimi'], [e['id'] for e in got])
+        self.assertEqual([('claude', True, None), ('codex', True, None), ('kimi', None, None)],
+                         [(e['id'], e.get('bare'), e.get('model')) for e in got])      # kimi is also a roster id
+        self.assertTrue(all('model' not in e for e in got))
 
     def test_a_roster_id_is_its_own_entry_and_carries_its_model(self):
         got = roster.resolve_order(['claude-opus', 'codex-luna'], self.ROSTER)
@@ -66,7 +68,13 @@ class Failover(unittest.TestCase):
     def test_recorded_limits_are_skipped_and_none_left_is_none(self):
         order = ['claude', 'codex', 'kimi']
         self.assertEqual('kimi', roster.next_failover(order, self.ROSTER, 'claude', recorded={'codex'})['id'])
+        self.assertIsNone(roster.next_failover(order, self.ROSTER, 'kimi', recorded={'codex', 'claude'}))
         self.assertIsNone(roster.next_failover(order, self.ROSTER, 'claude', recorded={'codex', 'kimi'}))
+
+    def test_a_roster_id_that_is_also_a_tool_name_is_the_entry(self):
+        custom = [{'id': 'codex', 'tool': 'codex', 'model': 'gpt-6-luna', 'note': 'x'}]
+        got = roster.next_failover(['codex', 'claude'], custom, 'claude')
+        self.assertEqual(('codex', 'gpt-6-luna', None), (got['id'], got['model'], got.get('bare')))
 
     def test_the_default_order_keeps_todays_behaviour(self):
         order = ['claude', 'codex', 'kimi']

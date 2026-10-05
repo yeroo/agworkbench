@@ -207,19 +207,12 @@ def schema_for(ids) -> dict:
 
 
 def prompt_text(facts_file: Path) -> str:
-    text = COMMAND.read_text(encoding='utf-8').replace('\r\n', '\n')
-    text = re.sub(r'\A---\n.*?\n---\n', '', text, flags=re.S)
-    return text.replace('$ARGUMENTS', str(facts_file)) + f'\n\nFacts file: {facts_file}\n'
+    return triage.prompt_text(facts_file, COMMAND)
 
 
 def model_argv(claude, facts_file: Path, ids, model: str, home: Path) -> list[str]:
-    settings, mcp = home / 'settings.json', home / 'mcp.json'
-    settings.write_text('{"promptSuggestionEnabled": false}', encoding='utf-8')
-    mcp.write_text('{"mcpServers": {}}', encoding='utf-8')
-    return [*claude, '-p', prompt_text(facts_file), '--restricted', '--tools', 'Read', '--strict-mcp-config',
-            '--mcp-config', str(mcp), '--settings', str(settings), '--no-session-persistence',
-            '--output-format', 'json', '--json-schema', json.dumps(schema_for(ids), separators=(',', ':')),
-            '--model', model, '--add-dir', str(facts_file.parent)]
+    return triage.headless_argv(claude, prompt_text(facts_file), schema_for(ids), home, tools='Read', model=model,
+                                add_dirs=[facts_file.parent])
 
 
 def validate(answer, roster, roster_offered, labels, priority) -> dict:
@@ -270,8 +263,12 @@ def read_issue(repo: str, number: int, gh) -> dict:
 def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage.real_gh, model=triage.real_model,
                 records=None, issue=None) -> dict:
     """The roster entry for one issue, as a dict with `implementer` (a roster id), `tool`, `model` (when the
-    entry has one), `reason`, `rule`, `source` ('label' or 'router') and `warnings`. Raises RouteError."""
-    roster = rosters.load(settings)
+    entry has one), `reason`, `rule`, `source` ('label' or 'router') and `warnings`. Raises RouteError: a bad
+    roster, no usable claude and a failed judgment all arrive as one."""
+    try:
+        roster = rosters.load(settings)
+    except rosters.RosterError as err:
+        raise RouteError(str(err)) from err
     limited = set(limited)
     issue = issue or read_issue(repo, number, gh)
     labels = label_names(issue)
@@ -287,7 +284,10 @@ def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage
                                                            if limited else 'the roster is empty'))
     eligible, why = kimi_eligible(labels, priority)
     records = read_outcomes() if records is None else records
-    claude = triage.find_claude() if model is triage.real_model else ['claude']
+    try:
+        claude = triage.find_claude() if model is triage.real_model else ['claude']
+    except triage.ConfigError as err:
+        raise RouteError(str(err)) from err
     work = work_root()
     try:
         work.mkdir(parents=True, exist_ok=True)
@@ -494,13 +494,15 @@ def record_outcome(checkout, outcome: str, *, pr=None, settings=None, path=None,
         return None
 
 
-def stats_table(records) -> str:
-    """The route-stats table: one row per roster id, in roster order (then unknown ids)."""
+def stats_table(records, roster=None) -> str:
+    """The route-stats table: one row per roster id, in roster order, then the ids the roster no longer has."""
     table = summarize(records)
+    order = [e['id'] for e in roster or []]
+    order = [i for i in order if i in table] + sorted(i for i in table if i not in order)
     if not table:
         return 'no outcomes recorded yet (loops record one when they end: a merge, or an issue closed without one)'
     rows = [('roster id', 'merged', 'not merged', 'mean rounds', 'Majors', 'mean wall', 'Claude out tokens', 'Claude cache reads')]
-    for ident in sorted(table):
+    for ident in order:
         row = table[ident]
         wall = row['meanWallMinutes']
         rows.append((ident, str(row['merged']), str(row['notMerged']),
@@ -526,7 +528,11 @@ def cmd_route_stats(args) -> int:
     if args.json:
         print(json.dumps(summarize(records), indent=2))
     else:
-        print(stats_table(records))
+        try:
+            roster = rosters.load(load_settings())
+        except (RouteError, rosters.RosterError):
+            roster = rosters.DEFAULT_ROSTER           # a bad config must not hide the history
+        print(stats_table(records, roster))
     return 0
 
 
@@ -537,11 +543,15 @@ def cmd_route_issue(args) -> int:
         settings = load_settings(args.config)
         out = route_issue(args.repo, args.number, settings=settings,
                           limited=[t for t in (args.limited or '').split(',') if t])
-        if args.label and out['source'] == 'router':
-            apply_label(args.repo, args.number, out['implementer'])
     except (RouteError, rosters.RosterError, triage.TriageError) as err:
         print(f'route: {err}', file=sys.stderr)
         return 1
+    if args.label and out['source'] == 'router':
+        # The router did choose: a label that cannot be written is said, never a reason to refuse the launch.
+        try:
+            apply_label(args.repo, args.number, out['implementer'])
+        except (RouteError, OSError) as err:
+            out.setdefault('warnings', []).append(f'the impl: label was not written: {err}')
     for line in out.pop('warnings', []):
         print(f'route: warning: {line}', file=sys.stderr)
     print(json.dumps(out, indent=None if args.json else 2))

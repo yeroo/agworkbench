@@ -4695,13 +4695,16 @@ class ImplementerModelState(ImplementerCheckout):
         subprocess.run(["git", "-C", str(self.checkout), "init", "-q"], check=True, capture_output=True)
         self.record(tool="kimi", model="kimi-k2")
         with_model = self.kimi_line({"kimiArgs": ["-m", "kimi-k1"]})
-        if with_model.returncode != 0:
-            self.skipTest("the Kimi pane cannot be composed here: " + with_model.stdout + with_model.stderr)
+        self.assertEqual(0, with_model.returncode, with_model.stdout + with_model.stderr)
         self.assertRegex(with_model.stdout, r"'-m' 'kimi-k1' '-m' 'kimi-k2'\s*$")
         self.record(tool="kimi")
-        self.assertNotRegex(self.kimi_line().stdout, r"'-m'")
+        without = self.kimi_line()
+        self.assertEqual(0, without.returncode, without.stdout + without.stderr)
+        self.assertNotRegex(without.stdout, r"'-m'")
         self.record(tool="claude", model="claude-opus-5-5")
-        self.assertNotIn("claude-opus-5-5", self.kimi_line().stdout)
+        other = self.kimi_line()
+        self.assertEqual(0, other.returncode, other.stdout + other.stderr)
+        self.assertNotIn("claude-opus-5-5", other.stdout)
 
     # --- the entry script ------------------------------------------------------------------------------
 
@@ -4854,11 +4857,16 @@ class AutoImplementerLaunch(ImplementerCheckout):
                          "ConvertTo-Json -Compress -InputObject @{ Target = $t.Target; Id = $t.Entry.id; Model = $t.Entry.model; "
                          "Reasons = @($t.Reasons) }", env=self.env)
 
-    def test_the_default_order_keeps_todays_targets_and_carries_the_first_entrys_model(self):
+    def test_the_default_order_keeps_todays_targets_and_pins_no_model(self):
         got = self.failover(["claude", "codex"], "codex")
-        self.assertEqual(("claude", "claude-sonnet", "claude-sonnet-5-5"), (got["Target"], got["Id"], got["Model"]))
+        self.assertEqual(("claude", "claude", None), (got["Target"], got["Id"], got["Model"]))
         got = self.failover(["claude", "codex"], "claude")
-        self.assertEqual(("codex", "codex-sol", "gpt-6.1-sol"), (got["Target"], got["Id"], got["Model"]))
+        self.assertEqual(("codex", "codex", None), (got["Target"], got["Id"], got["Model"]))
+
+    def test_a_tool_name_that_is_a_roster_id_is_that_entry(self):
+        roster = [{"id": "codex", "tool": "codex", "model": "gpt-6-luna", "note": "x"}]
+        got = self.failover(["codex", "claude"], "claude", roster=roster)
+        self.assertEqual(("codex", "codex", "gpt-6-luna"), (got["Target"], got["Id"], got["Model"]))
 
     def test_a_roster_id_in_the_order_is_that_entry(self):
         got = self.failover(["claude-opus", "codex-luna"], "codex")
@@ -4878,6 +4886,8 @@ class AutoImplementerLaunch(ImplementerCheckout):
         only = [{"id": "luna", "tool": "codex", "model": "gpt-6-luna", "note": "x"}]
         got = self.failover(["claude", "luna"], "codex", roster=only)
         self.assertEqual(("claude", "claude", None), (got["Target"], got["Id"], got["Model"]))
+        got = self.failover(["claude", "luna"], "claude", roster=only)
+        self.assertEqual(("codex", "luna", "gpt-6-luna"), (got["Target"], got["Id"], got["Model"]))
 
 
 if __name__ == "__main__":

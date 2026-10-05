@@ -262,9 +262,9 @@ function Test-ImplementerTool($Value) { return $Value -is [string] -and $Value -
 
 # A model name as claudeImplementerModel always took it. gpt-6-astra is never offered or passed on: a
 # model naming "astra", in any case, is refused wherever a model is read.
-$script:ModelNamePattern = '^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$'
+$script:ModelNamePattern = '^[A-Za-z0-9][A-Za-z0-9._\[\]-]*\z'
 $script:RefusedModelPattern = '(?i)astra'
-$script:RosterIdPattern = '^[a-z0-9][a-z0-9-]*$'
+$script:RosterIdPattern = '^[a-z0-9][a-z0-9-]*\z'      # \z, not $: .NET's $ also matches before a final newline
 
 function Get-RefusedModelMessage([string] $Model) { return "the model '$Model' is refused: gpt-6-astra is never used" }
 
@@ -1335,8 +1335,9 @@ function Resolve-AutoImplementer {
     <# `-Implementer auto` on a single launch (#109): the router (lib/route.py) chooses a roster entry once for
        this issue, and the choice is written as the issue's impl:<id> label. A checkout that was routed before
        keeps its entry (a restart does not route again). The router never defaults silently: a failure refuses
-       the launch with its reason. Returns @{ Tool; Model; RosterId } ($null Tool in a dry run, which routes
-       nothing, labels nothing and calls no model). #>
+       the launch with its reason. Returns @{ Tool; Model; RosterId }: a routed checkout returns its saved entry,
+       also in a dry run; otherwise a dry run returns a $null Tool (it routes nothing, labels nothing and calls
+       no model). #>
     param([string] $Checkout, [string] $Repo, [int] $Number, [switch] $DryRun)
     $rosterId = Get-SavedRosterId $Checkout
     $savedTool = Get-SavedImplementerTool $Checkout
@@ -1431,8 +1432,7 @@ function Resolve-Implementer {
             $conflict = "this checkout's right pane '$pane' runs $saved on model '$savedModel'; close that agent (or leave it at a shell prompt) before changing the model to '$RequestedModel', or rerun without -ImplementerModel"
         } elseif ($toolSwitch) { $tool = $Requested; $model = $null; $rosterId = $null }
     } elseif ($Requested) {
-        # A first choice of the tool, or the same one again: the saved model stays with it.
-        if ($saved -and $Requested -ne $saved) { $model = $null; $rosterId = $null }
+        # A first choice of the tool, or the same one again (a switch was handled above): the saved model stays with it.
         $tool = $Requested
     }
     if ($RequestedModel -and -not $conflict) {
@@ -1671,12 +1671,11 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
 }
 
 function Resolve-FailoverOrder($Order, $Roster) {
-    <# failoverOrder as roster entries (lib/roster.py resolve_order): an id is its entry, a tool name is the first
-       entry of that tool; a tool the roster has no entry for stays a bare entry with no model. #>
+    <# failoverOrder as entries (lib/roster.py resolve_order): a roster id is its entry, with its model; a tool
+       name that is no roster id is the bare tool, with no model (today's behaviour: claudeImplementerModel and
+       each tool's own default stay in charge). #>
     foreach ($item in @($Order)) {
-        if (Test-ImplementerTool $item) {
-            $entry = @($Roster | Where-Object { $_.tool -ceq $item })[0]
-        } else { $entry = Get-RosterEntry $Roster ([string]$item) }
+        $entry = Get-RosterEntry $Roster ([string]$item)
         if ($entry) { $entry } else { [pscustomobject]@{ id = [string]$item; tool = [string]$item } }
     }
 }
@@ -2740,7 +2739,7 @@ function Invoke-LauncherBody {
             Set-LaunchStage failover
             $script:Launch.FailoverEntry = $null
             $Implementer = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
-            # The roster entry the failover chose carries its model (#109); a bare tool has none.
+            # A roster id in failoverOrder carries its model (#109); a bare tool name has none.
             $entry = $script:Launch.FailoverEntry
             $ImplementerModel = ''
             $RosterId = ''

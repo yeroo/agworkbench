@@ -771,7 +771,7 @@ The rules the router does not leave to the model:
   an error). With Claude limited, or every entry on a limited tool, a queue pauses as usual.
 - **The owner decides.** The choice is written on the issue as the label `impl:<roster id>`. Change that label
   before the launch and it wins: the router is not called. A label naming no roster entry is ignored with a
-  warning; two `impl:` labels, or one naming a limited tool, refuse the launch.
+  warning; two `impl:` labels that name roster entries, or one naming a limited tool, refuse the launch.
 
 A queue routes each member once, before its launch, and records the answer on the member (`route`): a restart
 or a retry does not route again, unless the routed tool has hit a limit since. A checkout routed before keeps
@@ -804,9 +804,10 @@ implementer, the planner runs `github-workbench <issue> -Failover`, which:
 - records the limit in the checkout's settings, clears the pane, and starts another tool there
   through the `-Implementer` switch: the first element of `failoverOrder` (default claude, codex,
   kimi; a tool name, or a roster id, #109) whose tool is not the limited one, has no recorded limit and,
-  for Kimi, passes its launch checks. A tool name stands for the first roster entry of that tool, so its
-  model is saved with the switch; a limited claude-sonnet never fails over to claude-opus, since limits
-  are per tool. The default keeps Codex and Claude switching to each other, as before;
+  for Kimi, passes its launch checks. A roster id switches to that entry and saves its model; a tool name that is no
+  roster id switches to the bare tool, with no model pinned (so `claudeImplementerModel` and each tool's own
+  default keep applying, as before the roster). A limited claude-sonnet never fails over to claude-opus, since
+  limits are per tool. The default keeps Codex and Claude switching to each other, as before;
 - lets the planner hand the work over by mail (`wb.py handover` computes the open request).
 
 A tool with a recorded limit is never switched back to automatically. Once its limit has reset,
@@ -1083,9 +1084,9 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `route` | `{"model": "claude-haiku-4-5-20251001"}` | the router's judgment: the model `claude -p` runs on |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude, `kimi-mixed` with Kimi when revmux has it (else `claude-only`) |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the next tool in `failoverOrder`; `false` only reports |
-| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools or roster ids a failover (and a queue with a limited tool) tries, in order: the first whose tool is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools (a roster id counts as its entry's tool) |
+| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools or roster ids a failover (and a queue with a limited tool) tries, in order: the first whose tool is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools (a roster id counts as its entry's tool). A roster id carries its model into the switch; a bare tool name pins none |
 | `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
-| `claudeImplementerModel` | `null` | the Claude implementer's model only (`--model`), e.g. `"claude-sonnet-5-5"` to spend less on implementing; the planner keeps whatever `claudeArgs` gives it |
+| `claudeImplementerModel` | `null` | the Claude implementer's model only (`--model`), e.g. `"claude-sonnet-5-5"` to spend less on implementing; the planner keeps whatever `claudeArgs` gives it. A model saved for the checkout (`-ImplementerModel`, the router's pick, or a failover to a roster id) wins over it |
 | `kimiApproval` | `"ask"` | the Kimi implementer's approval mode: `ask` runs `kimi --yolo` (it stops for commands it rates dangerous and waits for a human); `never` runs `kimi --auto` (no stops, as the Claude agents under `--dangerously-skip-permissions`; the push, `gh` and web guards stay) |
 | `kimiArgs` | `[]` | extra arguments for `kimi` (e.g. `["-m", "<model alias>"]`); approval-mode, session, agent and directory flags are refused in every spelling |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |

@@ -124,12 +124,13 @@ def failover_problem(order, roster) -> str | None:
 
 
 def resolve_order(order, roster) -> list[dict]:
-    """failoverOrder as roster entries: an id is its entry, a tool name is the first entry of that tool; a
-    tool the roster has no entry for stays a bare {'tool': name} (the roster only adds models)."""
+    """failoverOrder as entries: a roster id is its entry (with its model); a tool name that is no roster id is
+    the bare tool, `{'id': tool, 'tool': tool, 'bare': True}`, with no model: today's behaviour, so the default
+    order leaves claudeImplementerModel and each tool's own default model in charge."""
     entries = []
     for item in order:
-        entry = entry_of(roster, item) if item not in TOOLS else first_of_tool(roster, item)
-        entries.append(dict(entry) if entry else {'id': item, 'tool': item})
+        entry = entry_of(roster, item)
+        entries.append(dict(entry) if entry else {'id': item, 'tool': item, 'bare': True})
     return entries
 
 

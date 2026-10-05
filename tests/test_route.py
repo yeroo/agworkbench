@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -117,10 +118,15 @@ class Contract(Fixtures):
             route.route_issue('o/r', 5, settings={}, gh=self.gh, model=slow, records=[])
 
     def test_astra_is_never_offered_even_from_a_hand_edited_roster(self):
-        with self.assertRaisesRegex(roster.RosterError, 'astra'):
+        with self.assertRaisesRegex(route.RouteError, 'astra'):
             self.route(settings={'implementerRoster': [{'id': 'a', 'tool': 'codex', 'model': 'gpt-6-astra', 'note': 'x'}]})
         self.route()
         self.assertNotIn('astra', json.dumps(self.model_calls[0]).casefold())
+
+    def test_a_missing_claude_is_a_route_error_not_a_config_error(self):
+        with unittest.mock.patch.object(route.triage, 'find_claude', side_effect=route.triage.ConfigError('claude is not on PATH')):
+            with self.assertRaisesRegex(route.RouteError, 'claude is not on PATH'):
+                route.route_issue('o/r', 5, settings={}, gh=self.gh, model=route.triage.real_model, records=[])
 
     def test_the_facts_directory_is_removed_afterwards(self):
         self.route()
@@ -373,6 +379,12 @@ class Stats(Fixtures):
         self.assertIn('planner', text)
         self.assertIn('3 loop(s)', text)
 
+    def test_rows_follow_the_roster_then_unknown_ids_alphabetically(self):
+        records = [dict(self.RECORDS[0], rosterId=i) for i in ('kimi', 'codex-luna', 'claude-sonnet', 'retired', 'ancient')]
+        ids = lambda text: [line.split()[0] for line in text.splitlines()[2:7]]
+        self.assertEqual(['claude-sonnet', 'kimi', 'codex-luna', 'ancient', 'retired'], ids(route.stats_table(records, roster.DEFAULT_ROSTER)))
+        self.assertEqual(['ancient', 'claude-sonnet', 'codex-luna', 'kimi', 'retired'], ids(route.stats_table(records)))
+
     def test_an_empty_history_says_so(self):
         self.assertIn('no outcomes recorded yet', route.stats_table([]))
 
@@ -401,6 +413,23 @@ class CommandLine(Fixtures):
         out = self.run_cli('route-issue', '5', '--repo', 'o/r', '--config', str(bad))
         self.assertEqual(1, out.returncode)
         self.assertIn('route: cannot read', out.stderr)
+
+    def test_a_label_that_cannot_be_written_is_a_warning_and_the_answer_is_still_printed(self):
+        bin_dir = self.temp / 'bin'
+        bin_dir.mkdir()
+        (self.temp / 'issue.json').write_text(json.dumps(self.issue), encoding='utf-8')
+        (bin_dir / 'gh').write_text('#!/bin/sh\nif [ "$1" = api ]; then cat ' + str(self.temp / 'issue.json') +
+                                   '; exit 0; fi\necho denied >&2; exit 1\n', encoding='utf-8')
+        (bin_dir / 'claude').write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps({'is_error': False, 'structured_output': self.answer}) +
+                                        "\nEOF\n", encoding='utf-8')
+        for name in ('gh', 'claude'):
+            (bin_dir / name).chmod(0o755)
+        out = subprocess.run([sys.executable, str(ROOT / 'lib/route.py'), 'route-issue', '5', '--repo', 'o/r', '--label', '--json'],
+                             capture_output=True, text=True, env=dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH']),
+                             timeout=60)
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertEqual('claude-sonnet', json.loads(out.stdout)['implementer'])
+        self.assertIn('route: warning: the impl: label was not written', out.stderr)
 
     def test_wb_exposes_route_issue(self):
         out = subprocess.run([sys.executable, str(ROOT / 'lib/wb.py'), 'route-issue', '--help'], capture_output=True, text=True)

@@ -672,15 +672,10 @@ def wait_text(m):
             f'next try {local_clock(wait["retryAt"])}')
 
 
-def tool_route(data):
-    """(implementer tool for the next launch, pause reason): route_entry's tool."""
-    entry, reason = route_entry(data)
-    return (entry['tool'] if entry else None), reason
-
-
 def route_entry(data):
     """(failover entry for the next launch, pause reason) from the queue's recorded tool limits (#61): the
-    roster entry (id, tool, model when it has one, #109) the launch switches to.
+    entry the launch switches to, a roster entry (id, tool, model when it has one, #109) or a bare tool
+    (`bare` true: no model, no roster id).
     (None, None) launches with the queue's own settings, and always in a queue that waits limits out (#77)."""
     if data.get('onLimit') == 'wait':
         return None, None
@@ -2195,7 +2190,7 @@ class Worker:
                 settings['implementer'] = route['tool']     # this launch only; the queue's setting is the human's
                 if route.get('model'):
                     settings['implementerModel'] = route['model']
-                if route['id'] != route['tool']:
+                if not route.get('bare'):
                     settings['rosterId'] = route['id']
                 # A profile chosen for the queue's tool is not the routed tool's (#66): that one's default applies.
                 settings.pop('revmuxProfile', None)

@@ -308,6 +308,30 @@
     }
    ],
    "ok": false
+  },
+  {
+   "name": "id with a trailing newline",
+   "roster": [
+    {
+     "id": "a\n",
+     "tool": "claude",
+     "model": "claude-sonnet-5-5",
+     "note": "n"
+    }
+   ],
+   "ok": false
+  },
+  {
+   "name": "model with a trailing newline",
+   "roster": [
+    {
+     "id": "a",
+     "tool": "claude",
+     "model": "claude-sonnet-5-5\n",
+     "note": "n"
+    }
+   ],
+   "ok": false
   }
  ],
  "failoverOrder": [
@@ -441,6 +465,31 @@
     2
    ],
    "ok": false
+  },
+  {
+   "name": "an element with a trailing newline",
+   "roster": null,
+   "order": [
+    "claude\n",
+    "codex"
+   ],
+   "ok": false
+  },
+  {
+   "name": "a roster id that is also a tool name",
+   "roster": [
+    {
+     "id": "codex",
+     "tool": "codex",
+     "model": "gpt-6-luna",
+     "note": "n"
+    }
+   ],
+   "order": [
+    "codex",
+    "claude"
+   ],
+   "ok": true
   }
  ]
 }

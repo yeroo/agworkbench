@@ -689,21 +689,9 @@ class Triage:
                 pass
 
     def model_argv(self, facts_file: Path, schema: dict = SCHEMA) -> list[str]:
-        home = self.state / 'claude'
-        home.mkdir(parents=True, exist_ok=True)
-        settings, mcp = home / 'settings.json', home / 'mcp.json'
-        settings.write_text('{"promptSuggestionEnabled": false}', encoding='utf-8')
-        mcp.write_text('{"mcpServers": {}}', encoding='utf-8')
-        prompt = prompt_text(facts_file)
-        argv = [*self.claude, '-p', prompt, '--restricted', '--tools', 'Read,Grep,Glob',
-                '--strict-mcp-config', '--mcp-config', str(mcp), '--settings', str(settings),
-                '--no-session-persistence', '--output-format', 'json',
-                '--json-schema', json.dumps(schema, separators=(',', ':'))]
-        if self.config.get('model'):
-            argv += ['--model', self.config['model']]
-        for spec in self.specs[1:]:
-            argv += ['--add-dir', str(spec['path'])]
-        return argv + ['--add-dir', str(facts_file.parent)]
+        return headless_argv(self.claude, prompt_text(facts_file), schema, self.state / 'claude', tools='Read,Grep,Glob',
+                             model=self.config.get('model'),
+                             add_dirs=[spec['path'] for spec in self.specs[1:]] + [facts_file.parent])
 
     # writing ----------------------------------------------------------------------------------------
     def apply(self, issue: dict, decision: Decision, retriage: bool) -> bool:
@@ -1063,8 +1051,27 @@ class Triage:
                 sleep(interval)
 
 
-def prompt_text(facts_file: Path) -> str:
-    text = COMMAND.read_text(encoding='utf-8').replace('\r\n', '\n')
+def headless_argv(claude, prompt: str, schema: dict, home: Path, *, tools: str, model: str | None = None,
+                  add_dirs=()) -> list[str]:
+    """The `claude -p` argv of a judgment that answers one JSON object (triage, the router #109): no MCP, no
+    session, no tools but `tools`, the schema bound; `home` holds its settings and empty MCP config."""
+    home.mkdir(parents=True, exist_ok=True)
+    settings, mcp = home / 'settings.json', home / 'mcp.json'
+    settings.write_text('{"promptSuggestionEnabled": false}', encoding='utf-8')
+    mcp.write_text('{"mcpServers": {}}', encoding='utf-8')
+    argv = [*claude, '-p', prompt, '--restricted', '--tools', tools,
+            '--strict-mcp-config', '--mcp-config', str(mcp), '--settings', str(settings),
+            '--no-session-persistence', '--output-format', 'json',
+            '--json-schema', json.dumps(schema, separators=(',', ':'))]
+    if model:
+        argv += ['--model', model]
+    for directory in add_dirs:
+        argv += ['--add-dir', str(directory)]
+    return argv
+
+
+def prompt_text(facts_file: Path, command: Path = COMMAND) -> str:
+    text = command.read_text(encoding='utf-8').replace('\r\n', '\n')
     text = re.sub(r'\A---\n.*?\n---\n', '', text, flags=re.S)       # the command's frontmatter
     return text.replace('$ARGUMENTS', str(facts_file)) + f'\n\nFacts file: {facts_file}\n'
 

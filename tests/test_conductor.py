@@ -22,6 +22,12 @@ import cleanup
 import tslog
 import wb
 
+def tool_route(data):
+    """(the tool a launch is routed to, pause reason): conductor.route_entry's entry, tool only."""
+    entry, reason = q.route_entry(data)
+    return (entry['tool'] if entry else None), reason
+
+
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
 REAL_FREE_RAM = q.free_ram
 
@@ -2420,9 +2426,9 @@ class LimitWait(unittest.TestCase):
 
     def test_a_wait_queue_never_routes_to_another_tool(self):
         limits = {'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1}}
-        self.assertEqual((None, None), q.tool_route({'config': str(self.config), 'onLimit': 'wait',
+        self.assertEqual((None, None), tool_route({'config': str(self.config), 'onLimit': 'wait',
                                                     'implementer': 'codex', 'toolLimits': limits}))
-        self.assertEqual(('claude', None), q.tool_route({'config': str(self.config), 'onLimit': 'failover',
+        self.assertEqual(('claude', None), tool_route({'config': str(self.config), 'onLimit': 'failover',
                                                         'implementer': 'codex', 'toolLimits': limits}))
 
     def test_a_review_limit_waits_too(self):
@@ -2477,15 +2483,17 @@ class ToolLimits(unittest.TestCase):
 
     def setUp(self):
         QueueCase.setUp(self)
-        self.implementers, self.profiles = [], []
+        self.implementers, self.profiles, self.models = [], [], []
         self.start('o/r#1,2,3', parallel=1)
         self.w = self.worker()
         self.w.notify, self.w.status = Mock(), Mock()
         self.w.tick(); self.w.tick()               # #1 active
         self.implementers.clear()
+        self.models.clear()
 
     def spawn(self, data, m):
         self.implementers.append((m['number'], data.get('implementer')))
+        self.models.append((m['number'], data.get('implementerModel'), data.get('rosterId')))
         self.profiles.append((m['number'], data.get('revmuxProfile')))
         return QueueCase.spawn(self, data, m)
 
@@ -2513,6 +2521,26 @@ class ToolLimits(unittest.TestCase):
         limit = self.store.load()['toolLimits']['codex']
         self.assertEqual(('warning', 1), (limit['kind'], limit['member']))
         self.assertNotIn('implementer', self.store.load())          # the queue's setting stays the human's
+
+    def test_a_failover_to_a_bare_tool_pins_no_model_and_no_roster_id(self):
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        self.assertEqual([(2, None, None)], self.models)           # claudeImplementerModel stays in charge
+
+    def test_a_failover_to_a_roster_id_carries_its_model_and_id(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'failoverOrder': ['claude-opus', 'kimi']}))
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        self.assertEqual([(2, 'claude-opus-5-5', 'claude-opus')], self.models)
+
+    def test_a_failover_to_the_kimi_entry_keeps_its_roster_id(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'failoverOrder': ['kimi', 'claude']}))
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'kimi')], self.implementers)
+        self.assertEqual([(2, None, 'kimi')], self.models)
 
     def test_a_relay_episode_is_read_by_its_tool_not_its_box(self):
         self.record(1, tool='claude', kind='limited', relay=True)   # a Claude implementer in the codex box
@@ -2563,31 +2591,31 @@ class ToolLimits(unittest.TestCase):
         self.record(1)                                               # codex limited
         self.next_member()
         self.assertEqual([(2, 'kimi')], self.implementers)
-        self.assertEqual(('kimi', None), q.tool_route({'config': str(self.config), 'toolLimits': {
+        self.assertEqual(('kimi', None), tool_route({'config': str(self.config), 'toolLimits': {
             'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1}}}))
         both = {'config': str(self.config), 'toolLimits': {
             'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1},
             'kimi': {'kind': 'limited', 'member': 2, 'line': 'y', 'at': 2}}}
-        self.assertEqual(('claude', None), q.tool_route(both))
+        self.assertEqual(('claude', None), tool_route(both))
         self.config.write_text(json.dumps({'failoverOrder': ['codex', 'kimi']}))
-        route, reason = q.tool_route(both)
+        route, reason = tool_route(both)
         self.assertIsNone(route)
         self.assertIn('no tool in failoverOrder', reason)
         for bad in (['codex'], ['codex', 'codex'], ['codex', 'aider'], 'codex,claude'):
             with self.subTest(order=bad):
                 self.config.write_text(json.dumps({'failoverOrder': bad}))
-                route, reason = q.tool_route(both)
+                route, reason = tool_route(both)
                 self.assertIsNone(route)
                 self.assertIn('failoverOrder', reason)
 
     def test_the_default_order_keeps_codex_and_claude_as_before(self):
         limits = lambda *tools: {'config': str(self.config), 'toolLimits': {
             tool: {'kind': 'limited', 'member': 1, 'line': tool, 'at': 1} for tool in tools}}
-        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
-        self.assertIn('planner is always Claude', q.tool_route(limits('claude'))[1])
-        self.assertEqual((None, None), q.tool_route(limits('kimi')))    # a codex queue ignores a kimi limit
+        self.assertEqual(('claude', None), tool_route(limits('codex')))
+        self.assertIn('planner is always Claude', tool_route(limits('claude'))[1])
+        self.assertEqual((None, None), tool_route(limits('kimi')))    # a codex queue ignores a kimi limit
         self.config.write_text(json.dumps({'failoverOrder': None}))      # null is the default too (FIX r1 m3)
-        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
+        self.assertEqual(('claude', None), tool_route(limits('codex')))
 
     def test_clear_limit_and_implementer_accept_kimi(self):
         self.record(1, tool='kimi', kind='limited', relay=True)
@@ -4011,59 +4039,82 @@ class AutoRouting(unittest.TestCase):
             t: {'kind': 'limited', 'member': 1, 'line': t, 'at': 1} for t in tools}}, **extra)
 
     def test_an_auto_queue_routes_nothing_by_tool_unless_every_roster_entry_is_limited(self):
-        self.assertEqual((None, None), q.tool_route(self.limits('codex', implementer='auto')))
-        self.assertEqual((None, None), q.tool_route(self.limits('codex', 'kimi', implementer='auto')))
+        self.assertEqual((None, None), tool_route(self.limits('codex', implementer='auto')))
+        self.assertEqual((None, None), tool_route(self.limits('codex', 'kimi', implementer='auto')))
         self.settings(implementerRoster=[{'id': 'only', 'tool': 'codex', 'note': 'x'}, {'id': 'k', 'tool': 'kimi', 'note': 'y'}])
-        route, reason = q.tool_route(self.limits('codex', 'kimi', implementer='auto'))
+        route, reason = tool_route(self.limits('codex', 'kimi', implementer='auto'))
         self.assertIsNone(route)
         self.assertIn('every implementerRoster entry is on a limited tool', reason)
         self.settings(implementerRoster=[{'id': 'only', 'tool': 'codex', 'note': 'x'}])
-        self.assertIn('every implementerRoster entry', q.tool_route(self.limits('codex', implementer='auto'))[1])
-        self.assertIn('planner is always Claude', q.tool_route(self.limits('claude', implementer='auto'))[1])
+        self.assertIn('every implementerRoster entry', tool_route(self.limits('codex', implementer='auto'))[1])
+        self.assertIn('planner is always Claude', tool_route(self.limits('claude', implementer='auto'))[1])
 
     def test_failover_order_may_name_roster_ids_and_the_chosen_entry_carries_its_model(self):
         self.settings(failoverOrder=['claude-opus', 'codex', 'kimi'])
         entry, reason = q.route_entry(self.limits('codex', implementer='codex'))
         self.assertEqual(('claude-opus', 'claude', 'claude-opus-5-5', None), (entry['id'], entry['tool'], entry['model'], reason))
-        self.assertEqual(('claude', None), q.tool_route(self.limits('codex', implementer='codex')))
+        self.assertEqual(('claude', None), tool_route(self.limits('codex', implementer='codex')))
 
     def test_a_limited_tool_is_not_replaced_by_another_entry_of_the_same_tool(self):
         self.settings(failoverOrder=['claude-sonnet', 'claude-opus', 'codex-luna', 'kimi'])
         entry, _ = q.route_entry(self.limits('claude', implementer='claude'))
         self.assertIsNone(entry)                                   # claude limited: the planner cannot run
         entry, _ = q.route_entry(self.limits('codex', implementer='codex'))
-        self.assertEqual('claude-sonnet', entry['id'])
+        self.assertEqual('claude-sonnet', entry['id'])        # the order names the id itself
 
-    def test_a_bare_tool_in_the_order_is_the_first_entry_of_that_tool(self):
+    def test_a_bare_tool_in_the_order_is_the_bare_tool_with_no_model_and_no_roster_id(self):
         entry, _ = q.route_entry(self.limits('codex', implementer='codex'))
-        self.assertEqual(('claude-sonnet', 'claude-sonnet-5-5'), (entry['id'], entry['model']))
+        self.assertEqual(('claude', True, None), (entry['id'], entry.get('bare'), entry.get('model')))
+        self.settings(failoverOrder=['codex', 'kimi'])
+        entry, _ = q.route_entry(self.limits('codex', implementer='codex'))
+        self.assertEqual(('kimi', None, None), (entry['id'], entry.get('bare'), entry.get('model')))   # kimi is a roster id
 
     def test_an_invalid_failover_order_or_roster_is_a_pause_reason(self):
         for settings in ({'failoverOrder': ['codex', 'nobody']}, {'failoverOrder': ['claude-sonnet', 'claude-opus']},
                          {'implementerRoster': []}):
             with self.subTest(settings=settings):
                 self.settings(**settings)
-                route, reason = q.tool_route(self.limits('codex', implementer='codex'))
+                route, reason = tool_route(self.limits('codex', implementer='codex'))
                 self.assertIsNone(route)
                 self.assertRegex(reason, 'failoverOrder|implementerRoster')
 
-    def test_a_failover_routed_member_launches_with_the_entrys_model_and_roster_id(self):
-        # the ToolLimits flow, with the default roster: a limited codex sends the next member to claude-sonnet
-        class Queue(ToolLimits):
-            pass
-        case = Queue('test_a_limited_codex_sends_new_members_to_claude')
-        case.setUp()
-        try:
-            def spawn(data, m):
-                case.captured = (data.get('implementer'), data.get('implementerModel'), data.get('rosterId'))
-                return QueueCase.spawn(case, data, m)
-            case.spawn = spawn
-            case.w.spawn = spawn
-            case.record(1)
-            case.next_member()
-            self.assertEqual(('claude', 'claude-sonnet-5-5', 'claude-sonnet'), case.captured)
-        finally:
-            case.doCleanups()
+    def default_worker(self):
+        """A worker whose `route` is left at its default: Worker.route_issue, over a patched router."""
+        return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now,
+                        spawn=self.spawn)
+
+    def test_the_default_route_writes_the_label_for_a_router_answer_and_launches(self):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER)) as ask, \
+                patch.object(q.router, 'apply_label') as label:
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual(('o/r', 1), ask.call_args.args)
+        self.assertEqual({'limited': []}, {k: v for k, v in ask.call_args.kwargs.items() if k == 'limited'})
+        label.assert_called_once_with('o/r', 1, 'codex-sol')
+        self.assertEqual([(1, 'codex', 'gpt-6.1-sol', 'codex-sol')], self.spawned)
+
+    def test_the_default_route_writes_no_label_for_an_owner_label_answer(self):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER, source='label')), \
+                patch.object(q.router, 'apply_label') as label:
+            w = self.default_worker()
+            w.tick(); w.tick()
+        label.assert_not_called()
+        self.assertEqual(1, len(self.spawned))
+
+    def test_a_label_that_cannot_be_written_never_stops_the_launch(self):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER)), \
+                patch.object(q.router, 'apply_label', side_effect=q.router.RouteError('denied')):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual(1, len(self.spawned))
+        self.assertEqual('codex-sol', self.member(1)['route']['implementer'])
+
+    def test_a_router_error_of_the_default_route_defers_the_member(self):
+        with patch.object(q.router, 'route_issue', side_effect=q.router.RouteError('no claude')):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual([], self.spawned)
+        self.assertIn('launch deferred: route: no claude', self.member(1)['reason'])
 
 
 class OutcomeRecording(unittest.TestCase):
