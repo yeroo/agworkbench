@@ -23,6 +23,8 @@ from urllib.parse import quote, urlparse
 import agw
 import closer
 import labelquery
+import roster as rosters
+import route as router
 import triage
 import tslog
 
@@ -520,6 +522,7 @@ CEILING_EXTRA = 2               # live members beyond -Parallel the conductor to
 SESSION_GRACE = 120             # seconds a slot-holding member's session may be missing before its slot goes (#61)
 LIVE_STATES = {'active', 'blocked', 'pr-open'}
 IMPLEMENTER_TOOLS = ('codex', 'claude', 'kimi')     # #65
+AUTO = 'auto'                   # a queue's implementer chosen per member by the router (#109)
 DEFAULT_FAILOVER_ORDER = ['claude', 'codex', 'kimi']
 _UNREAD = object()
 
@@ -670,7 +673,14 @@ def wait_text(m):
 
 
 def tool_route(data):
-    """(implementer for the next launch, pause reason) from the queue's recorded tool limits (#61).
+    """(implementer tool for the next launch, pause reason): route_entry's tool."""
+    entry, reason = route_entry(data)
+    return (entry['tool'] if entry else None), reason
+
+
+def route_entry(data):
+    """(failover entry for the next launch, pause reason) from the queue's recorded tool limits (#61): the
+    roster entry (id, tool, model when it has one, #109) the launch switches to.
     (None, None) launches with the queue's own settings, and always in a queue that waits limits out (#77)."""
     if data.get('onLimit') == 'wait':
         return None, None
@@ -686,19 +696,34 @@ def tool_route(data):
     except (OSError, ValueError) as err:
         return None, f'tool limits: {said}; cannot read {data["config"]}: {err}'
     wanted = data.get('implementer') or settings.get('implementer') or 'codex'
+    if wanted == AUTO:
+        # The router (#109) is offered only roster entries whose tool is free of a limit, per member:
+        # nothing to route around here, unless no entry is left.
+        try:
+            entries = rosters.load(settings)
+        except rosters.RosterError as err:
+            return None, f'tool limits: {said}; {err}'
+        if all(entry['tool'] in limits for entry in entries):
+            return None, f'tool limits: {said}; every implementerRoster entry is on a limited tool'
+        return None, None
     if wanted not in limits:
         return None, None
     if settings.get('failover') is False:
         return None, f'tool limits: {said}; failover is off'
-    # The launcher's -Failover rule (#65): the first tool in failoverOrder that is not the limited one
-    # and has no recorded limit. Whether it is installed is the launcher's check, at the launch.
+    # The launcher's -Failover rule (#65): the first element of failoverOrder (a tool, or a roster id #109)
+    # whose tool is not the limited one and has no recorded limit. Whether it is installed is the
+    # launcher's check, at the launch.
     order = settings.get('failoverOrder')
     if order is None:                   # absent or null: the default, as the launcher reads it
         order = DEFAULT_FAILOVER_ORDER
-    if (not isinstance(order, list) or len(order) < 2 or len(set(map(str, order))) != len(order)
-            or any(tool not in IMPLEMENTER_TOOLS for tool in order)):
-        return None, f'tool limits: {said}; failoverOrder in {data["config"]} is invalid: {order!r}'
-    target = next((tool for tool in order if tool != wanted and tool not in limits), None)
+    try:
+        entries = rosters.load(settings)
+    except rosters.RosterError as err:
+        return None, f'tool limits: {said}; {err}'
+    problem = rosters.failover_problem(order, entries)
+    if problem:
+        return None, f'tool limits: {said}; failoverOrder in {data["config"]} {problem}'
+    target = rosters.next_failover(order, entries, wanted, limits)
     if target is None:
         return None, f'tool limits: {said}; no tool in failoverOrder {order} is free of a recorded limit'
     return target, None
@@ -723,7 +748,7 @@ class Store:
                 raise ValueError('unsupported version or repository')
             if type(data['parallel']) is not int or not 1 <= data['parallel'] <= 8 or type(data['watch']) is not bool:
                 raise ValueError('invalid settings')
-            if data.get('implementer') not in (None, *IMPLEMENTER_TOOLS):
+            if data.get('implementer') not in (None, AUTO, *IMPLEMENTER_TOOLS):
                 raise ValueError('invalid implementer')
             if data.get('autonomous') is not None and type(data['autonomous']) is not bool:
                 raise ValueError('invalid autonomous')
@@ -779,7 +804,8 @@ class Store:
                         (m['attempt'] > 0 and not valid_uuid(m.get('token'))) or
                         m.get('priority') not in (None, *triage.PRIORITIES) or
                         m.get('cause') not in (None, 'environment') or
-                        not isinstance(m.get('createdAt') or '', str)):
+                        not isinstance(m.get('createdAt') or '', str) or
+                        not (m.get('route') is None or isinstance(m['route'], dict))):
                     raise ValueError('invalid member')
                 seen.add(m['number'])
             return data
@@ -956,8 +982,8 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
     store = Store(queue_path(root, repo, name))
     if parallel is not None and not 1 <= parallel <= 8:
         raise UsageError('-Parallel must be between 1 and 8')
-    if implementer not in (None, *IMPLEMENTER_TOOLS):
-        raise UsageError('-Implementer must be codex, claude or kimi')
+    if implementer not in (None, AUTO, *IMPLEMENTER_TOOLS):
+        raise UsageError('-Implementer must be codex, claude, kimi or auto')
     if clear_limit not in (None, *IMPLEMENTER_TOOLS):
         raise UsageError('-ClearLimit must be codex, claude or kimi')
     existing = store.load() if store.path.exists() else None      # under the state lock, like every other read
@@ -1259,8 +1285,9 @@ def summary(data):
 
 class Worker:
     def __init__(self, store, token, *, gh=gh_json, clock=time.time, spawn=None, spawn_triage=None, disk_free=None,
-                 ram_free=None):
+                 ram_free=None, route=None):
         self.store, self.token, self.gh, self.clock = store, token, gh, clock
+        self.route = route or self.route_issue
         self.disk_free = disk_free or free_bytes
         self.ram_free = ram_free or free_ram
         self.disk_announced = False   # whether this worker has announced a disk pause (#41)
@@ -1342,6 +1369,55 @@ class Worker:
         except (agw.CtlError, OSError) as err:
             print(f'notification failed: {err}', flush=True)
 
+    def route_issue(self, repo, number, settings, limited):
+        """The router (#109) for one member; tests replace it. A router answer, or router.RouteError. The
+        choice is also written as the issue's impl:<id> label, so the owner sees it (and the next
+        member's override reads it); a label that cannot be written is only said."""
+        config = read_json(settings['config']) if Path(settings['config']).exists() else {}
+        answer = router.route_issue(repo, number, settings=config, limited=limited)
+        if answer['source'] == 'router':
+            try:
+                router.apply_label(repo, number, answer['implementer'])
+            except (router.RouteError, OSError) as err:
+                print(f'{self.tag}#{number}: route: the impl: label was not written: {err}', flush=True)
+        return answer
+
+    def routed_settings(self, settings, m):
+        """The queue's settings for one member of an `implementer: auto` queue: the router runs once per
+        member and its choice is recorded on the member, so a restart or a retry does not route again;
+        only a choice whose tool has since hit a limit is dropped and routed once more. A router failure
+        defers the member like any launch deferral (None)."""
+        limits = set(settings.get('toolLimits') or {})
+        with self.store.transaction() as data:
+            member = find_member(data, m['number'])
+            recorded = (member or {}).get('route')
+            if recorded and recorded.get('tool') in limits:
+                member.pop('route')
+                recorded = None
+        if not recorded:
+            try:
+                answer = self.route(settings['repo'], m['number'], settings, sorted(limits))
+                for warning in answer.get('warnings', []):
+                    print(f'{self.tag}#{m["number"]}: route: {warning}', flush=True)
+                recorded = {key: answer[key] for key in ('implementer', 'tool', 'model', 'reason', 'rule', 'source') if key in answer}
+            except (router.RouteError, rosters.RosterError, triage.TriageError, OSError, ValueError) as err:
+                reason = f'launch deferred: route: {err}'
+                with self.store.transaction() as data:
+                    member = find_member(data, m['number'])
+                    if member and member['state'] == 'launching' and member['attempt'] == m['attempt'] and member.get('token') == m['token']:
+                        defer_launch(data, member, reason, self.clock())
+                return None
+            with self.store.transaction() as data:
+                member = find_member(data, m['number'])
+                if member:
+                    member['route'] = recorded
+            print(f'{self.tag}#{m["number"]}: route: {recorded["implementer"]} ({recorded["rule"]}) - {recorded["reason"]}', flush=True)
+        chosen = dict(settings, implementer=recorded['tool'], rosterId=recorded['implementer'])
+        chosen.pop('implementerModel', None)
+        if recorded.get('model'):
+            chosen['implementerModel'] = recorded['model']
+        return chosen
+
     def spawn_launcher(self, data, m):
         output = self.store.directory / f'launch-{m["number"]}-{m["attempt"]}.log'
         stream = open(output, 'wb')
@@ -1357,6 +1433,10 @@ class Worker:
             args.append('-Yes')
         if data.get('implementer'):
             args += ['-Implementer', data['implementer']]
+        if data.get('implementerModel'):                  # the router's choice for this member (#109)
+            args += ['-ImplementerModel', data['implementerModel']]
+        if data.get('rosterId'):
+            args += ['-RosterId', data['rosterId']]
         if data.get('revmuxProfile'):
             args += ['-RevmuxProfile', data['revmuxProfile']]     # the human's explicit one (#66)
         if data.get('autonomous') is not None:
@@ -2031,7 +2111,7 @@ class Worker:
         disk, ram = self.disk_pause(config), self.ram_pause(config)
         with self.store.transaction() as data:
             self.collect_tool_limits(data)
-            route, tools = tool_route(data)
+            route, tools = route_entry(data)
             # A member waiting out a usage limit keeps its slot, and nobody new starts meanwhile (#77).
             # Not a pause: nothing is wrong, so no notification and no blocked status.
             waiting = self.collect_limit_waits(data)
@@ -2094,7 +2174,11 @@ class Worker:
             self.forget_stale_stamps(data)
             settings = dict(data)
             if route:
-                settings['implementer'] = route     # this launch only; the queue's setting is the human's
+                settings['implementer'] = route['tool']     # this launch only; the queue's setting is the human's
+                if route.get('model'):
+                    settings['implementerModel'] = route['model']
+                if route['id'] != route['tool']:
+                    settings['rosterId'] = route['id']
                 # A profile chosen for the queue's tool is not the routed tool's (#66): that one's default applies.
                 settings.pop('revmuxProfile', None)
         for number, attempt, token, checkout, cleanup in orphan_timeouts:
@@ -2111,8 +2195,13 @@ class Worker:
                                  reason='interrupted launcher still holds the member or checkout lock after 1800 s; stop it and use -Retry')
                     m['launchResult'] = 'timeout'
         for m in launches:
+            launch_settings = settings
+            if settings.get('implementer') == AUTO:
+                launch_settings = self.routed_settings(settings, m)
+                if launch_settings is None:
+                    continue                    # deferred: the member is pending again
             try:
-                self.jobs[m['number']] = self.spawn(settings, m)
+                self.jobs[m['number']] = self.spawn(launch_settings, m)
             except (OSError, ValueError) as err:
                 member_result(self.store.path, m['number'], m['attempt'], m['token'],
                               dict(result='failed', infra=isinstance(err, OSError),
@@ -2274,7 +2363,7 @@ def main(argv=None):
     start.add_argument('--parallel', type=int)
     for flag in ('watch', 'retry', 'yes', 'dry-run', 'triage', 'prune'):
         start.add_argument('--' + flag, action='store_true')
-    start.add_argument('--implementer', choices=IMPLEMENTER_TOOLS)
+    start.add_argument('--implementer', choices=(*IMPLEMENTER_TOOLS, AUTO))
     start.add_argument('--name', help='a named queue of the repo (#66); omitted: the main queue')
     start.add_argument('--workspace', help="the named queue's agwinterm workspace (#66)")
     start.add_argument('--revmux-profile', help="the queue's revmux profile, passed to every member launch (#66)")
