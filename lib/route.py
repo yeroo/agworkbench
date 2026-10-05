@@ -98,11 +98,14 @@ def offered(roster, limited, labels, priority) -> list[dict]:
     return [e for e in roster if e['tool'] not in limited and (e['tool'] != 'kimi' or eligible)]
 
 
-def label_override(labels, roster, limited) -> tuple[dict | None, list[str]]:
+def label_override(labels, roster, limited, ignore=None) -> tuple[dict | None, list[str]]:
     """The owner's `impl:<id>` label: (entry, warnings). A label naming no roster entry is ignored with a
-    warning; two naming entries, or one naming an entry whose tool is limited, is a RouteError."""
+    warning; two naming entries, or one naming an entry whose tool is limited, is a RouteError. `ignore` is
+    the id of the router's own earlier label (a re-route after a limit): that one label is stale, not an order."""
     warnings, named = [], []
     for name in labels:
+        if ignore and name == f'{IMPL_PREFIX}{ignore}':
+            continue
         if name.casefold().startswith(IMPL_PREFIX):
             entry = rosters.entry_of(roster, name[len(IMPL_PREFIX):])
             if entry is None:
@@ -176,12 +179,8 @@ def comparable(records, labels, priority) -> list[dict]:
 
 # --- the facts and the call ----------------------------------------------------------------------
 
-def label_names(issue) -> list[str]:
-    return triage.label_names(issue)
-
-
 def build_facts(repo: str, issue: dict, roster_offered, records, kimi_note: str, eligible: bool) -> dict:
-    labels = label_names(issue)
+    labels = triage.label_names(issue)
     priority = triage.priority_of(issue.get('labels'))
     similar = comparable(records, labels, priority)
     title = issue.get('title') or ''
@@ -261,19 +260,22 @@ def read_issue(repo: str, number: int, gh) -> dict:
 
 
 def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage.real_gh, model=triage.real_model,
-                records=None, issue=None) -> dict:
+                records=None, issue=None, label=False, ignore_label=None) -> dict:
     """The roster entry for one issue, as a dict with `implementer` (a roster id), `tool`, `model` (when the
     entry has one), `reason`, `rule`, `source` ('label' or 'router') and `warnings`. Raises RouteError: a bad
-    roster, no usable claude and a failed judgment all arrive as one."""
+    roster, no usable claude and a failed judgment all arrive as one.
+    `label`: write the router's own answer as the issue's `impl:<id>` label (never for the owner's label); a
+    label that cannot be written is a warning, not an error. `ignore_label`: the id of the router's own earlier
+    label, stale in a re-route: it is skipped, and the new label replaces it."""
     try:
         roster = rosters.load(settings)
     except rosters.RosterError as err:
         raise RouteError(str(err)) from err
     limited = set(limited)
     issue = issue or read_issue(repo, number, gh)
-    labels = label_names(issue)
+    labels = triage.label_names(issue)
     priority = triage.priority_of(issue.get('labels'))
-    entry, warnings = label_override(labels, roster, limited)
+    entry, warnings = label_override(labels, roster, limited, ignore_label)
     if entry is not None:
         out = result_of(entry, f"the owner's {IMPL_PREFIX}{entry['id']} label on the issue", 'label-override', 'label')
         out['warnings'] = warnings
@@ -315,19 +317,26 @@ def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage
             raise RouteError(f'the router failed: {err}') from err
         out = validate(answer, roster, roster_offered, labels, priority)
         out['warnings'] = warnings
+        if label:
+            try:
+                apply_label(repo, number, out['implementer'], gh, replace=ignore_label)
+            except RouteError as err:
+                warnings.append(f'the impl: label was not written: {err}')
         return out
     finally:
         shutil.rmtree(facts_dir, ignore_errors=True)
 
 
-def apply_label(repo: str, number: int, ident: str, gh=triage.real_gh) -> None:
-    """Record the choice as the `impl:<id>` label, creating it when the repository has none yet."""
+def apply_label(repo: str, number: int, ident: str, gh=triage.real_gh, replace=None) -> None:
+    """Record the choice as the `impl:<id>` label, creating it when the repository has none yet. `replace` is
+    the router's own earlier label, removed in the same edit."""
     name = f'{IMPL_PREFIX}{ident}'
     made = gh('label', 'create', name, '--repo', repo, '--color', LABEL_COLOR,
               '--description', 'agworkbench: the implementer chosen for this issue (#109); change it before launch to override')
     if made.returncode != 0 and 'already exists' not in (made.stderr or '') + (made.stdout or ''):
         raise RouteError(f"cannot create label '{name}': {(made.stderr or made.stdout).strip()[-200:]}")
-    edit = gh('issue', 'edit', str(number), '--repo', repo, '--add-label', name)
+    swap = ['--remove-label', f'{IMPL_PREFIX}{replace}'] if replace and replace != ident else []
+    edit = gh('issue', 'edit', str(number), '--repo', repo, '--add-label', name, *swap)
     if edit.returncode != 0:
         raise RouteError(f"cannot label {repo}#{number} '{name}': {(edit.stderr or edit.stdout).strip()[-200:]}")
 
@@ -473,7 +482,7 @@ def record_outcome(checkout, outcome: str, *, pr=None, settings=None, path=None,
         try:
             done = gh('api', f'repos/{repo}/issues/{number}', timeout=30)
             issue = json.loads(done.stdout) if done.returncode == 0 else {}
-            labels = label_names(issue)
+            labels = triage.label_names(issue)
             priority = triage.priority_of(issue.get('labels'))
         except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
             pass
@@ -541,17 +550,11 @@ def cmd_route_stats(args) -> int:
 def cmd_route_issue(args) -> int:
     try:
         settings = load_settings(args.config)
-        out = route_issue(args.repo, args.number, settings=settings,
+        out = route_issue(args.repo, args.number, settings=settings, label=args.label,
                           limited=[t for t in (args.limited or '').split(',') if t])
     except (RouteError, rosters.RosterError, triage.TriageError) as err:
         print(f'route: {err}', file=sys.stderr)
         return 1
-    if args.label and out['source'] == 'router':
-        # The router did choose: a label that cannot be written is said, never a reason to refuse the launch.
-        try:
-            apply_label(args.repo, args.number, out['implementer'])
-        except (RouteError, OSError) as err:
-            out.setdefault('warnings', []).append(f'the impl: label was not written: {err}')
     for line in out.pop('warnings', []):
         print(f'route: warning: {line}', file=sys.stderr)
     print(json.dumps(out, indent=None if args.json else 2))

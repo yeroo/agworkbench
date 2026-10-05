@@ -96,10 +96,6 @@ def entry_of(roster, ident):
     return next((e for e in roster if e['id'] == ident), None)
 
 
-def first_of_tool(roster, tool):
-    return next((e for e in roster if e['tool'] == tool), None)
-
-
 def failover_problem(order, roster) -> str | None:
     """Why this failoverOrder is invalid, or None: a list, no duplicates, every element a tool or a roster
     id, at least two distinct tools among them."""

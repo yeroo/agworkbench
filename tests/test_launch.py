@@ -4572,8 +4572,8 @@ class ImplementerModelState(ImplementerCheckout):
 
     def test_switching_the_tool_drops_the_model_that_belonged_to_the_other_tool(self):
         self.record(tool="claude", model="claude-sonnet-5-5", rosterId="claude-sonnet")
-        got = self.resolved("-Requested kimi")
-        self.assertEqual(("kimi", None, None), (got["Tool"], got["Model"], got["RosterId"]))
+        got = self.resolved("-Requested codex")                 # not kimi: its revmux profile probe runs the real revmux
+        self.assertEqual(("codex", None, None), (got["Tool"], got["Model"], got["RosterId"]))
         got = self.resolved("-Requested codex -RequestedModel gpt-6-luna -RequestedRosterId codex-luna")
         self.assertEqual(("codex", "gpt-6-luna", "codex-luna"), (got["Tool"], got["Model"], got["RosterId"]))
 
@@ -4821,6 +4821,40 @@ class AutoImplementerLaunch(ImplementerCheckout):
         return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), *arguments],
                               env=self.env, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=60)
+
+    def test_the_same_model_under_another_roster_id_is_a_new_label_not_a_model_change(self):
+        self.record(tool="claude", model="claude-opus-5-5")           # set by hand: no roster id saved
+        self.live_pane()
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId claude-opus")
+        self.assertEqual((None, "claude-opus-5-5", "claude-opus"), (got["Conflict"], got["Model"], got["RosterId"]))
+        self.record(tool="claude", model="claude-opus-5-5", rosterId="claude-opus")
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId opus-again")
+        self.assertEqual((None, "opus-again"), (got["Conflict"], got["RosterId"]))
+
+    def test_a_model_less_entry_over_a_saved_model_is_refused_on_a_live_pane_in_plain_words(self):
+        self.record(tool="claude", model="claude-opus-5-5", rosterId="claude-opus")
+        self.live_pane()
+        said = self.resolved("-Requested claude -RequestedRosterId claude-plain")["Conflict"]
+        self.assertIn("claude-opus-5-5", said)
+        self.assertIn("roster entry 'claude-plain', which has no model", said)
+        self.assertIn("-Implementer auto", said)
+        self.assertNotIn("''", said)
+        self.record(tool="claude")                                      # nothing saved: nothing to change
+        self.assertIsNone(self.resolved("-Requested claude -RequestedRosterId claude-plain")["Conflict"])
+
+    def test_a_model_over_a_pane_on_its_default_model_says_so(self):
+        self.record(tool="claude")
+        self.live_pane()
+        said = self.resolved("-Requested claude -RequestedModel claude-opus-5-5")["Conflict"]
+        self.assertIn("runs claude on its default model", said)
+        self.assertNotIn("''", said)
+
+    def test_a_failover_order_marks_a_bare_tool_and_leaves_a_roster_id_its_entry(self):
+        got = pwsh_json(". ./lib/Workbench.ps1; $o = @(Resolve-FailoverOrder @('claude', 'codex-luna', 'kimi') (Get-DefaultImplementerRoster)); "
+                        "ConvertTo-Json -Compress -InputObject @($o | ForEach-Object { @{ id = $_.id; bare = [bool]$_.bare; model = $_.model } })",
+                        env=self.env)
+        self.assertEqual([("claude", True, None), ("codex-luna", False, "gpt-6-luna"), ("kimi", False, None)],
+                         [(e["id"], e["bare"], e["model"]) for e in got])
 
     def dry_run(self, *arguments) -> subprocess.CompletedProcess:
         return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), "o/repo#7", "-NewSession",

@@ -3931,7 +3931,7 @@ class AutoRouting(unittest.TestCase):
 
     def setUp(self):
         QueueCase.setUp(self)
-        self.spawned, self.routed, self.answers = [], [], {}
+        self.spawned, self.routed, self.answers, self.ignored = [], [], {}, []
         self.start('o/r#1,2,3', parallel=1, implementer='auto')
         self.w = self.worker()
         self.w.notify, self.w.status = Mock(), Mock()
@@ -3940,8 +3940,9 @@ class AutoRouting(unittest.TestCase):
         return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now,
                         spawn=self.spawn, route=self.route)
 
-    def route(self, repo, number, settings, limited):
+    def route(self, repo, number, settings, limited, ignore_label=None):
         self.routed.append((number, tuple(limited)))
+        self.ignored.append(ignore_label)
         outcome = self.answers.get(number, self.ANSWER)
         if isinstance(outcome, Exception):
             raise outcome
@@ -4083,31 +4084,110 @@ class AutoRouting(unittest.TestCase):
         return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now,
                         spawn=self.spawn)
 
-    def test_the_default_route_writes_the_label_for_a_router_answer_and_launches(self):
-        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER)) as ask, \
-                patch.object(q.router, 'apply_label') as label:
+    def test_the_default_route_asks_the_router_to_write_the_label_and_launches(self):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER)) as ask:
             w = self.default_worker()
             w.tick(); w.tick()
         self.assertEqual(('o/r', 1), ask.call_args.args)
-        self.assertEqual({'limited': []}, {k: v for k, v in ask.call_args.kwargs.items() if k == 'limited'})
-        label.assert_called_once_with('o/r', 1, 'codex-sol')
+        self.assertEqual((True, None, []), (ask.call_args.kwargs['label'], ask.call_args.kwargs['ignore_label'],
+                                            ask.call_args.kwargs['limited']))
         self.assertEqual([(1, 'codex', 'gpt-6.1-sol', 'codex-sol')], self.spawned)
 
-    def test_the_default_route_writes_no_label_for_an_owner_label_answer(self):
-        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER, source='label')), \
-                patch.object(q.router, 'apply_label') as label:
+    def test_the_label_is_written_for_a_router_answer(self):
+        calls, patched = self.default_route_with(['priority:P2'])
+        with patched:
             w = self.default_worker()
             w.tick(); w.tick()
-        label.assert_not_called()
+        self.assertEqual([('label', 'create', 'impl:claude-sonnet')], [c[:3] for c in calls if c[0] == 'label'])
         self.assertEqual(1, len(self.spawned))
 
+    def test_no_label_is_written_for_an_owner_label(self):
+        calls, patched = self.default_route_with(['impl:codex-luna'])
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual([], [c for c in calls if c[0] in ('label', 'issue')])
+        self.assertEqual('label', self.member(1)['route']['source'])
+        self.assertEqual((1, 'codex', 'gpt-6-luna', 'codex-luna'), self.spawned[0])
+
     def test_a_label_that_cannot_be_written_never_stops_the_launch(self):
-        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER)), \
-                patch.object(q.router, 'apply_label', side_effect=q.router.RouteError('denied')):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER, warnings=['the impl: label was not written: denied'])):
             w = self.default_worker()
             w.tick(); w.tick()
         self.assertEqual(1, len(self.spawned))
         self.assertEqual('codex-sol', self.member(1)['route']['implementer'])
+
+    def default_route_with(self, issue_labels):
+        """Worker.route_issue over the real router.route_issue with a fake gh and a fake model: the issue
+        carries `issue_labels`, the model answers claude-sonnet. Returns (gh calls, the patched context)."""
+        calls = []
+        real = q.router.route_issue
+        issue = {'number': 1, 'title': 't', 'body': 'b', 'state': 'open', 'labels': [{'name': n} for n in issue_labels],
+                 'author_association': 'OWNER'}
+
+        def gh(*args, timeout=120):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, json.dumps(issue) if args[0] == 'api' else '', '')
+
+        def model(argv, cwd):
+            answer = dict(implementer='claude-sonnet', reason='fine', rule='default-code')
+            return subprocess.CompletedProcess(argv, 0, json.dumps({'is_error': False, 'structured_output': answer}), '')
+        patched = patch.object(q.router, 'route_issue', side_effect=lambda *a, **k: real(*a, gh=gh, model=model, records=[], **k))
+        return calls, patched
+
+    def route_again(self, route_record, issue_labels):
+        """Route member 1 once, then make its recorded choice `route_record`, limit codex and route again."""
+        calls, patched = self.default_route_with(issue_labels)
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+            with self.store.transaction() as data:
+                m = q.find_member(data, 1)
+                m.update(state='pending', slotReleased=False, route=route_record)
+            self.limit('codex')
+            calls.clear()
+            w = self.default_worker()
+            w.tick(); w.tick()
+        return calls, w
+
+    def test_a_re_route_after_a_limit_replaces_the_routers_own_stale_label(self):
+        record = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='r', rule='x', source='router')
+        calls, _ = self.route_again(record, ['impl:codex-sol'])
+        self.assertEqual('claude-sonnet', self.member(1)['route']['implementer'])
+        self.assertNotIn('routeStale', self.member(1))
+        edit = next(c for c in calls if c[:2] == ('issue', 'edit'))
+        self.assertEqual(['--add-label', 'impl:claude-sonnet', '--remove-label', 'impl:codex-sol'], list(edit[edit.index('--add-label'):]))
+        self.assertEqual('claude', self.spawned[-1][1])
+
+    def test_a_re_route_that_fails_keeps_the_stale_label_ignored_for_the_next_attempt(self):
+        record = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='r', rule='x', source='router')
+        calls, patched = self.default_route_with(['impl:codex-sol'])
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+            with self.store.transaction() as data:
+                q.find_member(data, 1).update(state='pending', slotReleased=False, route=record)
+            self.limit('codex')
+        # a deferral (no claude on this machine): the member is pending again, its route dropped, the stale id remembered
+        with patch.object(q.router, 'route_issue', side_effect=q.router.RouteError('no claude')):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual(('codex-sol', None), (self.member(1).get('routeStale'), self.member(1).get('route')))
+        self.assertIn('launch deferred: route: no claude', self.member(1)['reason'])
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER, implementer='claude-sonnet', tool='claude')) as ask:
+            self.now += 3600
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual('codex-sol', ask.call_args.kwargs['ignore_label'])
+        self.assertNotIn('routeStale', self.member(1))
+
+    def test_a_re_route_of_an_owners_label_on_a_limited_tool_defers(self):
+        record = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='r', rule='x', source='label')
+        _, w = self.route_again(record, ['impl:codex-sol'])
+        self.assertNotIn('routeStale', self.member(1))
+        member = self.member(1)
+        self.assertEqual('pending', member['state'])
+        self.assertIn('usage limit', member['reason'])
 
     def test_a_router_error_of_the_default_route_defers_the_member(self):
         with patch.object(q.router, 'route_issue', side_effect=q.router.RouteError('no claude')):

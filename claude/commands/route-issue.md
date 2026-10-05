@@ -4,8 +4,10 @@ argument-hint: <facts.json written by agworkbench's lib/route.py>
 ---
 
 You are choosing WHICH implementer works ONE issue. agworkbench's `lib/route.py` gathered the facts and
-runs you headless; it validates your answer and enforces the rules below itself, so answer honestly
-rather than strategically. Easy issues on an expensive implementer waste budget; hard ones on a weak
+runs you headless and validates your answer. What it enforces itself: which roster entries you are offered
+(none on a tool with a recorded usage limit, Kimi only for a `kimi`-labelled issue that is not P0 or P1,
+replacing a Kimi answer otherwise), and that the answer is well formed. The other rules below, including
+Kimi's own suitability rules, are yours to apply: answer honestly rather than strategically. Easy issues on an expensive implementer waste budget; hard ones on a weak
 one waste review rounds.
 
 ## Input

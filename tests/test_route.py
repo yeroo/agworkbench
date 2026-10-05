@@ -32,6 +32,12 @@ class Fixtures(unittest.TestCase):
         os.environ['AGWORKBENCH_ROUTE_ROOT'] = str(self.temp / 'work')
         os.environ['AGWORKBENCH_ROUTE_OUTCOMES'] = str(self.temp / 'outcomes.jsonl')
         self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v) for k, v in old.items()])
+        self.config = self.temp / 'config.json'
+        self.config.write_text('{}', encoding='utf-8')
+        old_config = os.environ.get('AGWORKBENCH_CONFIG')
+        os.environ['AGWORKBENCH_CONFIG'] = str(self.config)
+        self.addCleanup(lambda: os.environ.pop('AGWORKBENCH_CONFIG', None) if old_config is None
+                        else os.environ.__setitem__('AGWORKBENCH_CONFIG', old_config))
         self.model_calls = []
         self.answer = dict(implementer='claude-sonnet', reason='ordinary code', rule='default-code')
         self.issue = {'number': 5, 'title': 'Fix the thing', 'body': 'Details.', 'state': 'open',
@@ -231,6 +237,46 @@ class LabelOverride(Fixtures):
         self.assertEqual(('label', 'create', 'impl:claude-opus'), self.gh_calls[0][:3])
         self.assertEqual(('issue', 'edit', '5'), self.gh_calls[1][:3])
         self.assertIn('impl:claude-opus', self.gh_calls[1])
+
+    def test_the_router_writes_its_own_label_through_route_issue_and_never_the_owners(self):
+        self.route_with_label()
+        self.assertEqual(('label', 'create', 'impl:claude-sonnet'), self.gh_calls[1][:3])
+        self.assertIn('impl:claude-sonnet', self.gh_calls[2])
+        self.gh_calls.clear()
+        self.labels('impl:codex-luna')
+        got = self.route_with_label()
+        self.assertEqual('label', got['source'])
+        self.assertEqual([('api', 'repos/o/r/issues/5')], self.gh_calls)
+
+    def route_with_label(self, **kwargs):
+        return route.route_issue('o/r', 5, settings={}, gh=self.gh, model=self.model, records=[], label=True, **kwargs)
+
+    def test_a_label_failure_is_a_warning_in_the_answer(self):
+        failing = lambda *a, **k: done('', 'denied', 1) if a[0] != 'api' else done(json.dumps(self.issue))
+        got = route.route_issue('o/r', 5, settings={}, gh=failing, model=self.model, records=[], label=True)
+        self.assertEqual('claude-sonnet', got['implementer'])
+        self.assertTrue(any('the impl: label was not written' in w for w in got['warnings']))
+
+    def test_a_re_route_skips_the_routers_own_stale_label_and_replaces_it(self):
+        self.labels('impl:codex-sol', 'priority:P2')
+        with self.assertRaisesRegex(route.RouteError, 'usage limit'):                  # as an owner's label: refused
+            self.route_with_label(limited={'codex'})
+        got = self.route_with_label(limited={'codex'}, ignore_label='codex-sol')
+        self.assertEqual(('router', 'claude-sonnet'), (got['source'], got['implementer']))
+        edit = next(c for c in self.gh_calls if c[:2] == ('issue', 'edit'))
+        self.assertEqual(['--add-label', 'impl:claude-sonnet', '--remove-label', 'impl:codex-sol'], list(edit[edit.index('--add-label'):]))
+
+    def test_an_owner_label_on_a_limited_tool_still_refuses_beside_a_stale_one(self):
+        self.labels('impl:codex-sol', 'impl:codex-luna')
+        with self.assertRaisesRegex(route.RouteError, 'usage limit'):
+            self.route_with_label(limited={'codex'}, ignore_label='codex-sol')
+        self.labels('impl:codex-sol')
+        with self.assertRaisesRegex(route.RouteError, 'usage limit'):
+            self.route_with_label(limited={'codex'}, ignore_label='kimi')            # a different id is not stale
+
+    def test_the_same_id_again_removes_nothing(self):
+        route.apply_label('o/r', 5, 'claude-sonnet', gh=self.gh, replace='claude-sonnet')
+        self.assertNotIn('--remove-label', self.gh_calls[-1])
 
     def test_apply_label_tolerates_an_existing_label_and_reports_a_failure(self):
         route.apply_label('o/r', 5, 'kimi', gh=lambda *a, **k: done('', 'label already exists') if a[0] == 'label' else done(''))

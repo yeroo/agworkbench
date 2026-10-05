@@ -306,7 +306,10 @@ function Get-RosterProblem($Roster) {
             if ($model -match $script:RefusedModelPattern) { return "entry '$id': $(Get-RefusedModelMessage $model)" }
         }
         $note = & $get 'note'
-        if ($note -isnot [string] -or -not $note.Trim() -or $note.Length -gt 200) { return "entry '$id': note must be a non-empty string of at most 200 characters" }
+        # Code points, as lib/roster.py counts them: a character outside the BMP is two UTF-16 units, one low surrogate.
+        $noteLength = 0
+        if ($note -is [string]) { $noteLength = $note.Length - [regex]::Matches($note, '[\uDC00-\uDFFF]').Count }
+        if ($note -isnot [string] -or -not $note.Trim() -or $noteLength -gt 200) { return "entry '$id': note must be a non-empty string of at most 200 characters" }
     }
     return $null
 }
@@ -1412,10 +1415,11 @@ function Resolve-Implementer {
     $rosterId = $savedRosterId
     $conflict = $null
     $toolSwitch = [bool]($Requested -and $saved -and $Requested -ne $saved)
-    # A roster entry without a model (-RequestedRosterId alone) ends the saved model like a different one does.
+    # A model switch is a different model, or a roster entry without one (-RequestedRosterId alone) over a saved model.
+    # The same model under another roster id is only a new label on it: no switch, whatever the saved id was.
     $modelSwitch = [bool]($saved -and -not $toolSwitch -and
-                          (($RequestedModel -and ($RequestedModel -cne $savedModel -or ($RequestedRosterId -and $RequestedRosterId -cne $savedRosterId))) -or
-                           (-not $RequestedModel -and $RequestedRosterId -and $savedModel -and $RequestedRosterId -cne $savedRosterId)))
+                          (($RequestedModel -and $RequestedModel -cne $savedModel) -or
+                           (-not $RequestedModel -and $RequestedRosterId -and $savedModel)))
     if ($toolSwitch -or $modelSwitch) {
         $pane = $null
         $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
@@ -1429,7 +1433,12 @@ function Resolve-Implementer {
         if ($live -and $toolSwitch) {
             $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
         } elseif ($live) {
-            $conflict = "this checkout's right pane '$pane' runs $saved on model '$savedModel'; close that agent (or leave it at a shell prompt) before changing the model to '$RequestedModel', or rerun without -ImplementerModel"
+            $now = ' on its default model'
+            if ($savedModel) { $now = " on model '$savedModel'" }
+            if ($RequestedModel -and $RequestedRosterId) { $next = "model '$RequestedModel' (roster entry '$RequestedRosterId', chosen by -Implementer auto or the queue's router)" }
+            elseif ($RequestedModel) { $next = "model '$RequestedModel'" }
+            else { $next = "the roster entry '$RequestedRosterId', which has no model (chosen by -Implementer auto or the queue's router)" }
+            $conflict = "this checkout's right pane '$pane' runs $saved$now; close that agent (or leave it at a shell prompt) before changing it to $next, or rerun without -ImplementerModel / -Implementer auto"
         } elseif ($toolSwitch) { $tool = $Requested; $model = $null; $rosterId = $null }
     } elseif ($Requested) {
         # A first choice of the tool, or the same one again (a switch was handled above): the saved model stays with it.
@@ -1676,7 +1685,7 @@ function Resolve-FailoverOrder($Order, $Roster) {
        each tool's own default stay in charge). #>
     foreach ($item in @($Order)) {
         $entry = Get-RosterEntry $Roster ([string]$item)
-        if ($entry) { $entry } else { [pscustomobject]@{ id = [string]$item; tool = [string]$item } }
+        if ($entry) { $entry } else { [pscustomobject]@{ id = [string]$item; tool = [string]$item; bare = $true } }
     }
 }
 
@@ -1708,8 +1717,8 @@ function Get-FailoverTarget {
 
 function Invoke-Failover {
     <# Stops a limited implementer (only when it is provably idle at its limit) or accepts an exited
-       one, records the limit, clears the pane, and returns the tool to switch to (the roster entry it came from is left in
-       $script:Launch.FailoverEntry, #109). A refusal is an
+       one, records the limit, clears the pane, and returns @{ Tool; Entry }: the tool to switch to and the entry it
+       came from (#109; `bare` for a tool name, a roster entry with its model otherwise). A refusal is an
        [ImplementerConflict] (exit 2) and happens before anything is stopped or written. A failure
        after that point is a [FailoverIncomplete] (exit 3): the human relaunches with -Implementer. #>
     param([string] $Checkout, $Config, $Tree)
@@ -1719,7 +1728,9 @@ function Invoke-Failover {
     $choice = Get-FailoverTarget -Checkout $Checkout -Config $Config -Saved $saved
     if (-not $choice.Target) { throw [ImplementerConflict]::new("failover refused: $($choice.Reasons -join '; ')") }
     $target = $choice.Target
-    $script:Launch.FailoverEntry = $choice.Entry
+    # What the human types to finish a failover that could not: the tool, and the entry's model when it has one.
+    $relaunch = "-Implementer $target"
+    if ($choice.Entry.model) { $relaunch += " -ImplementerModel $($choice.Entry.model)" }
     $pane = $null
     $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
     if (Test-Path -LiteralPath $registryPath) {
@@ -1761,7 +1772,7 @@ function Invoke-Failover {
             throw [FailoverIncomplete]::new("${incomplete}: the pane showed no shell prompt within $($script:FailoverTiming.ShellWait)s")
         }
         if (Test-Path -LiteralPath $lock) {
-            throw [FailoverIncomplete]::new("${incomplete}: '$lock' appeared while it was being stopped. It was not deleted: check the repository, then run github-workbench <issue> -Implementer $target")
+            throw [FailoverIncomplete]::new("${incomplete}: '$lock' appeared while it was being stopped. It was not deleted: check the repository, then run github-workbench <issue> $relaunch")
         }
     } else { $incomplete = 'failover could not switch' }
     $line = $seen.line
@@ -1774,10 +1785,10 @@ function Invoke-Failover {
     if ($script:OnAgterm) { $clear = 'clear' }
     Invoke-Ctl session type "$clear`n" --target $pane | Out-Null
     if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
-        throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> -Implementer $target once it is")
+        throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> $relaunch once it is")
     }
     Write-Step "failover: $saved -> $target"
-    return $target
+    return @{ Tool = $target; Entry = $choice.Entry }
 }
 
 function Get-ImplementerName([string] $Tool) {
@@ -2737,14 +2748,15 @@ function Invoke-LauncherBody {
         Set-LaunchStage implementer
         if ($Failover) {
             Set-LaunchStage failover
-            $script:Launch.FailoverEntry = $null
-            $Implementer = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
-            # A roster id in failoverOrder carries its model (#109); a bare tool name has none.
-            $entry = $script:Launch.FailoverEntry
+            $failedOver = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
+            $Implementer = $failedOver.Tool
+            # A roster id in failoverOrder carries its model and id (#109); a bare tool name has neither.
             $ImplementerModel = ''
             $RosterId = ''
-            if ($entry -and $entry.model) { $ImplementerModel = [string]$entry.model }
-            if ($entry -and (Get-RosterEntry $config.implementerRoster ([string]$entry.id))) { $RosterId = [string]$entry.id }
+            if (-not $failedOver.Entry.bare) {
+                $RosterId = [string]$failedOver.Entry.id
+                if ($failedOver.Entry.model) { $ImplementerModel = [string]$failedOver.Entry.model }
+            }
             Set-LaunchStage implementer
         }
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
