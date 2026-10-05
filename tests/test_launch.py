@@ -4840,6 +4840,39 @@ class AutoImplementerLaunch(ImplementerCheckout):
         self.assertNotEqual(0, out.returncode)
         self.assertIn("usage limit", out.stdout + out.stderr)
 
+    def test_a_kept_entry_whose_tool_has_a_recorded_limit_is_routed_again_without_that_tool(self):
+        self.record(tool="codex", model="gpt-6.1-sol", rosterId="codex-sol",
+                    limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.fake_claude({"implementer": "claude-sonnet", "reason": "codex is out", "rule": "default-code"})
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("claude", "claude-sonnet"), (got["Tool"], got["RosterId"]))
+        self.assertIn("issue edit", self.gh_log.read_text(encoding="utf-8"))
+        self.fake_claude({"implementer": "codex-sol", "reason": "an answer naming the limited tool", "rule": "x"})
+        self.assertNotEqual(0, self.auto().returncode)                    # the limited tool is not offered
+
+    def test_a_kept_entry_with_a_limit_on_another_tool_is_still_kept(self):
+        self.record(tool="codex", model="gpt-6.1-sol", rosterId="codex-sol",
+                    limits={"kimi": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        out = self.auto()
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual("codex-sol", got["RosterId"])
+        self.assertFalse(self.gh_log.exists())
+
+    def clear_limit(self, implementer, failover, from_auto):
+        self.record(tool="codex", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        out = ps(". ./lib/Workbench.ps1; Clear-ChosenImplementerLimit " + ps_quote(self.checkout) + " " + ps_quote(implementer) +
+                 " $" + str(failover).lower() + " $" + str(from_auto).lower(), env=self.env)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        return "limits" in self.saved()
+
+    def test_only_a_concrete_choice_by_the_human_clears_a_recorded_limit_never_auto_or_a_failover(self):
+        self.assertFalse(self.clear_limit("codex", False, False))         # -Implementer codex: the human says it reset
+        self.assertTrue(self.clear_limit("codex", False, True))           # -Implementer auto picked codex: nothing was said
+        self.assertTrue(self.clear_limit("codex", True, False))           # a failover never clears
+        self.assertTrue(self.clear_limit("", False, False))
+
     def test_a_dry_run_routes_and_labels_nothing(self):
         out = self.auto("-DryRun")
         self.assertEqual(0, out.returncode, out.stdout + out.stderr)

@@ -772,13 +772,14 @@ The rules the router does not leave to the model:
 - **The owner decides.** The choice is written on the issue as the label `impl:<roster id>`, and remembered in
   `~/.agworkbench/route-labels.jsonl` so the router's own label can be told from one you wrote. Change that label
   before the launch and it wins: the router is not called. The router's own label is kept (no model call) while its
-  tool is free of a limit and the roster still has it; once its tool is limited it is stale, and the router chooses
-  again and replaces it. A label naming no roster entry is ignored with a
+  entry would still be offered: its tool free of a limit, Kimi only for an eligible issue, the roster still having
+  it. Otherwise it is stale: the router chooses again and replaces it. A label naming no roster entry is ignored with a
   warning; two `impl:` labels that name roster entries, or one naming a limited tool, refuse the launch.
 
 A queue routes each member once, before its launch, and records the answer on the member (`route`): a restart
-or a retry does not route again, unless the routed tool has hit a limit since. A checkout routed before keeps
-its entry. `-DryRun` calls no model and labels nothing.
+or a retry does not route again, unless the routed tool has hit a limit since (a queue started with `-WaitOnLimit`
+waits limits out instead, as with a concrete tool: it routes around nothing). A checkout routed before keeps
+its entry, unless its tool has a recorded usage limit. `-DryRun` calls no model and labels nothing.
 
 **The model.** `-ImplementerModel <model>` (a single launch) saves the model in `.workbench/state/implementer.json`
 next to the tool, so restarts, resumes and failovers keep it. The Claude pane passes `--model <model>` last,

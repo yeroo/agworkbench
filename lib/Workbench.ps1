@@ -1336,14 +1336,15 @@ function Get-SavedImplementerModel([string] $Checkout, [string] $Tool) {
 function Resolve-AutoImplementer {
     <# `-Implementer auto` on a single launch (#109): the router (lib/route.py) chooses a roster entry once for
        this issue, and the choice is written as the issue's impl:<id> label. A checkout that was routed before
-       keeps its entry (a restart does not route again). The router never defaults silently: a failure refuses
+       keeps its entry (a restart does not route again) unless its tool has a recorded usage limit. The router never defaults silently: a failure refuses
        the launch with its reason. Returns @{ Tool; Model; RosterId }: a routed checkout returns its saved entry,
        also in a dry run; otherwise a dry run returns a $null Tool (it routes nothing, labels nothing and calls
        no model). #>
     param([string] $Checkout, [string] $Repo, [int] $Number, [switch] $DryRun)
     $rosterId = Get-SavedRosterId $Checkout
     $savedTool = Get-SavedImplementerTool $Checkout
-    if ($rosterId -and $savedTool) {
+    # A kept entry whose tool has a recorded limit is not kept: it is routed again, with that tool left out.
+    if ($rosterId -and $savedTool -and -not (Get-ImplementerLimits $Checkout).ContainsKey($savedTool)) {
         $model = Get-SavedImplementerModel $Checkout $savedTool
         Write-Step "implementer: auto - this checkout was routed to $rosterId before; kept"
         return @{ Tool = $savedTool; Model = $model; RosterId = $rosterId }
@@ -1570,6 +1571,12 @@ function Set-ImplementerLimit([string] $Checkout, [string] $Tool, $Entry) {
     $data.PSObject.Properties.Remove('limits')
     if ($limits.Count) { $data | Add-Member -NotePropertyName limits -NotePropertyValue ([pscustomobject]$limits) }
     Write-AtomicJson $path $data
+}
+
+function Clear-ChosenImplementerLimit([string] $Checkout, [string] $Implementer, [bool] $Failover, [bool] $FromAuto) {
+    # The human choosing a tool explicitly says its limit has reset (#24). A tool the router chose says nothing of
+    # the kind: the router only offers tools without a recorded limit, and a failover never clears one.
+    if ($Implementer -and -not $Failover -and -not $FromAuto) { Set-ImplementerLimit $Checkout $Implementer $null }
 }
 
 function Get-PaneLimit([string] $Text, [string] $Tool) {
@@ -2664,7 +2671,8 @@ function Invoke-LauncherBody {
     }
     $hubDir = Join-Path $co.Dir '.workbench'
     $script:Launch.Checkout = $co.Dir
-    if ($Implementer -eq 'auto') {
+    $autoChosen = ($Implementer -eq 'auto')
+    if ($autoChosen) {
         # The router's choice (#109) is made once, here, outside the checkout lock (a model call takes a while):
         # it becomes an ordinary -Implementer <tool> -ImplementerModel <model> with the roster id it came from.
         Set-LaunchStage route
@@ -2772,7 +2780,7 @@ function Invoke-LauncherBody {
         }
         Save-Implementer $co.Dir $resolved
         # The human choosing a tool explicitly says its limit has reset (#24).
-        if ($Implementer -and -not $Failover) { Set-ImplementerLimit $co.Dir $Implementer $null }
+        Clear-ChosenImplementerLimit $co.Dir $Implementer ([bool]$Failover) $autoChosen
         $script:Launch.ImplementerTool = $resolved.Tool
         $lines = & $implementerLines $resolved.Tool
         $codexLaunch = $lines.Launch

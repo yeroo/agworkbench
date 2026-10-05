@@ -1393,8 +1393,9 @@ class Worker:
         """The queue's settings for one member of an `implementer: auto` queue: the router runs once per
         member and its choice is recorded on the member, so a restart or a retry does not route again;
         only a choice whose tool has since hit a limit is dropped and routed once more. A router failure
-        defers the member like any launch deferral (None)."""
-        limits = set(settings.get('toolLimits') or {})
+        defers the member like any launch deferral (None). A queue that waits limits out (#77) ignores them, as a
+        queue with a concrete tool does: nothing is left out of the roster and nothing is re-routed."""
+        limits = set() if settings.get('onLimit') == 'wait' else set(settings.get('toolLimits') or {})
         with self.store.transaction() as data:
             member = find_member(data, m['number'])
             recorded = (member or {}).get('route')

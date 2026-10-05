@@ -4017,6 +4017,20 @@ class AutoRouting(unittest.TestCase):
         self.assertEqual(1, self.store.load()['launchBackoff']['failures'])
         self.assertEqual(1, self.store.load()['launchBackoff']['member'])
 
+    def test_a_queue_that_waits_limits_out_routes_around_nothing(self):
+        with self.store.transaction() as data:
+            data['onLimit'] = 'wait'
+        self.limit('kimi')
+        self.limit('codex')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([(1, ())], self.routed)                          # the router is told of no limit
+        with self.store.transaction() as data:
+            q.find_member(data, 1).update(state='pending', slotReleased=False)
+        self.worker().tick(); self.worker().tick()
+        self.assertEqual([(1, ())], self.routed)                          # and the codex choice is not dropped
+        self.assertEqual('codex-sol', self.member(1)['route']['implementer'])
+        self.assertEqual((None, None), q.route_entry(self.limits('codex', 'kimi', implementer='auto', onLimit='wait')))
+
     def test_the_router_is_told_which_tools_are_limited(self):
         self.limit('kimi')
         self.w.tick(); self.w.tick()

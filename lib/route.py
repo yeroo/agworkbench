@@ -141,7 +141,8 @@ def offered(roster, limited, labels, priority) -> list[dict]:
 
 
 def label_override(labels, roster, limited, own=None, priority=None) -> tuple[dict | None, str | None, str | None, list[str]]:
-    """The `impl:<id>` label of an issue: (entry, source, stale id, warnings); no entry when there is no order.
+    """The `impl:<id>` label of an issue: (entry, source, stale id, warnings); no entry when there is neither an
+    owner's order nor a usable router label.
     The owner's label (one the router did not write) is an order, source 'label', whatever the router's own rules
     say: a label naming no roster entry is ignored with a warning; two naming entries, or one naming an entry
     whose tool is limited, is a RouteError. `own` is the id the router itself wrote (route-labels.jsonl): that
@@ -325,8 +326,9 @@ def route_issue(repo: str, number: int, *, settings: dict, limited=(), gh=triage
     roster, no usable claude and a failed judgment all arrive as one.
     `label`: write the router's own answer as the issue's `impl:<id>` label (never for the owner's label) and
     remember that it was the router's; a label that cannot be written is a warning, not an error. The router's
-    own earlier label (route-labels.jsonl) is kept while it is usable ('router-label', no model call) and
-    replaced when it is stale: its tool has a recorded limit, or the roster lost it."""
+    own earlier label (route-labels.jsonl) is kept while its entry is still offered ('router-label', no model
+    call) and replaced when it is stale: its entry is no longer offered (a limited tool, Kimi on an issue that
+    is not eligible for it, or the roster lost it)."""
     try:
         roster = rosters.load(settings)
     except rosters.RosterError as err:
