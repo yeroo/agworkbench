@@ -142,6 +142,8 @@ function Get-WorkbenchConfig {
          implementerRoster  the entries -Implementer auto chooses from (#109): a list of
                         {"id", "tool", "model" (optional), "note"}; a model naming astra is refused
                         (default: the five entries of Get-DefaultImplementerRoster)
+         route          {"model": ...}: the model of the router's judgment (lib/route.py, #109; default
+                        claude-haiku-4-5-20251001)
          failoverOrder  the tools (or roster ids) -Failover and the queue try, in order, when the
                         implementer is limited (default ["claude", "codex", "kimi"]): the first whose
                         tool is not the limited one, has no recorded limit and is usable
@@ -172,11 +174,11 @@ function Get-WorkbenchConfig {
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
                  cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask'; claudeImplementerModel = $null;
-                 failoverOrder = @('claude', 'codex', 'kimi'); implementerRoster = $null; limitRetryMinutes = 30; reviewOnLimit = 'wait';
+                 failoverOrder = @('claude', 'codex', 'kimi'); implementerRoster = $null; route = $null; limitRetryMinutes = 30; reviewOnLimit = 'wait';
                  closeHelpers = $true; restartExited = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'route', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -199,6 +201,16 @@ function Get-WorkbenchConfig {
     $rosterProblem = Get-RosterProblem $config.implementerRoster
     if ($rosterProblem) { throw "implementerRoster in '$path': $rosterProblem" }
     $config.implementerRoster = @($config.implementerRoster | ForEach-Object { $_ })
+    if ($null -ne $config.route) {
+        # lib/route.py reads this itself (#109): the model of the router's judgment (default claude-haiku-4-5-20251001).
+        if ($config.route -isnot [pscustomobject]) { throw "route in '$path' must be an object with an optional model" }
+        $routeKeys = @($config.route.PSObject.Properties | ForEach-Object { $_.Name })
+        if (@($routeKeys | Where-Object { $_ -cne 'model' }).Count) { throw "route in '$path' must be an object with an optional model" }
+        if ($routeKeys -ccontains 'model') {
+            $routeProblem = Get-ModelProblem $config.route.model
+            if ($routeProblem) { throw "route.model in '$path': $routeProblem" }
+        }
+    }
     # @( ... ) keeps a one-item list a list: ConvertFrom-Json unrolls nothing, but a bare string must fail.
     $orderProblem = Get-FailoverOrderProblem $config.failoverOrder $config.implementerRoster
     if ($orderProblem) { throw "failoverOrder in '$path' $orderProblem" }

@@ -4494,6 +4494,13 @@ class RosterConfig(unittest.TestCase):
                 self.assertNotEqual(0, bad.returncode)
                 self.assertIn(key, bad.stdout + bad.stderr)
 
+    def test_the_route_section_is_validated_like_lib_route(self):
+        for value, ok in (({"model": "claude-haiku-4-5-20251001"}, True), ({}, True), ({"model": "gpt-6-astra"}, False),
+                          ({"model": 5}, False), ({"model": "a b"}, False), ({"other": 1}, False), ("haiku", False)):
+            with self.subTest(value=value):
+                result = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {"route": value})
+                self.assertEqual(ok, result.returncode == 0, result.stdout + result.stderr)
+
     def test_astra_is_refused_in_every_agent_argument_spelling(self):
         for key, args in (("codexArgs", ["-m", "gpt-6-astra"]), ("codexArgs", ["-mgpt-6-ASTRA"]),
                           ("codexArgs", ["--model=gpt-6-astra"]), ("codexArgs", ["-c", "model=gpt-6-astra"]),
