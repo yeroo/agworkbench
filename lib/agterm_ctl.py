@@ -439,13 +439,14 @@ def _parse_cli(argv: list[str]) -> tuple[str, str | None, dict[str, Any], bool, 
     rest = [a for a in argv if a != "--json"]
     target = None
     stdin_text = None
-    if "--target" in rest:
-        i = rest.index("--target")
-        target = rest[i + 1]
-        del rest[i:i + 2]
-    if "--timeout" in rest:
-        i = rest.index("--timeout")
-        del rest[i:i + 2]
+    for flag in ("--target", "--timeout"):
+        if flag in rest:
+            i = rest.index(flag)
+            if i + 1 >= len(rest) or not rest[i + 1]:
+                raise CtlError(f"{flag} needs a value")
+            if flag == "--target":
+                target = rest[i + 1]
+            del rest[i:i + 2]
     if not rest:
         raise CtlError("no verb")
     if rest[0] in ("ping", "tree", "version"):
