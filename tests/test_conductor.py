@@ -40,6 +40,8 @@ class QueueCase(unittest.TestCase):
         self.enterContext(patch.object(q.agw, 'request', self.terminal))
         self.enterContext(patch.object(q.agw, 'notify'))
         self.enterContext(patch.object(q.agw, 'set_status'))
+        # #109: a merged or closed member's outcome goes to the router's statistics: not to the real file, no gh.
+        self.outcomes = self.enterContext(patch.object(q.router, 'record_outcome', return_value=None))
         # The in-hand lookups (#28) call gh and the terminal; queue mechanics tests assume none in hand.
         self.real_in_hand = q.in_hand
         self.in_hand = self.enterContext(patch.object(q, 'in_hand', return_value={}))
@@ -4062,3 +4064,46 @@ class AutoRouting(unittest.TestCase):
             self.assertEqual(('claude', 'claude-sonnet-5-5', 'claude-sonnet'), case.captured)
         finally:
             case.doCleanups()
+
+
+class OutcomeRecording(unittest.TestCase):
+    """#109: a member that merged or closed hands its loop's outcome to the router's statistics, once."""
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh, QueueCase.spawn,
+                                                  QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2')
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+        self.w.tick(); self.w.tick()
+
+    def finish(self, n, state, pr=None):
+        with self.store.transaction() as data:
+            q.find_member(data, n).update(state=state, slotReleased=True, pr=pr, phase='pr-open' if pr else 'closed')
+
+    def test_a_merged_member_is_recorded_once_with_its_pr_while_the_checkout_exists(self):
+        self.finish(1, 'merged', 'https://github.com/o/r/pull/7')
+        self.w.tick()
+        self.outcomes.assert_called_once()
+        args, kwargs = self.outcomes.call_args
+        self.assertEqual((self.member(1)['checkout'], 'merged', 7), (str(args[0]), args[1], kwargs['pr']))
+        self.assertTrue(self.member(1)['outcomeRecorded'])
+        self.w.tick(); self.w.tick()
+        self.outcomes.assert_called_once()
+
+    def test_an_issue_closed_without_a_pr_is_a_closed_outcome_and_live_members_record_nothing(self):
+        self.finish(1, 'closed')
+        self.w.tick()
+        self.assertEqual([(self.member(1)['checkout'], 'closed')], [(str(c.args[0]), c.args[1]) for c in self.outcomes.call_args_list])
+        self.assertNotIn('outcomeRecorded', self.member(2))
+
+    def test_a_checkout_that_is_already_gone_is_skipped_and_a_router_error_never_fails_the_tick(self):
+        self.finish(1, 'merged', 'https://github.com/o/r/pull/7')
+        shutil.rmtree(self.member(1)['checkout'])
+        self.w.tick()
+        self.outcomes.assert_not_called()
+        self.finish(2, 'merged', 'https://github.com/o/r/pull/8')
+        self.outcomes.side_effect = OSError('disk full')
+        self.w.tick()
+        self.assertIn('route outcomes', self.w.errors)

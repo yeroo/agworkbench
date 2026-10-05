@@ -269,6 +269,125 @@ class PastOutcomes(Fixtures):
         self.assertEqual([1], [r['number'] for r in route.read_outcomes()])
 
 
+class Outcomes(Fixtures):
+    """record_outcome: what a loop leaves behind while its checkout still exists."""
+
+    def setUp(self):
+        super().setUp()
+        self.checkout = self.temp / 'repo-issue-5'
+        self.state = self.checkout / '.workbench/state'
+        self.state.mkdir(parents=True)
+        self.claude_home = self.temp / 'claude-home'
+        old = os.environ.get('CLAUDE_CONFIG_DIR')
+        os.environ['CLAUDE_CONFIG_DIR'] = str(self.claude_home)
+        self.addCleanup(lambda: os.environ.pop('CLAUDE_CONFIG_DIR', None) if old is None else os.environ.__setitem__('CLAUDE_CONFIG_DIR', old))
+        (self.state / 'implementer.json').write_text(json.dumps(
+            {'tool': 'claude', 'model': 'claude-sonnet-5-5', 'rosterId': 'claude-sonnet'}), encoding='utf-8')
+        (self.state / 'claude.json').write_text(json.dumps({'issue': 'o/r#5', 'sessionId': 'x'}), encoding='utf-8')
+        (self.state / 'launch.log').write_text('2026-10-05T10:00:00 config starting\n2026-10-05T10:00:01 step x\n', encoding='utf-8')
+        (self.state / 'review-rounds.json').write_text(json.dumps([
+            {'round': 1, 'severe': 2, 'decision': 'continue'}, {'round': 2, 'severe': 0, 'decision': 'stop'}]), encoding='utf-8')
+        self.issue['labels'] = [{'name': 'priority:P2'}, {'name': 'bug'}]
+        self.issue_pr = {'additions': 60, 'deletions': 90}
+
+    def gh(self, *args, timeout=120):
+        if args[1].startswith('repos/o/r/pulls/'):
+            return done(json.dumps(self.issue_pr))
+        return super().gh(*args, timeout=timeout)
+
+    def transcript(self, directory, *entries):
+        folder = self.claude_home / 'projects' / directory
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'a.jsonl').write_text('\n'.join(json.dumps(e) for e in entries) + '\n', encoding='utf-8')
+
+    def slug(self):
+        return __import__('re').sub(r'[^A-Za-z0-9]', '-', str(self.checkout.resolve()))
+
+    def record(self, outcome='merged', **kwargs):
+        return route.record_outcome(self.checkout, outcome, settings={}, gh=self.gh, now=1790000000 + 3600 * 3, **kwargs)
+
+    def test_the_record_holds_the_roster_entry_rounds_majors_labels_and_size(self):
+        got = self.record(pr=9)
+        self.assertEqual(('o/r', 5, 'claude-sonnet', 'claude', 'claude-sonnet-5-5', 'merged'),
+                         tuple(got[k] for k in ('repo', 'number', 'rosterId', 'tool', 'model', 'outcome')))
+        self.assertEqual((2, 2, ['priority:P2', 'bug'], 'P2', 150, 'medium'),
+                         (got['reviewRounds'], got['majors'], got['labels'], got['priority'], got['changedLines'], got['sizeBucket']))
+        self.assertEqual([got['number']], [r['number'] for r in route.read_outcomes()])
+
+    def test_it_is_once_per_issue(self):
+        self.assertIsNotNone(self.record())
+        self.assertIsNone(self.record())
+        self.assertEqual(1, len(route.read_outcomes()))
+
+    def test_wall_time_runs_from_the_first_launch_log_line(self):
+        start = __import__('time').mktime(__import__('time').strptime('2026-10-05T10:00:00', '%Y-%m-%dT%H:%M:%S'))
+        got = route.record_outcome(self.checkout, 'merged', settings={}, gh=self.gh, now=start + 5400)
+        self.assertEqual(5400, got['wallSeconds'])
+
+    def test_a_closed_loop_is_recorded_as_closed_and_an_unsized_one_has_no_bucket(self):
+        got = self.record('closed')
+        self.assertEqual(('closed', None, None), (got['outcome'], got['changedLines'], got['sizeBucket']))
+        self.assertEqual('closed', route.read_outcomes()[0]['outcome'])
+
+    def test_a_loop_outside_the_roster_or_without_an_issue_is_not_recorded(self):
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'codex'}), encoding='utf-8')   # no codex entry without a model
+        self.assertIsNone(self.record())
+        (self.state / 'implementer.json').write_text(json.dumps({'tool': 'kimi'}), encoding='utf-8')    # matches the kimi entry
+        self.assertEqual('kimi', self.record()['rosterId'])
+        (self.state / 'claude.json').unlink()
+        self.assertIsNone(route.record_outcome(self.checkout, 'merged', settings={}, gh=self.gh, path=self.temp / 'other.jsonl'))
+        self.assertFalse((self.temp / 'other.jsonl').exists())
+
+    def test_it_never_raises_on_a_broken_checkout_or_roster(self):
+        self.assertIsNone(route.record_outcome(self.temp / 'nothing-here', 'merged', settings={}, gh=self.gh))
+        self.assertIsNone(route.record_outcome(self.checkout, 'merged', settings={'implementerRoster': []}, gh=self.gh))
+
+    def test_claude_tokens_are_summed_once_per_message_over_this_checkouts_transcripts(self):
+        usage = lambda out, cache: {'output_tokens': out, 'cache_read_input_tokens': cache}
+        self.transcript(self.slug(),
+                        {'message': {'id': 'm1', 'usage': usage(100, 1000)}, 'requestId': 'r1'},
+                        {'message': {'id': 'm1', 'usage': usage(100, 1000)}, 'requestId': 'r1'},      # the same message again
+                        {'message': {'id': 'm2', 'usage': usage(50, 500)}, 'requestId': 'r2'},
+                        {'type': 'user', 'message': {'content': 'hi'}}, {'message': {'usage': {'output_tokens': 'x'}}})
+        self.transcript(self.slug() + '--claude-worktrees-w', {'message': {'id': 'm3', 'usage': usage(7, 70)}, 'requestId': 'r3'})
+        self.transcript(self.slug() + '0', {'message': {'id': 'm4', 'usage': usage(999, 999)}, 'requestId': 'r4'})   # issue-5 vs issue-50
+        self.transcript('-somewhere-else', {'message': {'id': 'm5', 'usage': usage(999, 999)}, 'requestId': 'r5'})
+        self.assertEqual((157, 1570), route.claude_tokens(self.checkout))
+        got = self.record()
+        self.assertEqual((157, 1570), (got['claudeOutputTokens'], got['claudeCacheReadTokens']))
+
+    def test_no_transcripts_is_zero_tokens(self):
+        self.assertEqual((0, 0), route.claude_tokens(self.checkout))
+
+
+class Stats(Fixtures):
+    RECORDS = PastOutcomes.RECORDS
+
+    def test_the_table_has_a_row_per_roster_id_and_says_what_the_tokens_are(self):
+        text = route.stats_table(self.RECORDS)
+        lines = text.splitlines()
+        self.assertRegex(lines[0], r'^roster id\s+merged\s+not merged\s+mean rounds\s+Majors\s+mean wall\s+Claude out tokens\s+Claude cache reads$')
+        row = next(line for line in lines if line.startswith('claude-sonnet'))
+        self.assertRegex(row, r'1\s+1\s+3\s+3\s+1\.5 h\s+300k\s+90\.0M')
+        self.assertTrue(next(line for line in lines if line.startswith('kimi')).split()[-1] == '-')
+        self.assertIn('planner', text)
+        self.assertIn('3 loop(s)', text)
+
+    def test_an_empty_history_says_so(self):
+        self.assertIn('no outcomes recorded yet', route.stats_table([]))
+
+    def test_the_command_reads_the_outcomes_file_and_filters_by_repo(self):
+        (self.temp / 'outcomes.jsonl').write_text('\n'.join(json.dumps(r) for r in self.RECORDS + [
+            dict(self.RECORDS[2], repo='x/y', rosterId='codex-sol')]) + '\n', encoding='utf-8')
+        env = dict(os.environ, AGWORKBENCH_ROUTE_OUTCOMES=str(self.temp / 'outcomes.jsonl'))
+        out = subprocess.run([sys.executable, str(ROOT / 'lib/wb.py'), 'route-stats', '--repo', 'o/r', '--json'],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(0, out.returncode, out.stderr)
+        self.assertEqual({'claude-sonnet', 'kimi'}, set(json.loads(out.stdout)))
+        table = subprocess.run([sys.executable, str(ROOT / 'lib/wb.py'), 'route-stats'], capture_output=True, text=True, env=env)
+        self.assertIn('codex-sol', table.stdout)
+
+
 class CommandLine(Fixtures):
     def run_cli(self, *argv):
         out = subprocess.run([sys.executable, str(ROOT / 'lib/route.py'), *argv], capture_output=True, text=True,

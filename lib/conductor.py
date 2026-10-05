@@ -1369,6 +1369,23 @@ class Worker:
         except (agw.CtlError, OSError) as err:
             print(f'notification failed: {err}', flush=True)
 
+    def record_outcomes(self):
+        """Once a member has merged or closed, its loop's outcome goes to the router's statistics (#109) while
+        the checkout still exists (cleanup deletes it; it records too, and the record is once per issue). Never
+        fails a tick."""
+        try:
+            data = self.store.load()
+            todo = [(m['number'], m['checkout'], m['state'], pr_number(m.get('pr'))) for m in data['members']
+                    if m['state'] in TERMINAL_STATES and not m.get('outcomeRecorded') and Path(m['checkout']).is_dir()]
+            for number, checkout, state, pr in todo:
+                router.record_outcome(checkout, state, pr=pr, settings=read_json(data['config']) if Path(data['config']).exists() else {})
+                with self.store.transaction() as current:
+                    member = find_member(current, number)
+                    if member:
+                        member['outcomeRecorded'] = True
+        except (OSError, ValueError, StateError) as err:
+            self.error('route outcomes', err)
+
     def route_issue(self, repo, number, settings, limited):
         """The router (#109) for one member; tests replace it. A router answer, or router.RouteError. The
         choice is also written as the issue's impl:<id> label, so the owner sees it (and the next
@@ -2105,6 +2122,7 @@ class Worker:
         self.refresh_priorities()
         self.step_triage()
         self.close_backstop()
+        self.record_outcomes()
         launches = []
         orphan_timeouts = []
         config = self.store.load()['config']

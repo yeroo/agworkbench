@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'lib'))
 import cleanup  # noqa: E402
 import conductor  # noqa: E402
+import route  # noqa: E402
 import triage  # noqa: E402
 
 EMPTY_TREE = {'workspaces': [{'name': 'repo', 'sessions': []}]}
@@ -307,6 +308,38 @@ class Remove(Clones):
         self.assertFalse(deleted)
         self.assertEqual(['another cleanup is running on it'], reasons)
         self.assertTrue(checkout.exists())
+
+
+class RouterOutcome(Clones):
+    """#109: the router's statistics need what the checkout holds, so cleanup records before it deletes."""
+
+    def clean(self, checkout, mode, pr_head):
+        return cleanup.clean(checkout, repo='o/repo', issue=7, root=self.root, mode=mode, tree=EMPTY_TREE, pr_head=pr_head,
+                             pause=lambda s: None)
+
+    def test_a_merged_checkout_is_recorded_as_merged_before_it_is_deleted(self):
+        checkout = self.clone()
+        seen = []
+        with patch.object(route, 'record_outcome', side_effect=lambda *a, **k: seen.append((a, checkout.exists()))):
+            deleted, reasons, _ = self.clean(checkout, 'merged', pr_head=run(checkout, 'rev-parse', 'HEAD'))
+        self.assertTrue(deleted, reasons)
+        self.assertEqual([((checkout, 'merged'), True)], seen)
+
+    def test_no_merged_pr_is_a_closed_outcome_and_a_build_cleanup_or_a_kept_checkout_records_nothing(self):
+        checkout = self.clone()
+        with patch.object(route, 'record_outcome') as record:
+            self.clean(checkout, 'build', pr_head=None)
+            record.assert_not_called()
+            deleted, _, _ = self.clean(checkout, 'merged', pr_head=None)
+        self.assertTrue(deleted)
+        record.assert_called_once_with(checkout, 'closed')
+        kept = self.clone(number=8, pushed=False)
+        (kept / 'dirty.txt').write_text('x', encoding='utf-8')
+        with patch.object(route, 'record_outcome') as record:
+            deleted, _, _ = cleanup.clean(kept, repo='o/repo', issue=8, root=self.root, mode='merged', tree=EMPTY_TREE,
+                                          pr_head=None, pause=lambda s: None)
+        self.assertFalse(deleted)
+        record.assert_not_called()
 
 
 class AfterClose(Clones):

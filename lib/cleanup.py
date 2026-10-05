@@ -38,6 +38,7 @@ from typing import Callable
 import agw
 import closer
 import conductor
+import route
 import triage
 
 HERE = Path(__file__).resolve().parent
@@ -352,6 +353,10 @@ def clean(checkout: Path, *, repo: str, issue: int | str, root: Path, mode: str,
             log(root, checkout, 'kept: ' + '; '.join(reasons))
             return False, reasons, 0
         log(root, checkout, f'deleting ({mode})')
+        # The router's stats (#109) need what only this checkout still has (review rounds, the launch log); a
+        # build-only cleanup keeps the checkout, which the conductor's or the next cleanup's record covers.
+        if mode == 'merged':
+            route.record_outcome(checkout, 'merged' if pr_head else 'closed')
         try:
             freed = remove(checkout, mode, pause=pause)
         except CleanupError as err:

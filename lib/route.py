@@ -2,7 +2,8 @@
 """route - the implementer router (#109): which roster entry (tool and model) works this issue.
 
   python lib/route.py route-issue 109 --repo yeroo/agworkbench [--limited codex,kimi] [--label] [--json]
-  (also: wb.py route-issue ...)
+  python lib/route.py route-stats [--repo owner/name] [--json]       the outcome table per roster id
+  (also: wb.py route-issue ... and wb.py route-stats ...)
 
 The judgment is shaped like triage's: facts in a file, `claude -p` on a cheap model with a JSON schema,
 one JSON answer `{"implementer": <roster id>, "reason": ..., "rule": ...}` that this module validates.
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -330,6 +332,204 @@ def apply_label(repo: str, number: int, ident: str, gh=triage.real_gh) -> None:
         raise RouteError(f"cannot label {repo}#{number} '{name}': {(edit.stderr or edit.stdout).strip()[-200:]}")
 
 
+# --- outcomes and stats --------------------------------------------------------------------------
+
+SIZE_BUCKETS = ((100, 'small'), (500, 'medium'))     # changed lines of the PR; above: large
+CHECKOUT_ID = re.compile(r'^(.+)#([1-9][0-9]*)$')
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return None
+
+
+def issue_of(state: Path) -> tuple[str, int] | None:
+    """(owner/name, number) of the loop: the planner's (or implementer's) recorded conversation names it."""
+    for name in ('claude.json', 'implementer-claude.json', 'queue-member.json'):
+        record = read_json(state / name)
+        if not isinstance(record, dict):
+            continue
+        match = CHECKOUT_ID.match(str(record.get('issue') or ''))
+        if match:
+            return match[1], int(match[2])
+        if isinstance(record.get('repo'), str) and type(record.get('number')) is int:
+            return record['repo'], record['number']
+    return None
+
+
+def project_dirs(checkout: Path) -> list[Path]:
+    """Claude Code's transcript directories of this checkout: its slug (every non-alphanumeric character
+    becomes -) and the `<slug>--...` ones of worktrees under it. Not a bare prefix: issue-109 is not issue-1090."""
+    home = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'projects'
+    slug = re.sub(r'[^A-Za-z0-9]', '-', str(Path(checkout).resolve()))
+    if not home.is_dir():
+        return []
+    return [d for d in sorted(home.iterdir()) if d.is_dir() and (d.name == slug or d.name.startswith(slug + '--'))]
+
+
+def claude_tokens(checkout: Path) -> tuple[int, int]:
+    """(output tokens, cache-read tokens) summed over every Claude transcript of the checkout (the planner's
+    and a Claude implementer's), each assistant message once."""
+    output = cache = 0
+    seen = set()
+    for directory in project_dirs(checkout):
+        for transcript in sorted(directory.glob('*.jsonl')):
+            try:
+                lines = transcript.read_text(encoding='utf-8', errors='replace').splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                message = entry.get('message') if isinstance(entry, dict) else None
+                usage = message.get('usage') if isinstance(message, dict) else None
+                if not isinstance(usage, dict):
+                    continue
+                key = (message.get('id'), entry.get('requestId'))
+                if key[0]:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                for name in ('output_tokens', 'cache_read_input_tokens'):
+                    if type(usage.get(name)) is not int:
+                        usage[name] = 0
+                output += usage['output_tokens']
+                cache += usage['cache_read_input_tokens']
+    return output, cache
+
+
+def review_totals(state: Path) -> tuple[int, int]:
+    """(rounds, Majors found): wb.py review-round's record; `severe` is a round's Major+ count."""
+    entries = read_json(state / 'review-rounds.json')
+    entries = [e for e in entries if isinstance(e, dict) and type(e.get('round')) is int] if isinstance(entries, list) else []
+    return len({e['round'] for e in entries}), sum(e['severe'] for e in entries if type(e.get('severe')) is int)
+
+
+def wall_seconds(state: Path, now: float) -> float | None:
+    """From the launcher's first log line (local time) - else implementer.json's own time - to now."""
+    started = None
+    try:
+        first = (state / 'launch.log').read_text(encoding='utf-8-sig').splitlines()[0]
+        started = time.mktime(time.strptime(first.split(' ', 1)[0], '%Y-%m-%dT%H:%M:%S'))
+    except (OSError, IndexError, ValueError, OverflowError):
+        try:
+            started = (state / 'implementer.json').stat().st_mtime
+        except OSError:
+            return None
+    return max(now - started, 0.0)
+
+
+def size_bucket(repo: str, pr, gh) -> tuple[int | None, str | None]:
+    if pr is None:
+        return None, None
+    try:
+        done = gh('api', f'repos/{repo}/pulls/{pr}', timeout=30)
+        data = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None, None
+    if not isinstance(data, dict) or type(data.get('additions')) is not int or type(data.get('deletions')) is not int:
+        return None, None
+    lines = data['additions'] + data['deletions']
+    return lines, next((name for limit, name in SIZE_BUCKETS if lines < limit), 'large')
+
+
+def roster_id_of(recorded: dict, roster) -> str | None:
+    """The roster entry a loop ran on: the one the router or the launcher recorded, else the entry of the
+    saved tool and model; None when no entry matches (a loop outside the roster is not in the table)."""
+    ident = recorded.get('rosterId')
+    if isinstance(ident, str) and rosters.entry_of(roster, ident):
+        return ident
+    entry = next((e for e in roster if e['tool'] == recorded.get('tool') and e.get('model') == recorded.get('model')), None)
+    return entry['id'] if entry else None
+
+
+def record_outcome(checkout, outcome: str, *, pr=None, settings=None, path=None, gh=None, now=None) -> dict | None:
+    """Append one loop's outcome (merged or closed) to route-outcomes.jsonl, once per (repo, issue): the
+    roster entry, review rounds and Majors, wall time, Claude tokens, labels and size bucket. The checkout
+    is deleted after a merge, so this runs while it still exists (the conductor's merged/closed transition and
+    cleanup, which both call it); it is idempotent. Returns the record, or None when there is nothing to add.
+    Never raises: a missing piece is left out."""
+    try:
+        checkout = Path(checkout)
+        state = checkout / '.workbench' / 'state'
+        recorded = read_json(state / 'implementer.json')
+        who = issue_of(state)
+        if not isinstance(recorded, dict) or who is None:
+            return None
+        repo, number = who
+        roster = rosters.load(settings if settings is not None else load_settings())
+        ident = roster_id_of(recorded, roster)
+        if ident is None:
+            return None
+        target = Path(path) if path else outcomes_path()
+        if any(r.get('repo') == repo and r.get('number') == number for r in read_outcomes(target)):
+            return None
+        gh = gh or triage.real_gh
+        labels, priority = [], None
+        try:
+            done = gh('api', f'repos/{repo}/issues/{number}', timeout=30)
+            issue = json.loads(done.stdout) if done.returncode == 0 else {}
+            labels = label_names(issue)
+            priority = triage.priority_of(issue.get('labels'))
+        except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+            pass
+        rounds, majors = review_totals(state)
+        output, cache = claude_tokens(checkout)
+        lines, bucket = size_bucket(repo, pr, gh)
+        now = time.time() if now is None else now
+        record = dict(repo=repo, number=number, rosterId=ident, tool=recorded.get('tool'), model=recorded.get('model'),
+                      outcome='merged' if outcome == 'merged' else 'closed', reviewRounds=rounds, majors=majors,
+                      wallSeconds=wall_seconds(state, now), claudeOutputTokens=output, claudeCacheReadTokens=cache,
+                      labels=labels, priority=priority, changedLines=lines, sizeBucket=bucket,
+                      at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, 'a', encoding='utf-8') as stream:
+            stream.write(json.dumps(record, separators=(',', ':')) + '\n')
+        return record
+    except (OSError, ValueError, rosters.RosterError, RouteError):
+        return None
+
+
+def stats_table(records) -> str:
+    """The route-stats table: one row per roster id, in roster order (then unknown ids)."""
+    table = summarize(records)
+    if not table:
+        return 'no outcomes recorded yet (loops record one when they end: a merge, or an issue closed without one)'
+    rows = [('roster id', 'merged', 'not merged', 'mean rounds', 'Majors', 'mean wall', 'Claude out tokens', 'Claude cache reads')]
+    for ident in sorted(table):
+        row = table[ident]
+        wall = row['meanWallMinutes']
+        rows.append((ident, str(row['merged']), str(row['notMerged']),
+                     '-' if row['meanReviewRounds'] is None else f"{row['meanReviewRounds']:g}", str(row['majors']),
+                     '-' if wall is None else (f'{wall / 60:.1f} h' if wall >= 90 else f'{wall:.0f} min'),
+                     '-' if row['meanClaudeOutputTokens'] is None else f"{row['meanClaudeOutputTokens'] / 1000:,.0f}k",
+                     '-' if row['meanClaudeCacheReadTokens'] is None else f"{row['meanClaudeCacheReadTokens'] / 1e6:,.1f}M"))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    lines = ['  '.join(cell.ljust(w) if i == 0 else cell.rjust(w) for i, (cell, w) in enumerate(zip(r, widths))) for r in rows]
+    lines.insert(1, '  '.join('-' * w for w in widths))
+    return '\n'.join(lines) + ('\nmeans per loop; Claude tokens are the planner\'s and a Claude implementer\'s together '
+                                f'(from ~/.claude/projects/<checkout>/*.jsonl); {len(records)} loop(s)')
+
+
+def cmd_route_stats(args) -> int:
+    try:
+        records = read_outcomes()
+    except RouteError as err:
+        print(f'route: {err}', file=sys.stderr)
+        return 1
+    if args.repo:
+        records = [r for r in records if str(r.get('repo')).casefold() == args.repo.casefold()]
+    if args.json:
+        print(json.dumps(summarize(records), indent=2))
+    else:
+        print(stats_table(records))
+    return 0
+
+
 # --- command line --------------------------------------------------------------------------------
 
 def cmd_route_issue(args) -> int:
@@ -357,6 +557,10 @@ def add_commands(subs) -> None:
     p.add_argument('--config', help='the config file (default: ~/.agworkbench.json)')
     p.add_argument('--json', action='store_true', help='one line of JSON')
     p.set_defaults(func=cmd_route_issue)
+    p = subs.add_parser('route-stats', help='the outcome table per roster id: merged, rounds, Majors, wall time, Claude tokens (#109)')
+    p.add_argument('--repo', help='only this repository (owner/name)')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_route_stats)
 
 
 def main(argv=None) -> int:

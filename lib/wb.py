@@ -25,6 +25,7 @@
   wb.py ci-rerun --pr 12                                          # rerun the failed Actions jobs once (#32)
   wb.py ci-log --pr 12                                            # the failed jobs' log for a FIX round (#32)
   wb.py route-issue 109 --repo yeroo/agworkbench                  # which roster entry (tool + model) works it (#109)
+  wb.py route-stats                                               # merged / rounds / Majors / wall time / tokens per roster id (#109)
 
 Why a helper: Claude's shell is Git Bash, where $PWD is a POSIX path (/c/Users/...) that PowerShell
 cannot use, and quoting a PowerShell command inside a bash string inside an agwintermctl argument
@@ -2679,7 +2680,7 @@ def main() -> int:
     p.add_argument("--after", type=int, metavar="MINUTES",
                    help="with --rerun: wait this long on screen first, for the reviewer's limit to reset")
     p.set_defaults(func=cmd_revmux)
-    route.add_commands(subs)          # route-issue (#109)
+    route.add_commands(subs)          # route-issue, route-stats (#109)
     p = subs.add_parser("plan-check", help="with a Kimi implementer: is the plan Kimi-grade? (#77)")
     p.add_argument("--plan", help="default .workbench/plan.md")
     p.set_defaults(func=cmd_plan_check)
