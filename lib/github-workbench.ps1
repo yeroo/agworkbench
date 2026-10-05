@@ -74,6 +74,7 @@ param(
     [int] $QueueAttempt,
     [string] $QueueToken,
     [string] $Implementer,
+    [string] $ImplementerModel,
     [string] $QueueName,
     [string] $Workspace,
     [string] $RevmuxProfile,
@@ -184,6 +185,18 @@ if ($Cleanup -or $BuildOnly) {
 if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude', 'kimi')) {
     Write-Host "-Implementer must be codex, claude or kimi (got '$Implementer')" -ForegroundColor Yellow
     exit 2
+}
+
+if ($PSBoundParameters.ContainsKey('ImplementerModel')) {
+    $modelProblem = Get-ModelProblem $ImplementerModel
+    if ($modelProblem) {
+        Write-Host "-ImplementerModel: $modelProblem" -ForegroundColor Yellow
+        exit 2
+    }
+    if ($Failover -or $PSBoundParameters.ContainsKey('Queue')) {
+        Write-Host '-ImplementerModel belongs to one launch: it cannot be combined with -Failover or -Queue (a queue routes its own models).' -ForegroundColor Yellow
+        exit 2
+    }
 }
 
 if ($PSBoundParameters.ContainsKey('ClearLimit') -and
@@ -370,7 +383,7 @@ if ($QueueMember) {
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
             Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice `
-                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice -OnLimit $onLimitChoice
+                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice -OnLimit $onLimitChoice -ImplementerModel $ImplementerModel
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -429,7 +442,7 @@ if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
         -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover -Autonomous $autonomousChoice `
-        -BigReview $bigReviewChoice -OnLimit $onLimitChoice
+        -BigReview $bigReviewChoice -OnLimit $onLimitChoice -ImplementerModel $ImplementerModel
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef

@@ -4437,5 +4437,278 @@ class AutonomyLaunch(LauncherFixtures):
         self.assertFalse((self.checkout / '.workbench').exists())
 
 
+ROSTER_CASES = json.loads((ROOT / "tests/fixtures/roster-cases.json").read_text(encoding="utf-8"))
+
+
+def pwsh_json(script: str, env: dict | None = None):
+    result = ps(script, env=env)
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+    return json.loads(result.stdout)
+
+
+class RosterConfig(unittest.TestCase):
+    """#109: implementerRoster and failoverOrder validation. tests/fixtures/roster-cases.json is also what
+    test_roster.py feeds lib/roster.py, so the two implementations cannot drift apart."""
+
+    def judged(self, key: str) -> list:
+        script = ("$cases = Get-Content -Raw -LiteralPath tests/fixtures/roster-cases.json | ConvertFrom-Json; "
+                  ". ./lib/Workbench.ps1; $out = @(); ")
+        if key == "roster":
+            script += ("foreach ($c in $cases.roster) { $out += [pscustomobject]@{ name = $c.name; "
+                       "problem = (Get-RosterProblem $c.roster) } }; ")
+        else:
+            script += ("foreach ($c in $cases.failoverOrder) { $roster = $c.roster; "
+                       "if ($null -eq $roster) { $roster = Get-DefaultImplementerRoster }; "
+                       "$out += [pscustomobject]@{ name = $c.name; problem = (Get-FailoverOrderProblem $c.order $roster) } }; ")
+        script += "ConvertTo-Json -InputObject $out -Compress"
+        return pwsh_json(script)
+
+    def test_every_roster_case_of_the_shared_fixture(self):
+        judged = {row["name"]: row["problem"] for row in self.judged("roster")}
+        self.assertEqual(len(ROSTER_CASES["roster"]), len(judged))
+        for case in ROSTER_CASES["roster"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(case["ok"], judged[case["name"]] is None, judged[case["name"]])
+
+    def test_every_failover_order_case_of_the_shared_fixture(self):
+        judged = {row["name"]: row["problem"] for row in self.judged("failoverOrder")}
+        self.assertEqual(len(ROSTER_CASES["failoverOrder"]), len(judged))
+        for case in ROSTER_CASES["failoverOrder"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(case["ok"], judged[case["name"]] is None, judged[case["name"]])
+
+    def test_the_config_loads_the_roster_and_refuses_a_bad_one(self):
+        default = pwsh_json(". ./lib/Workbench.ps1; $c = Get-WorkbenchConfig; "
+                            "ConvertTo-Json -InputObject @($c.implementerRoster | ForEach-Object { $_.id }) -Compress",
+                            env=dict(os.environ, AGWORKBENCH_CONFIG=str(ROOT / "no-such-config.json")))
+        self.assertEqual(["claude-sonnet", "claude-opus", "kimi", "codex-sol", "codex-luna"], default)
+        good = ps(". ./lib/Workbench.ps1; (Get-WorkbenchConfig).implementerRoster.Count",
+                  {"implementerRoster": [{"id": "only", "tool": "kimi", "note": "x"}], "failoverOrder": ["only", "codex"]})
+        self.assertEqual("1", good.stdout.strip(), good.stderr)
+        for key, value in (("implementerRoster", [{"id": "a", "tool": "codex", "model": "gpt-6-astra", "note": "x"}]),
+                           ("implementerRoster", []), ("failoverOrder", ["claude", "nobody"]),
+                           ("claudeImplementerModel", "gpt-6-ASTRA")):
+            with self.subTest(key=key, value=value):
+                bad = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {key: value})
+                self.assertNotEqual(0, bad.returncode)
+                self.assertIn(key, bad.stdout + bad.stderr)
+
+    def test_astra_is_refused_in_every_agent_argument_spelling(self):
+        for key, args in (("codexArgs", ["-m", "gpt-6-astra"]), ("codexArgs", ["-mgpt-6-ASTRA"]),
+                          ("codexArgs", ["--model=gpt-6-astra"]), ("codexArgs", ["-c", "model=gpt-6-astra"]),
+                          ("codexArgs", ["--config", " model = gpt-6-astra"]), ("claudeArgs", ["--model", "astra"]),
+                          ("kimiArgs", ["-m", "gpt-6-astra"]), ("kimiArgs", ["--model", "GPT-6-ASTRA"])):
+            with self.subTest(key=key, args=args):
+                bad = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {key: args})
+                self.assertNotEqual(0, bad.returncode)
+                self.assertIn("astra", bad.stdout + bad.stderr)
+        for key, args in (("codexArgs", ["-m", "gpt-6-luna"]), ("codexArgs", ["--search"]), ("claudeArgs", ["--model", "claude-opus-5-5"])):
+            with self.subTest(key=key, args=args, ok=True):
+                good = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {key: args})
+                self.assertEqual(0, good.returncode, good.stdout + good.stderr)
+
+
+class ImplementerModelState(unittest.TestCase):
+    """#109: -ImplementerModel in Resolve-Implementer, Save-Implementer and implementer.json; the panes'
+    flags (their -WhatIfOnly lines) come from that record."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="implementer-model-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.checkout = self.temp / "repo-issue-7"
+        (self.checkout / ".workbench/state").mkdir(parents=True)
+        self.config_path = self.temp / "config.json"
+        self.config_path.write_text(json.dumps({"checkoutRoot": str(self.temp)}), encoding="utf-8")
+        self.env = dict(os.environ, AGWORKBENCH_CONFIG=str(self.config_path), PYTHONIOENCODING="utf-8")
+
+    def record(self, **fields):
+        base = {"tool": "codex", "revmuxProfile": "comprehensive", "autoMerge": False, "autonomous": False,
+                "bigReview": False, "onLimit": "failover", "cleanup": "merged"}
+        base.update(fields)
+        (self.checkout / ".workbench/state/implementer.json").write_text(json.dumps(base), encoding="utf-8")
+
+    def saved(self) -> dict:
+        return json.loads((self.checkout / ".workbench/state/implementer.json").read_text(encoding="utf-8-sig"))
+
+    def live_pane(self):
+        (self.checkout / ".workbench/state/agents.json").write_text(
+            json.dumps({"agents": {"codex": {"pane": "pane-1", "tool": "codex"}}}), encoding="utf-8")
+
+    def resolve(self, arguments: str = "") -> subprocess.CompletedProcess:
+        return ps(". ./lib/Workbench.ps1; $r = Resolve-Implementer -Checkout " + ps_quote(self.checkout) +
+                  " -Config (Get-WorkbenchConfig) -NoProbe " + arguments +
+                  "; ConvertTo-Json -Compress -InputObject @{ Tool = $r.Tool; Model = $r.Model; RosterId = $r.RosterId; Conflict = $r.Conflict }",
+                  env=self.env)
+
+    def resolved(self, arguments: str = "") -> dict:
+        result = self.resolve(arguments)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_a_requested_model_is_resolved_with_its_roster_id(self):
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId claude-opus")
+        self.assertEqual(("claude", "claude-opus-5-5", "claude-opus", None), (got["Tool"], got["Model"], got["RosterId"], got["Conflict"]))
+        self.assertEqual((None, None), tuple(self.resolved("-Requested claude").get(k) for k in ("Model", "RosterId")))
+
+    def test_the_saved_model_survives_a_relaunch_and_a_same_tool_request(self):
+        self.record(tool="claude", model="claude-sonnet-5-5", rosterId="claude-sonnet")
+        for arguments in ("", "-Requested claude", "-Requested claude -RequestedModel claude-sonnet-5-5"):
+            with self.subTest(arguments=arguments):
+                got = self.resolved(arguments)
+                self.assertEqual(("claude", "claude-sonnet-5-5", "claude-sonnet", None), (got["Tool"], got["Model"], got["RosterId"], got["Conflict"]))
+
+    def test_switching_the_tool_drops_the_model_that_belonged_to_the_other_tool(self):
+        self.record(tool="claude", model="claude-sonnet-5-5", rosterId="claude-sonnet")
+        got = self.resolved("-Requested kimi")
+        self.assertEqual(("kimi", None, None), (got["Tool"], got["Model"], got["RosterId"]))
+        got = self.resolved("-Requested codex -RequestedModel gpt-6-luna -RequestedRosterId codex-luna")
+        self.assertEqual(("codex", "gpt-6-luna", "codex-luna"), (got["Tool"], got["Model"], got["RosterId"]))
+
+    def test_a_different_model_is_refused_while_the_pane_holds_an_agent_like_a_tool_switch(self):
+        self.record(tool="claude", model="claude-sonnet-5-5")
+        self.live_pane()
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5")
+        self.assertIn("claude-sonnet-5-5", got["Conflict"])
+        self.assertIn("claude-opus-5-5", got["Conflict"])
+        self.assertEqual("claude-sonnet-5-5", got["Model"])
+        same = self.resolved("-Requested claude -RequestedModel claude-sonnet-5-5")
+        self.assertIsNone(same["Conflict"])
+        self.assertIn("runs claude", self.resolved("-Requested codex")["Conflict"])
+
+    def test_a_different_model_is_taken_when_no_agent_holds_the_pane(self):
+        self.record(tool="claude", model="claude-sonnet-5-5")
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId claude-opus")
+        self.assertEqual((None, "claude-opus-5-5", "claude-opus"), (got["Conflict"], got["Model"], got["RosterId"]))
+
+    def test_astra_is_refused_as_a_request_and_as_a_saved_model(self):
+        refused = self.resolve("-Requested codex -RequestedModel gpt-6-astra")
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("astra", refused.stdout + refused.stderr)
+        self.record(tool="codex", model="gpt-6-Astra")
+        saved = self.resolve()
+        self.assertNotEqual(0, saved.returncode)
+        self.assertIn("implementer.json", saved.stdout + saved.stderr)
+        self.assertIn("astra", saved.stdout + saved.stderr)
+
+    def save(self, tool, model=None, roster_id=None) -> subprocess.CompletedProcess:
+        return ps(". ./lib/Workbench.ps1; Save-Implementer " + ps_quote(self.checkout) +
+                  " @{ Tool = " + ps_quote(tool) + "; Model = " + (ps_quote(model) if model else "$null") +
+                  "; RosterId = " + (ps_quote(roster_id) if roster_id else "$null") +
+                  "; RevmuxProfile = 'comprehensive'; AutoMerge = $false; Autonomous = $false; BigReview = $false;"
+                  " OnLimit = 'failover'; Cleanup = 'merged' }", env=self.env)
+
+    def test_the_model_is_saved_beside_the_tool_and_a_model_only_change_is_written(self):
+        first = self.save("codex")
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.assertNotIn("model", self.saved())
+        self.assertNotIn("rosterId", self.saved())
+        self.save("codex", "gpt-6.1-sol", "codex-sol")
+        self.assertEqual(("codex", "gpt-6.1-sol", "codex-sol"), tuple(self.saved()[k] for k in ("tool", "model", "rosterId")))
+        path = self.checkout / ".workbench/state/implementer.json"
+        mtime = path.stat().st_mtime_ns
+        self.save("codex", "gpt-6.1-sol", "codex-sol")
+        self.assertEqual(mtime, path.stat().st_mtime_ns)          # idempotent
+        self.save("codex", "gpt-6-luna", "codex-luna")
+        self.assertEqual("gpt-6-luna", self.saved()["model"])
+        self.save("codex")
+        self.assertNotIn("model", self.saved())
+
+    # --- the panes -------------------------------------------------------------------------------------
+
+    def codex_line(self, config=None) -> subprocess.CompletedProcess:
+        if config is not None:
+            self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding="utf-8")
+        return ps("& ./lib/pane-codex.ps1 -Checkout " + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly", env=self.env)
+
+    def test_codex_pane_passes_m_after_codexargs_so_it_wins(self):
+        self.record(tool="codex", model="gpt-6.1-sol")
+        line = self.codex_line({"codexArgs": ["-m", "gpt-6-luna"]}).stdout
+        self.assertRegex(line, r"-m gpt-6-luna -m gpt-6\.1-sol You are CODEX")
+        self.assertIn("--sandbox workspace-write --ask-for-approval never", line)
+
+    def test_codex_pane_without_a_model_or_with_another_tools_model_passes_none(self):
+        self.record(tool="codex")
+        self.assertNotRegex(self.codex_line().stdout, r" -m ")
+        self.record(tool="claude", model="claude-opus-5-5")
+        self.assertNotIn("claude-opus-5-5", self.codex_line().stdout)
+
+    def test_codex_pane_still_refuses_sandbox_flags_and_a_saved_astra(self):
+        self.record(tool="codex", model="gpt-6.1-sol")
+        refused = self.codex_line({"codexArgs": ["--sandbox", "danger-full-access"]})
+        self.assertNotEqual(0, refused.returncode)
+        self.assertNotIn("would run:", refused.stdout)
+        self.config_path.write_text(json.dumps({"checkoutRoot": str(self.temp)}), encoding="utf-8")
+        self.record(tool="codex", model="gpt-6-astra")
+        astra = self.codex_line()
+        self.assertNotEqual(0, astra.returncode)
+        self.assertNotIn("would run:", astra.stdout)
+        self.assertIn("astra", astra.stdout + astra.stderr)
+
+    def claude_line(self, config=None) -> subprocess.CompletedProcess:
+        if config is not None:
+            self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding="utf-8")
+        (self.checkout / ".workbench/state/implementer-claude.json").write_text(json.dumps(
+            dict(pane=RIGHT_ID, sessionId=OTHER_ID, cwd=str(self.checkout), origin="fresh",
+                 reservedAt="2026-09-23T00:00:00Z", issue="o/repo#7", checkout=str(self.checkout))), encoding="utf-8")
+        return ps("& ./lib/pane-implementer-claude.ps1 -Checkout " + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly",
+                  env=self.env)
+
+    def test_claude_pane_model_flag_is_last_and_the_saved_model_beats_claude_implementer_model(self):
+        self.record(tool="claude", model="claude-opus-5-5")
+        out = self.claude_line({"claudeArgs": ["--model", "claude-haiku-4-5"], "claudeImplementerModel": "claude-sonnet-5-5"})
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        line = next(row for row in out.stdout.splitlines() if row.startswith("would run: claude"))
+        self.assertEqual(["claude-haiku-4-5", "claude-opus-5-5"], re.findall(r"'--model' '([^']+)'", line))
+        self.assertNotIn("claude-sonnet-5-5", line)
+
+    def test_claude_pane_falls_back_to_claude_implementer_model_without_a_saved_one(self):
+        self.record(tool="claude")
+        line = self.claude_line({"claudeImplementerModel": "claude-sonnet-5-5"}).stdout
+        self.assertEqual(["claude-sonnet-5-5"], re.findall(r"'--model' '([^']+)'", line))
+        self.record(tool="codex", model="gpt-6.1-sol")
+        line = self.claude_line({}).stdout
+        self.assertNotIn("--model", line)
+
+    def kimi_line(self, config=None) -> subprocess.CompletedProcess:
+        stub = self.temp / "kimi"
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        settings = dict(config or {}, checkoutRoot=str(self.temp), kimiPath=str(stub))
+        self.config_path.write_text(json.dumps(settings), encoding="utf-8")
+        return ps("& ./lib/pane-implementer-kimi.ps1 -Checkout " + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly",
+                  env=dict(self.env, KIMI_CODE_HOME=str(self.temp / "kimi-home")))
+
+    def test_kimi_pane_passes_m_when_a_model_is_saved_and_nothing_otherwise(self):
+        subprocess.run(["git", "-C", str(self.checkout), "init", "-q"], check=True, capture_output=True)
+        self.record(tool="kimi", model="kimi-k2")
+        with_model = self.kimi_line({"kimiArgs": ["-m", "kimi-k1"]})
+        if with_model.returncode != 0:
+            self.skipTest("the Kimi pane cannot be composed here: " + with_model.stdout + with_model.stderr)
+        self.assertRegex(with_model.stdout, r"'-m' 'kimi-k1' '-m' 'kimi-k2'\s*$")
+        self.record(tool="kimi")
+        self.assertNotRegex(self.kimi_line().stdout, r"'-m'")
+        self.record(tool="claude", model="claude-opus-5-5")
+        self.assertNotIn("claude-opus-5-5", self.kimi_line().stdout)
+
+    # --- the entry script ------------------------------------------------------------------------------
+
+    def entry(self, *arguments) -> subprocess.CompletedProcess:
+        return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), *arguments],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=30)
+
+    def test_entry_refuses_an_astra_a_malformed_and_a_queue_model(self):
+        for model, message in (("gpt-6-astra", "astra"), ("GPT-6-ASTRA", "astra"), ("not a model", "model name")):
+            with self.subTest(model=model):
+                result = self.entry("o/repo#7", "-ImplementerModel", model)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIn("-ImplementerModel", result.stdout)
+                self.assertIn(message, result.stdout)
+        queue = self.entry("-Queue", "o/repo#7", "-ImplementerModel", "claude-opus-5-5")
+        self.assertEqual(2, queue.returncode, queue.stdout + queue.stderr)
+        self.assertIn("-ImplementerModel belongs to one launch", queue.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
