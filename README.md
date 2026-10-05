@@ -50,6 +50,8 @@ github-workbench https://github.com/owner/repo/issues/42
 github-workbench owner/repo#42 -DryRun                      # show the plan, touch nothing
 github-workbench owner/repo#42 -NewSession                  # separate session, or resume its existing workbench
 github-workbench -Version                                  # installed toolchain, one line per tool
+github-workbench owner/repo#42 -Implementer auto            # the router picks the implementer's tool and model
+github-workbench owner/repo#42 -Implementer claude -ImplementerModel claude-opus-5-5   # one model for this checkout
 ```
 
 Inside agwinterm (or agliteterm), the launcher adopts its current session: it keeps the caller as
@@ -729,6 +731,69 @@ window without activating it and waits for a usable pane before starting agents.
 If an orphaned launcher still holds its member or checkout lock after 30 minutes, that member
 fails instead; stop the stuck launcher and use `-Retry`.
 
+### The implementer router: an expert picks the tool and model per issue (#109)
+
+Easy issues on an expensive implementer waste budget, and hard ones on a weak one waste review
+rounds. With a **roster** in the config, the router chooses, per issue, which entry (a tool and a
+model) implements it:
+
+```json
+{"implementerRoster": [
+   {"id": "claude-sonnet", "tool": "claude", "model": "claude-sonnet-5-5", "note": "default for most code"},
+   {"id": "claude-opus",   "tool": "claude", "model": "claude-opus-5-5",   "note": "hardest design/cross-cutting work"},
+   {"id": "kimi",          "tool": "kimi",                                  "note": "cheapest in Claude tokens; well-scoped issues"},
+   {"id": "codex-sol",     "tool": "codex",  "model": "gpt-6.1-sol",       "note": "workhorse"},
+   {"id": "codex-luna",    "tool": "codex",  "model": "gpt-6-luna",        "note": "small, mechanical, docs/tests-only changes"}],
+ "route": {"model": "claude-haiku-4-5-20251001"}}
+```
+
+That is also the default roster, so nothing has to be configured. An entry is `{id, tool, model?, note}`:
+`id` is unique and `[a-z0-9-]`, `tool` is `codex`, `claude` or `kimi`, `model` (optional) a model name, `note` a
+sentence (at most 200 characters) the router reads. Unknown keys, an empty roster and **any model naming
+`gpt-6-astra`** are refused, in `implementerRoster`, `-ImplementerModel`, a saved model, `claudeImplementerModel`
+and a `-m` / `--model` / `-c model=` in `claudeArgs`, `codexArgs` or `kimiArgs`.
+
+**Choosing.** `github-workbench <issue> -Implementer auto`, or `-Implementer auto` on a queue (saved with the
+queue), runs `lib/route.py` once per issue: a `claude -p` judgment on `route.model` (cheap by default, JSON
+only, shaped like triage's). It reads the issue (title, body, labels, priority, follow-up lineage), asks
+itself for a size and risk estimate (files and areas named, crates reached, UI or core, platform-specific,
+whether anything can check the result), and sees the **past outcomes** of comparable issues per roster
+entry (see `route-stats`). It answers `{"implementer": "<roster id>", "reason": "...", "rule": "..."}`, which is
+validated: an unknown id is an error, and a failure refuses the launch (a queue defers the member) instead of
+launching on a silent default. `wb.py route-issue <N> --repo owner/name` runs the judgment alone and prints it.
+
+The rules the router does not leave to the model:
+- **Kimi** (rules `narrow-fix`, `leftovers-one-area`, `harness-two-crates`, `ui-single-view`, and the
+  exclusions of #77 and #82, are in `claude/commands/route-issue.md`) is offered only for an issue carrying
+  triage's `kimi` label that is not P0 or P1. A Kimi answer for any other issue is replaced by the first
+  offered non-Kimi entry, rule `kimi-guard`.
+- A tool with a recorded usage limit has no entry in what the router is offered (and an answer naming one is
+  an error). With Claude limited, or every entry on a limited tool, a queue pauses as usual.
+- **The owner decides.** The choice is written on the issue as the label `impl:<roster id>`, and remembered in
+  `~/.agworkbench/route-labels.jsonl` so the router's own label can be told from one you wrote. Change that label
+  before the launch and it wins: the router is not called. The router's own label is kept (no model call) while its
+  entry would still be offered: its tool free of a limit, Kimi only for an eligible issue, the roster still having
+  it. Otherwise it is stale: the router chooses again and replaces it. A label naming no roster entry is ignored with a
+  warning; two `impl:` labels that name roster entries, or one naming a limited tool, refuse the launch.
+
+A queue routes each member once, before its launch, and records the answer on the member (`route`): a restart
+or a retry does not route again, unless the routed tool has hit a limit since (a queue started with `-WaitOnLimit`
+waits limits out instead, as with a concrete tool: it routes around nothing). A checkout routed before keeps
+its entry, unless its tool has a recorded usage limit. `-DryRun` calls no model and labels nothing.
+
+**The model.** `-ImplementerModel <model>` (a single launch) saves the model in `.workbench/state/implementer.json`
+next to the tool, so restarts, resumes and failovers keep it. The Claude pane passes `--model <model>` last,
+which beats `claudeImplementerModel`; the Codex pane passes `-m <model>` after `codexArgs` (a model flag, not
+sandbox policy: the sandbox refusals are unchanged); the Kimi pane passes `-m <model>` when there is one. Switching
+the tool drops the saved model; changing only the model is refused, like a tool change, while the right pane
+holds a running agent.
+
+**`wb.py route-stats`** prints, per roster id, merged and not merged loops, mean review rounds, Majors found, mean
+wall time and the Claude tokens (output and cache reads, summed from `~/.claude/projects/<checkout>/*.jsonl`: the
+planner's and a Claude implementer's together). A loop's record is appended to `~/.agworkbench/route-outcomes.jsonl`
+when the conductor sees its member merged or closed, and by cleanup before it deletes a checkout, once per issue; the
+file is also what the router reads. A loop that ended before this existed is simply not in it.
+
 ### Usage limits: automatic failover
 
 When an agent hits its usage limit, **the loop now fails over by default**. The relay reads both
@@ -741,9 +806,12 @@ implementer, the planner runs `github-workbench <issue> -Failover`, which:
   has not changed for 90 s, there is no `.git/index.lock`, and exactly one agent process belongs to
   this checkout. It stops that process tree and never types into the agent;
 - records the limit in the checkout's settings, clears the pane, and starts another tool there
-  through the `-Implementer` switch: the first tool in `failoverOrder` (default claude, codex,
-  kimi) that is not the limited one, has no recorded limit and, for Kimi, passes its launch checks.
-  The default keeps Codex and Claude switching to each other, as before;
+  through the `-Implementer` switch: the first element of `failoverOrder` (default claude, codex,
+  kimi; a tool name, or a roster id, #109) whose tool is not the limited one, has no recorded limit and,
+  for Kimi, passes its launch checks. A roster id switches to that entry and saves its model; a tool name that is no
+  roster id switches to the bare tool, with no model pinned (so `claudeImplementerModel` and each tool's own
+  default keep applying, as before the roster). A limited claude-sonnet never fails over to claude-opus, since
+  limits are per tool. The default keeps Codex and Claude switching to each other, as before;
 - lets the planner hand the work over by mail (`wb.py handover` computes the open request).
 
 A tool with a recorded limit is never switched back to automatically. Once its limit has reset,
@@ -1015,12 +1083,14 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `codexArgs` | `[]` | extra arguments for `codex`; anything touching the sandbox policy is refused |
 | `checkoutRoot` | `~/source/workbench` | where per-issue clones go |
 | `allowNetwork` | `false` | let Codex's sandbox reach the network (package installs, tests that fetch); with a Claude implementer, allows its web tools; with Kimi, drops the launcher's check that Kimi's own `[tools] disabled` turns its web tools off |
-| `implementer` | `"codex"` | who runs the right pane (`"codex"`, `"claude"` or `"kimi"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members |
+| `implementer` | `"codex"` | who runs the right pane (`"codex"`, `"claude"` or `"kimi"`) in a new checkout; an existing checkout keeps its saved tool. `-Implementer` changes it for that checkout (refused while a live agent holds the pane) or sets it for a queue's members; `-Implementer auto` lets the router choose per issue (see The implementer router), and `-ImplementerModel <model>` sets the model of one launch |
+| `implementerRoster` | the five entries of the router section | the entries the router chooses from: `[{"id", "tool", "model"?, "note"}]`; ids unique, a model naming `gpt-6-astra` refused |
+| `route` | `{"model": "claude-haiku-4-5-20251001"}` | the router's judgment: the model `claude -p` runs on |
 | `revmuxProfile` | by implementer | revmux profile for review rounds: `comprehensive` with Codex, `claude-only` with Claude, `kimi-mixed` with Kimi when revmux has it (else `claude-only`) |
 | `failover` | `true` | when the implementer hits its usage limit, the planner stops it (only when idle at the limit) and switches to the next tool in `failoverOrder`; `false` only reports |
-| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools a failover (and a queue with a limited tool) tries, in order: the first that is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools |
+| `failoverOrder` | `["claude", "codex", "kimi"]` | the tools or roster ids a failover (and a queue with a limited tool) tries, in order: the first whose tool is not the limited one and has no recorded limit; `-Failover` also skips a Kimi that fails its launch checks, while a queue routes by limits only and lets the member's launch check Kimi (a refusal defers the member). At least two distinct tools (a roster id counts as its entry's tool). A roster id carries its model into the switch; a bare tool name pins none |
 | `kimiPath` | none | `kimi.exe` for the Kimi implementer; without it, `PATH`, then `%USERPROFILE%\.kimi-code\bin\kimi.exe` |
-| `claudeImplementerModel` | `null` | the Claude implementer's model only (`--model`), e.g. `"claude-sonnet-5-5"` to spend less on implementing; the planner keeps whatever `claudeArgs` gives it |
+| `claudeImplementerModel` | `null` | the Claude implementer's model only (`--model`), e.g. `"claude-sonnet-5-5"` to spend less on implementing; the planner keeps whatever `claudeArgs` gives it. A model saved for the checkout (`-ImplementerModel`, the router's pick, or a failover to a roster id) wins over it |
 | `kimiApproval` | `"ask"` | the Kimi implementer's approval mode: `ask` runs `kimi --yolo` (it stops for commands it rates dangerous and waits for a human); `never` runs `kimi --auto` (no stops, as the Claude agents under `--dangerously-skip-permissions`; the push, `gh` and web guards stay) |
 | `kimiArgs` | `[]` | extra arguments for `kimi` (e.g. `["-m", "<model alias>"]`); approval-mode, session, agent and directory flags are refused in every spelling |
 | `bugLabel` | `"bug"` | the label `-Queue bugs` stands for (non-empty, no comma) |
@@ -1056,6 +1126,7 @@ lib/limits.py               recognises an agent's own usage-limit message in a p
 lib/closer.py               the autonomous close after a merge, shared by the relay and the conductor (#27, #33)
 lib/cleanup.py              deletes finished checkouts: after an autonomous close, and -Cleanup (#41)
 lib/triage.py               priority labels for a product repo's issues, from its private spec repos (#34)
+lib/roster.py, lib/route.py the implementer roster and the router: route-issue, route-stats (#109)
 lib/labelquery.py           the boolean label query behind -Queue 'where: ...' (#38)
 lib/helper_done.py          a helper session's completion marker (#33)
 lib/run_helper.py           a long command (the suite, a build) in its own session: UTF-8 log, marker, mail (#45)
@@ -1067,6 +1138,7 @@ lib/agmsg.py, hub.py,       the mailbox and the fail-closed pane messenger, vend
 claude/commands/start-github-issue.md      the loop, from Claude's side
 claude/commands/workbench-implementer.md   the loop, from the implementer's side when it is Claude
 claude/commands/triage-issue.md            one issue's priority judgment; triage.py runs it headless
+claude/commands/route-issue.md             one issue's implementer (roster id) judgment; route.py runs it headless
 codex/skills/workbench-implementer/        the loop, from Codex's side
 tests/                      python -m unittest discover -s tests   (no terminal needed)
 ```

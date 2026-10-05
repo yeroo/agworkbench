@@ -76,6 +76,12 @@ for ($i = 0; $i -lt $extra.Count; $i++) {
     if ($setting -and $setting -match $policyKey) { throw "codexArgs: the setting '$setting' decides sandbox policy" }
 }
 
+# The checkout's model (-ImplementerModel or the router's pick, #109; saved in implementer.json): -m is a model
+# flag, not policy. Placed after codexArgs, so it wins over a -m there.
+$modelArgs = @()
+$implementerModel = Get-SavedImplementerModel $Checkout 'codex'
+if ($implementerModel) { $modelArgs = @('-m', $implementerModel) }
+
 $prompt = @"
 You are CODEX, the IMPLEMENTER, in the RIGHT pane of an agworkbench session for GitHub issue $Issue.
 Claude Code is in the left pane: it plans with you, reviews your work, and handles GitHub.
@@ -100,7 +106,7 @@ for the next "Chat from Workbench:" line from the relay.
 }
 
 if ($WhatIfOnly) {
-    Write-Host ("would run: codex " + (($inject + $resumeArgs + $policy + $extra + @($prompt)) -join ' '))
+    Write-Host ("would run: codex " + (($inject + $resumeArgs + $policy + $extra + $modelArgs + @($prompt)) -join ' '))
     return
 }
 
@@ -109,4 +115,4 @@ $env:AI_HUB = $hubDir
 $env:AI_BOX = 'codex'
 Set-Location -LiteralPath $Checkout
 Write-Host "agworkbench: Codex for $Issue - sandbox workspace-write, network $network, root $Checkout" -ForegroundColor DarkGray
-& codex @inject @resumeArgs @policy @extra $prompt
+& codex @inject @resumeArgs @policy @extra @modelArgs $prompt

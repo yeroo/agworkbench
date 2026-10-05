@@ -38,6 +38,7 @@ from typing import Callable
 import agw
 import closer
 import conductor
+import route
 import triage
 
 HERE = Path(__file__).resolve().parent
@@ -337,8 +338,10 @@ def lock_path(root: Path, checkout: Path) -> Path:
 
 
 def clean(checkout: Path, *, repo: str, issue: int | str, root: Path, mode: str, tree, pr_head: str | None,
-          pause: Callable[[float], None] = time.sleep) -> tuple[bool, list[str], int]:
-    """Check and delete one checkout under its own lock: (deleted, reasons kept, bytes freed)."""
+          pause: Callable[[float], None] = time.sleep, outcome: str | None = None,
+          pr: int | None = None) -> tuple[bool, list[str], int]:
+    """Check and delete one checkout under its own lock: (deleted, reasons kept, bytes freed). `outcome` is
+    'merged' or 'closed' when the caller knows it (the router's statistics, #109); None records nothing."""
     lock = conductor.Lock(lock_path(root, checkout), 0)
     try:
         lock.acquire()
@@ -352,6 +355,10 @@ def clean(checkout: Path, *, repo: str, issue: int | str, root: Path, mode: str,
             log(root, checkout, 'kept: ' + '; '.join(reasons))
             return False, reasons, 0
         log(root, checkout, f'deleting ({mode})')
+        # The router's stats (#109) need what only this checkout still has (review rounds, the launch log); a
+        # build-only cleanup keeps the checkout, which the conductor's or the next cleanup's record covers.
+        if mode == 'merged' and outcome:
+            route.record_outcome(checkout, outcome, pr=pr)
         try:
             freed = remove(checkout, mode, pause=pause)
         except CleanupError as err:
@@ -469,14 +476,16 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int | None, mode: str
             return 1
         pause(AFTER_CLOSE_POLL)
     head = None
+    outcome = 'closed' if pr is None else None          # no PR: the issue was closed; a PR whose state is unknown records nothing
     if pr is not None:
         try:
             head = pr_head_of(repo, pr, gh)
+            outcome = 'merged' if head else 'closed'
         except (OSError, ValueError, subprocess.SubprocessError) as err:
             # Without the PR head only remote-tracking refs vouch for local commits: the safe direction.
             log(root, checkout, f'PR head unknown ({err}); checking against remote-tracking refs only')
     deleted, reasons, _ = clean(checkout, repo=repo, issue=issue, root=root, mode=mode, tree=snapshot,
-                                pr_head=head, pause=pause)
+                                pr_head=head, pause=pause, outcome=outcome, pr=pr)
     if not deleted:
         close_log(checkout, 'kept: ' + '; '.join(reasons))
         return 1
@@ -485,22 +494,23 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int | None, mode: str
 
 # --- sweep -----------------------------------------------------------------------------------
 
-def candidacy(repo: str, number: int, branch: str | None, gh) -> tuple[bool, str, str | None]:
-    """(candidate, why, merged PR head): the branch has no open PR, and either the issue is closed or
+def candidacy(repo: str, number: int, branch: str | None, gh) -> tuple[bool, str, str | None, int | None]:
+    """(candidate, why, merged PR head, merged PR number): the branch has no open PR, and either the issue is closed or
     the branch has a merged or closed PR."""
     issue = gh('issue', 'view', str(number), '--repo', repo, '--json', 'state')
     prs = gh('pr', 'list', '--repo', repo, '--head', branch, '--state', 'all', '--json', 'number,state,headRefOid') if branch else []
     open_prs = [pr['number'] for pr in prs if pr.get('state') == 'OPEN']
     merged = [pr for pr in prs if pr.get('state') == 'MERGED']
     head = merged[0].get('headRefOid') if merged else None
+    merged_number = merged[0].get('number') if merged else None
     if open_prs:
-        return False, f'PR #{open_prs[0]} is open', head
+        return False, f'PR #{open_prs[0]} is open', head, merged_number
     if (issue or {}).get('state') == 'CLOSED':
-        return True, 'issue closed', head
+        return True, 'issue closed', head, merged_number
     done = [pr for pr in prs if pr.get('state') in ('MERGED', 'CLOSED')]
     if done:
-        return True, f"PR #{done[0]['number']} {done[0]['state'].lower()}", head
-    return False, 'issue open and no merged or closed PR', head
+        return True, f"PR #{done[0]['number']} {done[0]['state'].lower()}", head, merged_number
+    return False, 'issue open and no merged or closed PR', head, merged_number
 
 
 def sweep(root: Path, *, repo: str | None = None, dry_run: bool = False, build_only: bool = False, gh=conductor.gh_json,
@@ -552,7 +562,7 @@ def sweep(root: Path, *, repo: str | None = None, dry_run: bool = False, build_o
             continue
         branch = git(path, 'branch', '--show-current').stdout.strip() or None
         try:
-            candidate, why, head = candidacy(found['repo'], found['number'], branch, gh)
+            candidate, why, head, merged_pr = candidacy(found['repo'], found['number'], branch, gh)
         except (OSError, ValueError, subprocess.SubprocessError) as err:
             gh_failed = True
             out(f'skip {path}: GitHub lookup failed: {err}')
@@ -570,7 +580,7 @@ def sweep(root: Path, *, repo: str | None = None, dry_run: bool = False, build_o
                 out(f'candidate {path} {human(size)} ({why})')
             continue
         deleted, reasons, size = clean(path, repo=found['repo'], issue=found['number'], root=root, mode=mode,
-                                       tree=snapshot, pr_head=head)
+                                       tree=snapshot, pr_head=head, outcome='merged' if head else 'closed', pr=merged_pr)
         if deleted:
             freed += size
             out(f"{'cleaned' if build_only else 'deleted'} {path}: freed {human(size)} ({why})")

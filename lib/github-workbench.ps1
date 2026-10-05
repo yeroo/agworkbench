@@ -25,6 +25,8 @@
   github-workbench -Version              # report the installed toolchain
   github-workbench 7 -Implementer claude  # Claude, not Codex, in the right pane (e.g. Codex out of quota)
   github-workbench 7 -Implementer kimi    # Kimi Code in the right pane (#65)
+  github-workbench 7 -Implementer auto    # the router picks the tool and model from implementerRoster (#109)
+  github-workbench 7 -Implementer claude -ImplementerModel claude-opus-5-5   # one model for this checkout (#109)
   github-workbench 7 -AutoMerge           # the planner merges its own PR when every condition holds
   github-workbench 7 -Failover            # the planner, on a usage-limit mail: switch the implementer tool
   github-workbench 7 -Autonomous          # merge, file follow-ups and close the sessions without the human
@@ -74,6 +76,8 @@ param(
     [int] $QueueAttempt,
     [string] $QueueToken,
     [string] $Implementer,
+    [string] $ImplementerModel,
+    [string] $RosterId,
     [string] $QueueName,
     [string] $Workspace,
     [string] $RevmuxProfile,
@@ -181,9 +185,29 @@ if ($Cleanup -or $BuildOnly) {
     exit $LASTEXITCODE
 }
 
-if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude', 'kimi')) {
-    Write-Host "-Implementer must be codex, claude or kimi (got '$Implementer')" -ForegroundColor Yellow
+if ($PSBoundParameters.ContainsKey('Implementer') -and $Implementer -cnotin @('codex', 'claude', 'kimi', 'auto')) {
+    Write-Host "-Implementer must be codex, claude or kimi, or auto for the router (got '$Implementer')" -ForegroundColor Yellow
     exit 2
+}
+if ($Implementer -ceq 'auto' -and ($PSBoundParameters.ContainsKey('ImplementerModel') -or $Failover)) {
+    Write-Host '-Implementer auto lets the router choose the tool and the model: it cannot be combined with -ImplementerModel or -Failover.' -ForegroundColor Yellow
+    exit 2
+}
+if ($PSBoundParameters.ContainsKey('RosterId') -and (-not $QueueMember -or $RosterId -cnotmatch $script:RosterIdPattern)) {
+    Write-Host '-RosterId is the conductor''s: the roster entry a queue member was routed to.' -ForegroundColor Yellow
+    exit 2
+}
+
+if ($PSBoundParameters.ContainsKey('ImplementerModel')) {
+    $modelProblem = Get-ModelProblem $ImplementerModel
+    if ($modelProblem) {
+        Write-Host "-ImplementerModel: $modelProblem" -ForegroundColor Yellow
+        exit 2
+    }
+    if ($Failover -or $PSBoundParameters.ContainsKey('Queue')) {
+        Write-Host '-ImplementerModel belongs to one launch: it cannot be combined with -Failover or -Queue (a queue routes its own models).' -ForegroundColor Yellow
+        exit 2
+    }
 }
 
 if ($PSBoundParameters.ContainsKey('ClearLimit') -and
@@ -330,10 +354,10 @@ if ($PSBoundParameters.ContainsKey('Parallel') -or $Watch -or $Retry -or $Prune 
 }
 
 if (-not $Issue) {
-    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Failover]" -ForegroundColor Yellow
+    Write-Host "usage: github-workbench <issue> [-Repo owner/name] [-DryRun] [-Yes] [-NewSession] [-Implementer codex|claude|kimi|auto [-ImplementerModel <model>]] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Failover]" -ForegroundColor Yellow
     Write-Host "       github-workbench -Version"
     Write-Host "       (<spec> is a list like 3,4,5, label:<name>, bugs = label:<bugLabel>, or where: <label query>)"
-    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
+    Write-Host "       github-workbench -Queue <spec> [-Repo owner/name] [-Parallel 1..8] [-Watch] [-Prune] [-Retry] [-Yes] [-DryRun] [-Implementer codex|claude|kimi|auto] [-ClearLimit codex|claude|kimi] [-AutoMerge|-NoAutoMerge] [-Autonomous|-NoAutonomous] [-BigReview|-NoBigReview] [-WaitOnLimit|-NoWaitOnLimit] [-Triage] [-RevmuxProfile <profile>] [-QueueName <name> [-Workspace <ws>]]"
     Write-Host "       github-workbench -Triage|-Retriage -Repo owner/name [-Limit N] [-DryRun] [-FollowUps] [-KimiOnly] [-Watch]"
     Write-Host "       github-workbench -Cleanup [-Repo owner/name] [-DryRun] [-BuildOnly]"
     Write-Host "  <issue> is 123, owner/repo#123, or https://github.com/owner/repo/issues/123"
@@ -370,7 +394,7 @@ if ($QueueMember) {
         Enable-LaunchLog
         $ok = Invoke-LaunchSafely {
             Invoke-LauncherBody -Issue $Issue -Repo $Repo -Yes:$Yes -NewSession -Implementer $Implementer -AutoMerge $autoMergeChoice `
-                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice -OnLimit $onLimitChoice
+                -Autonomous $autonomousChoice -RevmuxProfile $RevmuxProfile -BigReview $bigReviewChoice -OnLimit $onLimitChoice -ImplementerModel $ImplementerModel -RosterId $RosterId
         }
         $outcome = 'ok'
         if (-not $ok) { $outcome = 'failed' }
@@ -429,7 +453,7 @@ if ($DryRun) { Disable-LaunchLog } else { Enable-LaunchLog }
 if (-not (Invoke-LaunchSafely {
     Invoke-LauncherBody -Issue $Issue -Repo $Repo -DryRun:$DryRun -Yes:$Yes -NoRelay:$NoRelay -NewSession:$NewSession `
         -Implementer $Implementer -AutoMerge $autoMergeChoice -Failover:$Failover -Autonomous $autonomousChoice `
-        -BigReview $bigReviewChoice -OnLimit $onLimitChoice
+        -BigReview $bigReviewChoice -OnLimit $onLimitChoice -ImplementerModel $ImplementerModel -RosterId $RosterId
 })) { exit $script:Launch.ExitCode }
 if ($script:Launch.ClaudeHerePending -and -not $DryRun) {
     Invoke-ClaudeHere -Checkout $script:Launch.Checkout -Issue $script:Launch.IssueRef

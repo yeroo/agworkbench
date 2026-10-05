@@ -47,8 +47,11 @@ foreach ($argument in $claudeArgs) {
     }
 }
 # "claudeImplementerModel": the implementer alone on another model (the planner keeps claudeArgs').
-# Last on the line, so it wins over a --model in claudeArgs.
-if ($config.claudeImplementerModel) { $claudeArgs += @('--model', [string]$config.claudeImplementerModel) }
+# Last on the line, so it wins over a --model in claudeArgs. The checkout's own model (-ImplementerModel, or
+# the router's pick, #109; saved in implementer.json) wins over claudeImplementerModel.
+$implementerModel = Get-SavedImplementerModel $Checkout 'claude'
+if (-not $implementerModel) { $implementerModel = $config.claudeImplementerModel }
+if ($implementerModel) { $claudeArgs += @('--model', [string]$implementerModel) }
 
 # Claude Code on Windows runs commands through two tools, Bash and PowerShell; each is denied by name.
 $denied = @('Bash(git push:*)', 'Bash(gh:*)', 'PowerShell(git push:*)', 'PowerShell(gh:*)')

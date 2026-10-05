@@ -86,7 +86,11 @@ if ($Resume) {
 }
 $approval = '--yolo'
 if ($config.kimiApproval -eq 'never') { $approval = '--auto' }
-$kimiArgs = @($approval) + $modeArgs + $extra
+# The checkout's model (-ImplementerModel or the router's pick, #109; saved in implementer.json), after kimiArgs so it wins.
+$modelArgs = @()
+$implementerModel = Get-SavedImplementerModel $Checkout 'kimi'
+if ($implementerModel) { $modelArgs = @('-m', $implementerModel) }
+$kimiArgs = @($approval) + $modeArgs + $extra + $modelArgs
 
 $shimDir = [string]$prepared.shimDir
 $environment = [ordered]@{ AGWORKBENCH = $script:Root; AI_HUB = (Join-Path $Checkout '.workbench'); AI_BOX = 'codex' }

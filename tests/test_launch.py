@@ -4437,5 +4437,564 @@ class AutonomyLaunch(LauncherFixtures):
         self.assertFalse((self.checkout / '.workbench').exists())
 
 
+ROSTER_CASES = json.loads((ROOT / "tests/fixtures/roster-cases.json").read_text(encoding="utf-8"))
+
+
+def pwsh_json(script: str, env: dict | None = None):
+    result = ps(script, env=env)
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+    return json.loads(result.stdout)
+
+
+class RosterConfig(unittest.TestCase):
+    """#109: implementerRoster and failoverOrder validation. tests/fixtures/roster-cases.json is also what
+    test_roster.py feeds lib/roster.py, so the two implementations cannot drift apart."""
+
+    def judged(self, key: str) -> list:
+        script = ("$cases = Get-Content -Raw -LiteralPath tests/fixtures/roster-cases.json | ConvertFrom-Json; "
+                  ". ./lib/Workbench.ps1; $out = @(); ")
+        if key == "roster":
+            script += ("foreach ($c in $cases.roster) { $out += [pscustomobject]@{ name = $c.name; "
+                       "problem = (Get-RosterProblem $c.roster) } }; ")
+        else:
+            script += ("foreach ($c in $cases.failoverOrder) { $roster = $c.roster; "
+                       "if ($null -eq $roster) { $roster = Get-DefaultImplementerRoster }; "
+                       "$out += [pscustomobject]@{ name = $c.name; problem = (Get-FailoverOrderProblem $c.order $roster) } }; ")
+        script += "ConvertTo-Json -InputObject $out -Compress"
+        return pwsh_json(script)
+
+    def test_every_roster_case_of_the_shared_fixture(self):
+        judged = {row["name"]: row["problem"] for row in self.judged("roster")}
+        self.assertEqual(len(ROSTER_CASES["roster"]), len(judged))
+        for case in ROSTER_CASES["roster"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(case["ok"], judged[case["name"]] is None, judged[case["name"]])
+
+    def test_every_failover_order_case_of_the_shared_fixture(self):
+        judged = {row["name"]: row["problem"] for row in self.judged("failoverOrder")}
+        self.assertEqual(len(ROSTER_CASES["failoverOrder"]), len(judged))
+        for case in ROSTER_CASES["failoverOrder"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(case["ok"], judged[case["name"]] is None, judged[case["name"]])
+
+    def test_the_config_loads_the_roster_and_refuses_a_bad_one(self):
+        default = pwsh_json(". ./lib/Workbench.ps1; $c = Get-WorkbenchConfig; "
+                            "ConvertTo-Json -InputObject @($c.implementerRoster | ForEach-Object { $_.id }) -Compress",
+                            env=dict(os.environ, AGWORKBENCH_CONFIG=str(ROOT / "no-such-config.json")))
+        self.assertEqual(["claude-sonnet", "claude-opus", "kimi", "codex-sol", "codex-luna"], default)
+        good = ps(". ./lib/Workbench.ps1; (Get-WorkbenchConfig).implementerRoster.Count",
+                  {"implementerRoster": [{"id": "only", "tool": "kimi", "note": "x"}], "failoverOrder": ["only", "codex"]})
+        self.assertEqual("1", good.stdout.strip(), good.stderr)
+        for key, value in (("implementerRoster", [{"id": "a", "tool": "codex", "model": "gpt-6-astra", "note": "x"}]),
+                           ("implementerRoster", []), ("failoverOrder", ["claude", "nobody"]),
+                           ("claudeImplementerModel", "gpt-6-ASTRA")):
+            with self.subTest(key=key, value=value):
+                bad = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {key: value})
+                self.assertNotEqual(0, bad.returncode)
+                self.assertIn(key, bad.stdout + bad.stderr)
+
+    def test_the_route_section_is_validated_like_lib_route(self):
+        for value, ok in (({"model": "claude-haiku-4-5-20251001"}, True), ({}, True), ({"model": "gpt-6-astra"}, False),
+                          ({"model": 5}, False), ({"model": "a b"}, False), ({"other": 1}, False), ("haiku", False)):
+            with self.subTest(value=value):
+                result = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {"route": value})
+                self.assertEqual(ok, result.returncode == 0, result.stdout + result.stderr)
+
+    def test_astra_is_refused_in_every_agent_argument_spelling(self):
+        for key, args in (("codexArgs", ["-m", "gpt-6-astra"]), ("codexArgs", ["-mgpt-6-ASTRA"]),
+                          ("codexArgs", ["--model=gpt-6-astra"]), ("codexArgs", ["-c", "model=gpt-6-astra"]),
+                          ("codexArgs", ["--config", " model = gpt-6-astra"]), ("claudeArgs", ["--model", "astra"]),
+                          ("kimiArgs", ["-m", "gpt-6-astra"]), ("kimiArgs", ["--model", "GPT-6-ASTRA"])):
+            with self.subTest(key=key, args=args):
+                bad = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {key: args})
+                self.assertNotEqual(0, bad.returncode)
+                self.assertIn("astra", bad.stdout + bad.stderr)
+        for key, args in (("codexArgs", ["-m", "gpt-6-luna"]), ("codexArgs", ["--search"]), ("claudeArgs", ["--model", "claude-opus-5-5"])):
+            with self.subTest(key=key, args=args, ok=True):
+                good = ps(". ./lib/Workbench.ps1; Get-WorkbenchConfig | Out-Null", {key: args})
+                self.assertEqual(0, good.returncode, good.stdout + good.stderr)
+
+
+class ImplementerCheckout(unittest.TestCase):
+    """A bare checkout with an implementer.json to read and write, and a config for pwsh to load (#109)."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="implementer-model-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.checkout = self.temp / "repo-issue-7"
+        (self.checkout / ".workbench/state").mkdir(parents=True)
+        self.config_path = self.temp / "config.json"
+        self.config_path.write_text(json.dumps({"checkoutRoot": str(self.temp)}), encoding="utf-8")
+        self.env = dict(os.environ, AGWORKBENCH_CONFIG=str(self.config_path), PYTHONIOENCODING="utf-8")
+
+    def record(self, **fields):
+        base = {"tool": "codex", "revmuxProfile": "comprehensive", "autoMerge": False, "autonomous": False,
+                "bigReview": False, "onLimit": "failover", "cleanup": "merged"}
+        base.update(fields)
+        (self.checkout / ".workbench/state/implementer.json").write_text(json.dumps(base), encoding="utf-8")
+
+    def saved(self) -> dict:
+        return json.loads((self.checkout / ".workbench/state/implementer.json").read_text(encoding="utf-8-sig"))
+
+    def live_pane(self):
+        (self.checkout / ".workbench/state/agents.json").write_text(
+            json.dumps({"agents": {"codex": {"pane": "pane-1", "tool": "codex"}}}), encoding="utf-8")
+
+    def resolve(self, arguments: str = "") -> subprocess.CompletedProcess:
+        return ps(". ./lib/Workbench.ps1; $r = Resolve-Implementer -Checkout " + ps_quote(self.checkout) +
+                  " -Config (Get-WorkbenchConfig) -NoProbe " + arguments +
+                  "; ConvertTo-Json -Compress -InputObject @{ Tool = $r.Tool; Model = $r.Model; RosterId = $r.RosterId; Conflict = $r.Conflict }",
+                  env=self.env)
+
+    def resolved(self, arguments: str = "") -> dict:
+        result = self.resolve(arguments)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+
+
+class ImplementerModelState(ImplementerCheckout):
+    """#109: -ImplementerModel in Resolve-Implementer, Save-Implementer and implementer.json; the panes'
+    flags (their -WhatIfOnly lines) come from that record."""
+
+    def test_a_requested_model_is_resolved_with_its_roster_id(self):
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId claude-opus")
+        self.assertEqual(("claude", "claude-opus-5-5", "claude-opus", None), (got["Tool"], got["Model"], got["RosterId"], got["Conflict"]))
+        self.assertEqual((None, None), tuple(self.resolved("-Requested claude").get(k) for k in ("Model", "RosterId")))
+
+    def test_the_saved_model_survives_a_relaunch_and_a_same_tool_request(self):
+        self.record(tool="claude", model="claude-sonnet-5-5", rosterId="claude-sonnet")
+        for arguments in ("", "-Requested claude", "-Requested claude -RequestedModel claude-sonnet-5-5"):
+            with self.subTest(arguments=arguments):
+                got = self.resolved(arguments)
+                self.assertEqual(("claude", "claude-sonnet-5-5", "claude-sonnet", None), (got["Tool"], got["Model"], got["RosterId"], got["Conflict"]))
+
+    def test_switching_the_tool_drops_the_model_that_belonged_to_the_other_tool(self):
+        self.record(tool="claude", model="claude-sonnet-5-5", rosterId="claude-sonnet")
+        got = self.resolved("-Requested codex")                 # not kimi: its revmux profile probe runs the real revmux
+        self.assertEqual(("codex", None, None), (got["Tool"], got["Model"], got["RosterId"]))
+        got = self.resolved("-Requested codex -RequestedModel gpt-6-luna -RequestedRosterId codex-luna")
+        self.assertEqual(("codex", "gpt-6-luna", "codex-luna"), (got["Tool"], got["Model"], got["RosterId"]))
+
+    def test_a_different_model_is_refused_while_the_pane_holds_an_agent_like_a_tool_switch(self):
+        self.record(tool="claude", model="claude-sonnet-5-5")
+        self.live_pane()
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5")
+        self.assertIn("claude-sonnet-5-5", got["Conflict"])
+        self.assertIn("claude-opus-5-5", got["Conflict"])
+        self.assertEqual("claude-sonnet-5-5", got["Model"])
+        same = self.resolved("-Requested claude -RequestedModel claude-sonnet-5-5")
+        self.assertIsNone(same["Conflict"])
+        self.assertIn("runs claude", self.resolved("-Requested codex")["Conflict"])
+
+    def test_a_different_model_is_taken_when_no_agent_holds_the_pane(self):
+        self.record(tool="claude", model="claude-sonnet-5-5")
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId claude-opus")
+        self.assertEqual((None, "claude-opus-5-5", "claude-opus"), (got["Conflict"], got["Model"], got["RosterId"]))
+
+    def test_astra_is_refused_as_a_request_and_as_a_saved_model(self):
+        refused = self.resolve("-Requested codex -RequestedModel gpt-6-astra")
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("astra", refused.stdout + refused.stderr)
+        self.record(tool="codex", model="gpt-6-Astra")
+        saved = self.resolve()
+        self.assertNotEqual(0, saved.returncode)
+        self.assertIn("implementer.json", saved.stdout + saved.stderr)
+        self.assertIn("astra", saved.stdout + saved.stderr)
+
+    def save(self, tool, model=None, roster_id=None) -> subprocess.CompletedProcess:
+        return ps(". ./lib/Workbench.ps1; Save-Implementer " + ps_quote(self.checkout) +
+                  " @{ Tool = " + ps_quote(tool) + "; Model = " + (ps_quote(model) if model else "$null") +
+                  "; RosterId = " + (ps_quote(roster_id) if roster_id else "$null") +
+                  "; RevmuxProfile = 'comprehensive'; AutoMerge = $false; Autonomous = $false; BigReview = $false;"
+                  " OnLimit = 'failover'; Cleanup = 'merged' }", env=self.env)
+
+    def test_the_model_is_saved_beside_the_tool_and_a_model_only_change_is_written(self):
+        first = self.save("codex")
+        self.assertEqual(0, first.returncode, first.stdout + first.stderr)
+        self.assertNotIn("model", self.saved())
+        self.assertNotIn("rosterId", self.saved())
+        self.save("codex", "gpt-6.1-sol", "codex-sol")
+        self.assertEqual(("codex", "gpt-6.1-sol", "codex-sol"), tuple(self.saved()[k] for k in ("tool", "model", "rosterId")))
+        path = self.checkout / ".workbench/state/implementer.json"
+        mtime = path.stat().st_mtime_ns
+        self.save("codex", "gpt-6.1-sol", "codex-sol")
+        self.assertEqual(mtime, path.stat().st_mtime_ns)          # idempotent
+        self.save("codex", "gpt-6-luna", "codex-luna")
+        self.assertEqual("gpt-6-luna", self.saved()["model"])
+        self.save("codex")
+        self.assertNotIn("model", self.saved())
+
+    # --- the panes -------------------------------------------------------------------------------------
+
+    def codex_line(self, config=None) -> subprocess.CompletedProcess:
+        if config is not None:
+            self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding="utf-8")
+        return ps("& ./lib/pane-codex.ps1 -Checkout " + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly", env=self.env)
+
+    def test_codex_pane_passes_m_after_codexargs_so_it_wins(self):
+        self.record(tool="codex", model="gpt-6.1-sol")
+        line = self.codex_line({"codexArgs": ["-m", "gpt-6-luna"]}).stdout
+        self.assertRegex(line, r"-m gpt-6-luna -m gpt-6\.1-sol You are CODEX")
+        self.assertIn("--sandbox workspace-write --ask-for-approval never", line)
+
+    def test_codex_pane_without_a_model_or_with_another_tools_model_passes_none(self):
+        self.record(tool="codex")
+        self.assertNotRegex(self.codex_line().stdout, r" -m ")
+        self.record(tool="claude", model="claude-opus-5-5")
+        self.assertNotIn("claude-opus-5-5", self.codex_line().stdout)
+
+    def test_codex_pane_still_refuses_sandbox_flags_and_a_saved_astra(self):
+        self.record(tool="codex", model="gpt-6.1-sol")
+        refused = self.codex_line({"codexArgs": ["--sandbox", "danger-full-access"]})
+        self.assertNotEqual(0, refused.returncode)
+        self.assertNotIn("would run:", refused.stdout)
+        self.config_path.write_text(json.dumps({"checkoutRoot": str(self.temp)}), encoding="utf-8")
+        self.record(tool="codex", model="gpt-6-astra")
+        astra = self.codex_line()
+        self.assertNotEqual(0, astra.returncode)
+        self.assertNotIn("would run:", astra.stdout)
+        self.assertIn("astra", astra.stdout + astra.stderr)
+
+    def claude_line(self, config=None) -> subprocess.CompletedProcess:
+        if config is not None:
+            self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding="utf-8")
+        (self.checkout / ".workbench/state/implementer-claude.json").write_text(json.dumps(
+            dict(pane=RIGHT_ID, sessionId=OTHER_ID, cwd=str(self.checkout), origin="fresh",
+                 reservedAt="2026-09-23T00:00:00Z", issue="o/repo#7", checkout=str(self.checkout))), encoding="utf-8")
+        return ps("& ./lib/pane-implementer-claude.ps1 -Checkout " + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly",
+                  env=self.env)
+
+    def test_claude_pane_model_flag_is_last_and_the_saved_model_beats_claude_implementer_model(self):
+        self.record(tool="claude", model="claude-opus-5-5")
+        out = self.claude_line({"claudeArgs": ["--model", "claude-haiku-4-5"], "claudeImplementerModel": "claude-sonnet-5-5"})
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        line = next(row for row in out.stdout.splitlines() if row.startswith("would run: claude"))
+        self.assertEqual(["claude-haiku-4-5", "claude-opus-5-5"], re.findall(r"'--model' '([^']+)'", line))
+        self.assertNotIn("claude-sonnet-5-5", line)
+
+    def test_claude_pane_falls_back_to_claude_implementer_model_without_a_saved_one(self):
+        self.record(tool="claude")
+        line = self.claude_line({"claudeImplementerModel": "claude-sonnet-5-5"}).stdout
+        self.assertEqual(["claude-sonnet-5-5"], re.findall(r"'--model' '([^']+)'", line))
+        self.record(tool="codex", model="gpt-6.1-sol")
+        line = self.claude_line({}).stdout
+        self.assertNotIn("--model", line)
+
+    def kimi_line(self, config=None) -> subprocess.CompletedProcess:
+        stub = self.temp / "kimi"
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        settings = dict(config or {}, checkoutRoot=str(self.temp), kimiPath=str(stub))
+        self.config_path.write_text(json.dumps(settings), encoding="utf-8")
+        return ps("& ./lib/pane-implementer-kimi.ps1 -Checkout " + ps_quote(self.checkout) + " -Issue 'o/repo#7' -WhatIfOnly",
+                  env=dict(self.env, KIMI_CODE_HOME=str(self.temp / "kimi-home")))
+
+    def test_kimi_pane_passes_m_when_a_model_is_saved_and_nothing_otherwise(self):
+        subprocess.run(["git", "-C", str(self.checkout), "init", "-q"], check=True, capture_output=True)
+        self.record(tool="kimi", model="kimi-k2")
+        with_model = self.kimi_line({"kimiArgs": ["-m", "kimi-k1"]})
+        self.assertEqual(0, with_model.returncode, with_model.stdout + with_model.stderr)
+        self.assertRegex(with_model.stdout, r"'-m' 'kimi-k1' '-m' 'kimi-k2'\s*$")
+        self.record(tool="kimi")
+        without = self.kimi_line()
+        self.assertEqual(0, without.returncode, without.stdout + without.stderr)
+        self.assertNotRegex(without.stdout, r"'-m'")
+        self.record(tool="claude", model="claude-opus-5-5")
+        other = self.kimi_line()
+        self.assertEqual(0, other.returncode, other.stdout + other.stderr)
+        self.assertNotIn("claude-opus-5-5", other.stdout)
+
+    # --- the entry script ------------------------------------------------------------------------------
+
+    def entry(self, *arguments) -> subprocess.CompletedProcess:
+        return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), *arguments],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=30)
+
+    def test_entry_refuses_an_astra_a_malformed_and_a_queue_model(self):
+        for model, message in (("gpt-6-astra", "astra"), ("GPT-6-ASTRA", "astra"), ("not a model", "model name")):
+            with self.subTest(model=model):
+                result = self.entry("o/repo#7", "-ImplementerModel", model)
+                self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+                self.assertIn("-ImplementerModel", result.stdout)
+                self.assertIn(message, result.stdout)
+        queue = self.entry("-Queue", "o/repo#7", "-ImplementerModel", "claude-opus-5-5")
+        self.assertEqual(2, queue.returncode, queue.stdout + queue.stderr)
+        self.assertIn("-ImplementerModel belongs to one launch", queue.stdout)
+
+
+@unittest.skipIf(os.name == "nt", "the gh and claude stand-ins are POSIX shell scripts")
+class AutoImplementerLaunch(ImplementerCheckout):
+    """#109: -Implementer auto on a single launch (Resolve-AutoImplementer, the dry run, the entry's refusals)
+    and failover over roster ids. gh and claude are shell stand-ins on PATH; the router itself is lib/route.py."""
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.temp / "bin"
+        self.bin.mkdir()
+        self.gh_log = self.temp / "gh.log"
+        self.answer = {"implementer": "codex-luna", "reason": "docs only", "rule": "docs-or-tests-only"}
+        self.issue = {"number": 7, "title": "docs", "body": "typo", "state": "open", "labels": [{"name": "priority:P3"}],
+                      "author_association": "OWNER"}
+        self.fake_gh()
+        self.fake_claude(self.answer)
+        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ["PATH"], AGWORKBENCH_ROUTE_ROOT=str(self.temp / "route"),
+                        AGWORKBENCH_ROUTE_OUTCOMES=str(self.temp / "outcomes.jsonl"))
+
+    def fake_gh(self, fail_label=False):
+        (self.temp / "issue.json").write_text(json.dumps(self.issue), encoding="utf-8")
+        script = ('#!/bin/sh\necho "$@" >> ' + shlex.quote(str(self.gh_log)) + '\n'
+                  'if [ "$1" = api ]; then cat ' + shlex.quote(str(self.temp / "issue.json")) + '; exit 0; fi\n' +
+                  ('if [ "$1" = issue ]; then echo denied >&2; exit 1; fi\n' if fail_label else '') + 'exit 0\n')
+        (self.bin / "gh").write_text(script, encoding="utf-8")
+        (self.bin / "gh").chmod(0o755)
+
+    def fake_claude(self, answer, code=0):
+        envelope = json.dumps({"is_error": code != 0, "structured_output": answer})
+        (self.bin / "claude").write_text("#!/bin/sh\ncat <<'EOF'\n" + envelope + "\nEOF\nexit " + str(code) + "\n", encoding="utf-8")
+        (self.bin / "claude").chmod(0o755)
+
+    def auto(self, extra="") -> subprocess.CompletedProcess:
+        return ps(". ./lib/Workbench.ps1; $r = Resolve-AutoImplementer -Checkout " + ps_quote(self.checkout) +
+                  " -Repo 'o/repo' -Number 7 " + extra + "; ConvertTo-Json -Compress -InputObject $r", env=self.env)
+
+    def test_the_router_chooses_once_and_the_label_is_written(self):
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("codex", "gpt-6-luna", "codex-luna"), (got["Tool"], got["Model"], got["RosterId"]))
+        log = self.gh_log.read_text(encoding="utf-8")
+        self.assertIn("label create impl:codex-luna", log)
+        self.assertIn("issue edit 7 --repo o/repo --add-label impl:codex-luna", log)
+
+    def test_an_owner_label_wins_without_a_model_call_or_a_new_label(self):
+        self.issue["labels"] = [{"name": "impl:claude-opus"}]
+        self.fake_gh()
+        self.fake_claude({"implementer": "codex-luna", "reason": "never asked", "rule": "x"}, code=1)   # would fail
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("claude", "claude-opus-5-5", "claude-opus"), (got["Tool"], got["Model"], got["RosterId"]))
+        self.assertNotIn("label create", self.gh_log.read_text(encoding="utf-8"))
+
+    def test_a_router_failure_refuses_with_its_reason_and_never_defaults(self):
+        self.fake_claude({"implementer": "gpt-6-astra", "reason": "x", "rule": "x"})
+        out = self.auto()
+        self.assertNotEqual(0, out.returncode)
+        self.assertIn("-Implementer auto refused", out.stdout + out.stderr)
+        self.assertIn("not an implementerRoster id", out.stdout + out.stderr)
+        self.assertNotIn("issue edit", self.gh_log.read_text(encoding="utf-8"))
+
+    def test_the_limits_recorded_on_the_checkout_keep_that_tool_from_the_router(self):
+        self.record(tool="claude", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.fake_claude({"implementer": "codex-sol", "reason": "x", "rule": "x"})
+        out = self.auto()
+        self.assertNotEqual(0, out.returncode)
+        self.assertIn("usage limit", out.stdout + out.stderr)
+
+    def test_a_checkout_routed_before_keeps_its_entry_and_calls_nothing(self):
+        self.record(tool="claude", model="claude-opus-5-5", rosterId="claude-opus")
+        out = self.auto()
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("claude", "claude-opus-5-5", "claude-opus"), (got["Tool"], got["Model"], got["RosterId"]))
+        self.assertFalse(self.gh_log.exists())
+
+    def routed_before(self, ident):
+        """The router wrote impl:<ident> on this issue earlier (route-labels.jsonl, beside the outcomes file)."""
+        (self.temp / "route-labels.jsonl").write_text(
+            json.dumps({"key": "o/repo#7", "id": ident, "at": "2026-10-04T00:00:00Z"}) + "\n", encoding="utf-8")
+        self.issue["labels"] = [{"name": "priority:P2"}, {"name": "impl:" + ident}]
+        self.fake_gh()
+
+    def test_after_a_bare_failover_the_routers_own_label_on_a_limited_tool_is_stale_not_an_order(self):
+        # the checkout failed over from codex to a bare claude: its rosterId is gone, codex is recorded limited
+        self.record(tool="claude", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.routed_before("codex-sol")
+        self.fake_claude({"implementer": "claude-sonnet", "reason": "codex is out", "rule": "default-code"})
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("claude", "claude-sonnet"), (got["Tool"], got["RosterId"]))
+        log = self.gh_log.read_text(encoding="utf-8")
+        self.assertIn("--add-label impl:claude-sonnet --remove-label impl:codex-sol", log)
+        lines = (self.temp / "route-labels.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual("claude-sonnet", json.loads(lines[-1])["id"])             # appended: the last record wins
+
+    def test_with_the_limit_cleared_the_routers_own_label_is_kept_without_a_model_call(self):
+        self.record(tool="claude")
+        self.routed_before("codex-sol")
+        self.fake_claude({"implementer": "claude-sonnet", "reason": "never asked", "rule": "x"}, code=1)      # would fail
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("codex", "gpt-6.1-sol", "codex-sol"), (got["Tool"], got["Model"], got["RosterId"]))
+        self.assertNotIn("issue edit", self.gh_log.read_text(encoding="utf-8"))
+
+    def test_an_owner_label_on_a_limited_tool_still_refuses_a_single_launch(self):
+        self.record(tool="claude", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.issue["labels"] = [{"name": "impl:codex-sol"}]                 # nothing recorded: the owner wrote it
+        self.fake_gh()
+        out = self.auto()
+        self.assertNotEqual(0, out.returncode)
+        self.assertIn("usage limit", out.stdout + out.stderr)
+
+    def test_a_kept_entry_whose_tool_has_a_recorded_limit_is_routed_again_without_that_tool(self):
+        self.record(tool="codex", model="gpt-6.1-sol", rosterId="codex-sol",
+                    limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        self.fake_claude({"implementer": "claude-sonnet", "reason": "codex is out", "rule": "default-code"})
+        out = self.auto()
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(("claude", "claude-sonnet"), (got["Tool"], got["RosterId"]))
+        self.assertIn("issue edit", self.gh_log.read_text(encoding="utf-8"))
+        self.fake_claude({"implementer": "codex-sol", "reason": "an answer naming the limited tool", "rule": "x"})
+        self.assertNotEqual(0, self.auto().returncode)                    # the limited tool is not offered
+
+    def test_a_kept_entry_with_a_limit_on_another_tool_is_still_kept(self):
+        self.record(tool="codex", model="gpt-6.1-sol", rosterId="codex-sol",
+                    limits={"kimi": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        out = self.auto()
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual("codex-sol", got["RosterId"])
+        self.assertFalse(self.gh_log.exists())
+
+    def clear_limit(self, implementer, failover, from_auto):
+        self.record(tool="codex", limits={"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}})
+        out = ps(". ./lib/Workbench.ps1; Clear-ChosenImplementerLimit " + ps_quote(self.checkout) + " " + ps_quote(implementer) +
+                 " $" + str(failover).lower() + " $" + str(from_auto).lower(), env=self.env)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        return "limits" in self.saved()
+
+    def test_only_a_concrete_choice_by_the_human_clears_a_recorded_limit_never_auto_or_a_failover(self):
+        self.assertFalse(self.clear_limit("codex", False, False))         # -Implementer codex: the human says it reset
+        self.assertTrue(self.clear_limit("codex", False, True))           # -Implementer auto picked codex: nothing was said
+        self.assertTrue(self.clear_limit("codex", True, False))           # a failover never clears
+        self.assertTrue(self.clear_limit("", False, False))
+
+    def test_a_dry_run_routes_and_labels_nothing(self):
+        out = self.auto("-DryRun")
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        self.assertIn("would ask the router", out.stdout)
+        self.assertFalse(self.gh_log.exists())
+
+    def test_the_resolved_roster_id_is_saved_with_the_model(self):
+        got = self.resolved("-Requested codex -RequestedModel gpt-6-luna -RequestedRosterId codex-luna")
+        self.assertEqual(("codex", "gpt-6-luna", "codex-luna"), (got["Tool"], got["Model"], got["RosterId"]))
+        self.record(tool="claude", model="claude-sonnet-5-5", rosterId="claude-sonnet")
+        # an entry without a model of the same tool ends the saved model
+        got = self.resolved("-Requested claude -RequestedRosterId claude-plain")
+        self.assertEqual((None, "claude-plain"), (got["Model"], got["RosterId"]))
+        self.live_pane()
+        self.assertIn("claude-sonnet-5-5", self.resolved("-Requested claude -RequestedRosterId claude-other")["Conflict"])
+
+    def entry(self, *arguments) -> subprocess.CompletedProcess:
+        return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), *arguments],
+                              env=self.env, cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=60)
+
+    def test_the_same_model_under_another_roster_id_is_a_new_label_not_a_model_change(self):
+        self.record(tool="claude", model="claude-opus-5-5")           # set by hand: no roster id saved
+        self.live_pane()
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId claude-opus")
+        self.assertEqual((None, "claude-opus-5-5", "claude-opus"), (got["Conflict"], got["Model"], got["RosterId"]))
+        self.record(tool="claude", model="claude-opus-5-5", rosterId="claude-opus")
+        got = self.resolved("-Requested claude -RequestedModel claude-opus-5-5 -RequestedRosterId opus-again")
+        self.assertEqual((None, "opus-again"), (got["Conflict"], got["RosterId"]))
+
+    def test_a_model_less_entry_over_a_saved_model_is_refused_on_a_live_pane_in_plain_words(self):
+        self.record(tool="claude", model="claude-opus-5-5", rosterId="claude-opus")
+        self.live_pane()
+        said = self.resolved("-Requested claude -RequestedRosterId claude-plain")["Conflict"]
+        self.assertIn("claude-opus-5-5", said)
+        self.assertIn("roster entry 'claude-plain', which has no model", said)
+        self.assertIn("-Implementer auto", said)
+        self.assertNotIn("''", said)
+        self.record(tool="claude")                                      # nothing saved: nothing to change
+        self.assertIsNone(self.resolved("-Requested claude -RequestedRosterId claude-plain")["Conflict"])
+
+    def test_a_model_over_a_pane_on_its_default_model_says_so(self):
+        self.record(tool="claude")
+        self.live_pane()
+        said = self.resolved("-Requested claude -RequestedModel claude-opus-5-5")["Conflict"]
+        self.assertIn("runs claude on its default model", said)
+        self.assertNotIn("''", said)
+
+    def test_a_failover_order_marks_a_bare_tool_and_leaves_a_roster_id_its_entry(self):
+        got = pwsh_json(". ./lib/Workbench.ps1; $o = @(Resolve-FailoverOrder @('claude', 'codex-luna', 'kimi') (Get-DefaultImplementerRoster)); "
+                        "ConvertTo-Json -Compress -InputObject @($o | ForEach-Object { @{ id = $_.id; bare = [bool]$_.bare; model = $_.model } })",
+                        env=self.env)
+        self.assertEqual([("claude", True, None), ("codex-luna", False, "gpt-6-luna"), ("kimi", False, None)],
+                         [(e["id"], e["bare"], e["model"]) for e in got])
+
+    def dry_run(self, *arguments) -> subprocess.CompletedProcess:
+        return subprocess.run([PWSH, "-NoProfile", "-File", str(LIB / "github-workbench.ps1"), "o/repo#7", "-NewSession",
+                               "-DryRun", *arguments], env=dict(self.env, PATH=str(self.bin) + os.pathsep + os.environ["PATH"]),
+                              cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+
+    def test_the_dry_run_of_the_entry_shows_auto_and_a_model(self):
+        auto = self.dry_run("-Implementer", "auto")
+        self.assertEqual(0, auto.returncode, auto.stdout + auto.stderr)
+        self.assertIn("implementer: auto - would ask the router", auto.stdout)
+        pinned = self.dry_run("-Implementer", "claude", "-ImplementerModel", "claude-opus-5-5")
+        self.assertEqual(0, pinned.returncode, pinned.stdout + pinned.stderr)
+        self.assertIn("implementer: claude model claude-opus-5-5", pinned.stdout)
+
+    def test_the_entry_refuses_auto_with_a_model_or_failover_and_a_stray_roster_id(self):
+        for arguments, message in ((["-Implementer", "auto", "-ImplementerModel", "claude-opus-5-5"], "cannot be combined"),
+                                   (["-Implementer", "auto", "-Failover"], "cannot be combined"),
+                                   (["-RosterId", "kimi"], "conductor"), (["-Implementer", "aider"], "-Implementer must be codex, claude or kimi")):
+            with self.subTest(arguments=arguments):
+                out = self.entry("o/repo#7", *arguments)
+                self.assertEqual(2, out.returncode, out.stdout + out.stderr)
+                self.assertIn(message, out.stdout)
+
+    # --- failover over roster ids ---------------------------------------------------------------------
+
+    def failover(self, order, saved, roster=None, limits=None) -> dict:
+        config = {"failoverOrder": order}
+        if roster is not None:
+            config["implementerRoster"] = roster
+        self.config_path.write_text(json.dumps(dict(config, checkoutRoot=str(self.temp))), encoding="utf-8")
+        self.record(tool=saved, **({"limits": limits} if limits else {}))
+        return pwsh_json(". ./lib/Workbench.ps1; $c = Get-WorkbenchConfig; $t = Get-FailoverTarget -Checkout " +
+                         ps_quote(self.checkout) + " -Config $c -Saved " + ps_quote(saved) + " -NoProbe; "
+                         "ConvertTo-Json -Compress -InputObject @{ Target = $t.Target; Id = $t.Entry.id; Model = $t.Entry.model; "
+                         "Reasons = @($t.Reasons) }", env=self.env)
+
+    def test_the_default_order_keeps_todays_targets_and_pins_no_model(self):
+        got = self.failover(["claude", "codex"], "codex")
+        self.assertEqual(("claude", "claude", None), (got["Target"], got["Id"], got["Model"]))
+        got = self.failover(["claude", "codex"], "claude")
+        self.assertEqual(("codex", "codex", None), (got["Target"], got["Id"], got["Model"]))
+
+    def test_a_tool_name_that_is_a_roster_id_is_that_entry(self):
+        roster = [{"id": "codex", "tool": "codex", "model": "gpt-6-luna", "note": "x"}]
+        got = self.failover(["codex", "claude"], "claude", roster=roster)
+        self.assertEqual(("codex", "codex", "gpt-6-luna"), (got["Target"], got["Id"], got["Model"]))
+
+    def test_a_roster_id_in_the_order_is_that_entry(self):
+        got = self.failover(["claude-opus", "codex-luna"], "codex")
+        self.assertEqual(("claude", "claude-opus", "claude-opus-5-5"), (got["Target"], got["Id"], got["Model"]))
+        got = self.failover(["codex-luna", "claude-opus"], "claude")
+        self.assertEqual(("codex", "codex-luna", "gpt-6-luna"), (got["Target"], got["Id"], got["Model"]))
+
+    def test_a_limited_tool_is_never_replaced_by_its_other_entry(self):
+        got = self.failover(["claude-sonnet", "claude-opus", "codex-sol"], "claude")
+        self.assertEqual(("codex", "codex-sol"), (got["Target"], got["Id"]))
+
+    def test_recorded_limits_are_skipped_and_a_bare_tool_has_no_model(self):
+        limits = {"codex": {"at": "2026-10-05T00:00:00Z", "line": "limit", "kind": "limited"}}
+        got = self.failover(["codex-sol", "claude-opus"], "kimi", limits=limits)
+        self.assertEqual(("claude-opus",), (got["Id"],))
+        self.assertIn("codex was recorded limited", got["Reasons"][0] if isinstance(got["Reasons"], list) else got["Reasons"])
+        only = [{"id": "luna", "tool": "codex", "model": "gpt-6-luna", "note": "x"}]
+        got = self.failover(["claude", "luna"], "codex", roster=only)
+        self.assertEqual(("claude", "claude", None), (got["Target"], got["Id"], got["Model"]))
+        got = self.failover(["claude", "luna"], "claude", roster=only)
+        self.assertEqual(("codex", "luna", "gpt-6-luna"), (got["Target"], got["Id"], got["Model"]))
+
+
 if __name__ == "__main__":
     unittest.main()

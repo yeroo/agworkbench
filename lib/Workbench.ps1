@@ -139,9 +139,14 @@ function Get-WorkbenchConfig {
                         Claude agents under --dangerously-skip-permissions; the push/gh guards stay)
          kimiArgs       extra arguments for kimi (policy and session flags are refused - see
                         pane-implementer-kimi.ps1)
-         failoverOrder  the tools -Failover and the queue try, in order, when the implementer is
-                        limited (default ["claude", "codex", "kimi"]): the first that is not the
-                        limited one, has no recorded limit and is usable
+         implementerRoster  the entries -Implementer auto chooses from (#109): a list of
+                        {"id", "tool", "model" (optional), "note"}; a model naming astra is refused
+                        (default: the five entries of Get-DefaultImplementerRoster)
+         route          {"model": ...}: the model of the router's judgment (lib/route.py, #109; default
+                        claude-haiku-4-5-20251001)
+         failoverOrder  the tools (or roster ids) -Failover and the queue try, in order, when the
+                        implementer is limited (default ["claude", "codex", "kimi"]): the first whose
+                        tool is not the limited one, has no recorded limit and is usable
          autoMerge      let the planner merge its own PR when every condition holds (default false)
          failover       switch the implementer to the next tool in failoverOrder when it hits its usage limit (default true)
          autonomous     full autonomy (#27): auto-merge, follow-up issues, sessions closed after the merge
@@ -169,11 +174,11 @@ function Get-WorkbenchConfig {
     $config = @{ claudeArgs = @(); codexArgs = @(); checkoutRoot = (Join-Path $HOME 'source\workbench'); allowNetwork = $false;
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
                  cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask'; claudeImplementerModel = $null;
-                 failoverOrder = @('claude', 'codex', 'kimi'); limitRetryMinutes = 30; reviewOnLimit = 'wait';
+                 failoverOrder = @('claude', 'codex', 'kimi'); implementerRoster = $null; route = $null; limitRetryMinutes = 30; reviewOnLimit = 'wait';
                  closeHelpers = $true; restartExited = $true }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'route', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -183,21 +188,38 @@ function Get-WorkbenchConfig {
     if ($null -ne $config.kimiPath -and ($config.kimiPath -isnot [string] -or -not $config.kimiPath.Trim())) {
         throw "kimiPath in '$path' must be the path of kimi.exe (got '$($config.kimiPath)')"
     }
-    if ($null -ne $config.claudeImplementerModel -and ($config.claudeImplementerModel -isnot [string] -or $config.claudeImplementerModel -notmatch '^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$')) {
-        throw "claudeImplementerModel in '$path' must be a model name such as ""claude-sonnet-5-5"" (got '$($config.claudeImplementerModel)')"
+    if ($null -ne $config.claudeImplementerModel) {
+        $modelProblem = Get-ModelProblem $config.claudeImplementerModel
+        if ($modelProblem) { throw "claudeImplementerModel in '$path': $modelProblem" }
     }
     if ($config.kimiApproval -cnotin @('ask', 'never')) { throw "kimiApproval in '$path' must be ""ask"" or ""never"" (got '$($config.kimiApproval)')" }
     $config.kimiArgs = @(@($config.kimiArgs) | Where-Object { $null -ne $_ })
     foreach ($argument in $config.kimiArgs) {
         if ($argument -isnot [string]) { throw "kimiArgs in '$path' must be a list of strings (got '$argument')" }
     }
-    # @( ... ) keeps a one-item list a list: ConvertFrom-Json unrolls nothing, but a bare string must fail.
-    $order = $config.failoverOrder
-    if ($order -is [string] -or @($order).Count -lt 2 -or @($order | Where-Object { -not (Test-ImplementerTool $_) }).Count -or
-        @($order | Select-Object -Unique).Count -ne @($order).Count) {
-        throw "failoverOrder in '$path' must list at least two distinct tools of codex, claude and kimi (got '$(@($order) -join ', ')')"
+    if ($null -eq $config.implementerRoster) { $config.implementerRoster = Get-DefaultImplementerRoster }
+    $rosterProblem = Get-RosterProblem $config.implementerRoster
+    if ($rosterProblem) { throw "implementerRoster in '$path': $rosterProblem" }
+    $config.implementerRoster = @($config.implementerRoster | ForEach-Object { $_ })
+    if ($null -ne $config.route) {
+        # lib/route.py reads this itself (#109): the model of the router's judgment (default claude-haiku-4-5-20251001).
+        if ($config.route -isnot [pscustomobject]) { throw "route in '$path' must be an object with an optional model" }
+        $routeKeys = @($config.route.PSObject.Properties | ForEach-Object { $_.Name })
+        if (@($routeKeys | Where-Object { $_ -cne 'model' }).Count) { throw "route in '$path' must be an object with an optional model" }
+        if ($routeKeys -ccontains 'model') {
+            $routeProblem = Get-ModelProblem $config.route.model
+            if ($routeProblem) { throw "route.model in '$path': $routeProblem" }
+        }
     }
-    $config.failoverOrder = @($order | ForEach-Object { [string]$_ })
+    # @( ... ) keeps a one-item list a list: ConvertFrom-Json unrolls nothing, but a bare string must fail.
+    $orderProblem = Get-FailoverOrderProblem $config.failoverOrder $config.implementerRoster
+    if ($orderProblem) { throw "failoverOrder in '$path' $orderProblem" }
+    $config.failoverOrder = @($config.failoverOrder | ForEach-Object { [string]$_ })
+    # No agent argument may name a refused model either (#109): -m / --model / -c model=...
+    foreach ($key in @('claudeArgs', 'codexArgs', 'kimiArgs')) {
+        $modelProblem = Get-ModelArgProblem $key $config[$key]
+        if ($modelProblem) { throw "$modelProblem (in '$path')" }
+    }
     if ($null -ne $config.revmuxProfile -and ($config.revmuxProfile -isnot [string] -or $config.revmuxProfile -notmatch '^[A-Za-z0-9._-]+$')) {
         throw "revmuxProfile in '$path' must be a revmux profile name (got '$($config.revmuxProfile)')"
     }
@@ -235,6 +257,108 @@ function Get-WorkbenchConfig {
 }
 
 function Test-ImplementerTool($Value) { return $Value -is [string] -and $Value -cin @('codex', 'claude', 'kimi') }
+
+# --- the implementer roster and models (#109) ---------------------------------------------------
+
+# A model name as claudeImplementerModel always took it. gpt-6-astra is never offered or passed on: a
+# model naming "astra", in any case, is refused wherever a model is read.
+$script:ModelNamePattern = '^[A-Za-z0-9][A-Za-z0-9._\[\]-]*\z'
+$script:RefusedModelPattern = '(?i)astra'
+$script:RosterIdPattern = '^[a-z0-9][a-z0-9-]*\z'      # \z, not $: .NET's $ also matches before a final newline
+
+function Get-RefusedModelMessage([string] $Model) { return "the model '$Model' is refused: gpt-6-astra is never used" }
+
+function Get-DefaultImplementerRoster {
+    return @(
+        [pscustomobject]@{ id = 'claude-sonnet'; tool = 'claude'; model = 'claude-sonnet-5-5'; note = 'default for most code' },
+        [pscustomobject]@{ id = 'claude-opus'; tool = 'claude'; model = 'claude-opus-5-5'; note = 'hardest design/cross-cutting work' },
+        [pscustomobject]@{ id = 'kimi'; tool = 'kimi'; note = 'cheapest in Claude tokens; well-scoped issues' },
+        [pscustomobject]@{ id = 'codex-sol'; tool = 'codex'; model = 'gpt-6.1-sol'; note = 'workhorse' },
+        [pscustomobject]@{ id = 'codex-luna'; tool = 'codex'; model = 'gpt-6-luna'; note = 'small, mechanical, docs/tests-only changes' })
+}
+
+function Get-RosterProblem($Roster) {
+    <# Why this roster is invalid, or $null. The same rules as lib/roster.py; tests/fixtures/roster-cases.json
+       is iterated by both. #>
+    if ($Roster -is [string] -or $Roster -is [System.Collections.IDictionary] -or $Roster -isnot [System.Collections.IEnumerable]) {
+        return 'must be a list of entries'
+    }
+    $entries = @($Roster)
+    if (-not $entries.Count) { return 'must have at least one entry' }
+    $seen = @{}
+    foreach ($entry in $entries) {
+        if ($entry -isnot [pscustomobject] -and $entry -isnot [System.Collections.IDictionary]) { return "entry '$entry' must be an object" }
+        $names = @($entry.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($entry -is [System.Collections.IDictionary]) { $names = @($entry.Keys) }
+        $get = { param($name) if ($entry -is [System.Collections.IDictionary]) { return $entry[$name] } else { return $entry.$name } }
+        foreach ($name in $names) {
+            if ($name -cnotin @('id', 'tool', 'model', 'note')) { return "has an unknown key '$name' (allowed: id, tool, model, note)" }
+        }
+        $id = & $get 'id'
+        if ($id -isnot [string] -or $id -cnotmatch $script:RosterIdPattern) { return "entry id '$id' must match $($script:RosterIdPattern)" }
+        if ($seen.ContainsKey($id)) { return "entry id '$id' is listed twice" }
+        $seen[$id] = $true
+        $tool = & $get 'tool'
+        if (-not (Test-ImplementerTool $tool)) { return "entry '$id': tool must be codex, claude or kimi (got '$tool')" }
+        if ($names -ccontains 'model') {
+            $modelProblem = Get-ModelProblem (& $get 'model')
+            if ($modelProblem) { return "entry '$id': $modelProblem" }
+        }
+        $note = & $get 'note'
+        # Code points, as lib/roster.py counts them: a character outside the BMP is two UTF-16 units, one low surrogate.
+        $noteLength = 0
+        if ($note -is [string]) { $noteLength = $note.Length - [regex]::Matches($note, '[\uDC00-\uDFFF]').Count }
+        if ($note -isnot [string] -or -not $note.Trim() -or $noteLength -gt 200) { return "entry '$id': note must be a non-empty string of at most 200 characters" }
+    }
+    return $null
+}
+
+function Get-RosterEntry($Roster, [string] $Id) {
+    foreach ($entry in @($Roster)) { if ($entry.id -ceq $Id) { return $entry } }
+    return $null
+}
+
+function Get-FailoverOrderProblem($Order, $Roster) {
+    <# Why this failoverOrder is invalid, or $null: a list, no duplicates, every element a tool or a roster
+       id, at least two distinct tools among them. The text continues "failoverOrder in '<path>' ...". #>
+    if ($Order -is [string] -or $Order -isnot [System.Collections.IEnumerable]) { return 'must be a list of tools or roster ids' }
+    $items = @($Order)
+    $tools = @{}
+    foreach ($item in $items) {
+        if ($item -isnot [string]) { return "must list tools or roster ids (got '$item')" }
+        if (Test-ImplementerTool $item) { $tools[$item] = $true; continue }
+        $entry = Get-RosterEntry $Roster $item
+        if (-not $entry) { return "names '$item', which is neither a tool (codex, claude, kimi) nor an implementerRoster id" }
+        $tools[[string]$entry.tool] = $true
+    }
+    if (@($items | Select-Object -Unique).Count -ne $items.Count) { return "must not list an element twice (got '$($items -join ', ')')" }
+    if ($tools.Count -lt 2) { return "must list at least two distinct tools of codex, claude and kimi (got '$($items -join ', ')')" }
+    return $null
+}
+
+function Get-ModelArgProblem([string] $Name, $Arguments) {
+    <# A model flag in an agent's extra arguments that names a refused model: -m X, --model X, -mX, --model=X,
+       -c model=X, --config model=X (any spelling of the value, case-insensitive). #>
+    $list = @(@($Arguments) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $text = $list[$i]
+        $value = $null
+        if ($text -ceq '-m' -or $text -ieq '--model') { if ($i + 1 -lt $list.Count) { $value = $list[$i + 1] } }
+        elseif ($text -imatch '^--model=(.*)$') { $value = $Matches[1] }
+        elseif ($text -cmatch '^-m=?(.+)$') { $value = $Matches[1] }
+        elseif ($text -ceq '-c' -or $text -ieq '--config') { if ($i + 1 -lt $list.Count -and $list[$i + 1] -imatch '^\s*model\s*=') { $value = $list[$i + 1] } }
+        elseif ($text -imatch '^(-c=?|--config=)(\s*model\s*=.*)$') { $value = $Matches[2] }
+        if ($value -and $value -match $script:RefusedModelPattern) { return "${Name}: $(Get-RefusedModelMessage $value)" }
+    }
+    return $null
+}
+
+function Get-ModelProblem($Model) {
+    <# Why -ImplementerModel (or a saved model) is unusable, or $null. #>
+    if ($Model -isnot [string] -or $Model -notmatch $script:ModelNamePattern) { return "a model must be a model name such as ""claude-sonnet-5-5"" (got '$Model')" }
+    if ($Model -match $script:RefusedModelPattern) { return (Get-RefusedModelMessage $Model) }
+    return $null
+}
 
 function Get-RevmuxProfile([string] $Tool, $Configured) {
     # Codex reviews only when Codex implements: a Claude or Kimi implementer may mean Codex is out of quota.
@@ -1192,6 +1316,69 @@ function Get-SavedImplementerTool([string] $Checkout) {
     return $null
 }
 
+function Get-SavedImplementerRecord([string] $Checkout) {
+    $path = Get-ImplementerStatePath $Checkout
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Get-SavedImplementerModel([string] $Checkout, [string] $Tool) {
+    <# The model this checkout's implementer was launched with (#109), only when the saved tool is $Tool:
+       the model belonged to that tool. A saved model naming a refused model is an error naming the file,
+       never ignored. #>
+    $data = Get-SavedImplementerRecord $Checkout
+    if (-not $data -or $data.tool -cne $Tool -or $null -eq $data.model) { return $null }
+    $problem = Get-ModelProblem $data.model
+    if ($problem) { throw "$(Get-ImplementerStatePath $Checkout): $problem" }
+    return [string]$data.model
+}
+
+function Resolve-AutoImplementer {
+    <# `-Implementer auto` on a single launch (#109): the router (lib/route.py) chooses a roster entry once for
+       this issue, and the choice is written as the issue's impl:<id> label. A checkout that was routed before
+       keeps its entry (a restart does not route again) unless its tool has a recorded usage limit. The router never defaults silently: a failure refuses
+       the launch with its reason. Returns @{ Tool; Model; RosterId }: a routed checkout returns its saved entry,
+       also in a dry run; otherwise a dry run returns a $null Tool (it routes nothing, labels nothing and calls
+       no model). #>
+    param([string] $Checkout, [string] $Repo, [int] $Number, [switch] $DryRun)
+    $rosterId = Get-SavedRosterId $Checkout
+    $savedTool = Get-SavedImplementerTool $Checkout
+    # A kept entry whose tool has a recorded limit is not kept: it is routed again, with that tool left out.
+    if ($rosterId -and $savedTool -and -not (Get-ImplementerLimits $Checkout).ContainsKey($savedTool)) {
+        $model = Get-SavedImplementerModel $Checkout $savedTool
+        Write-Step "implementer: auto - this checkout was routed to $rosterId before; kept"
+        return @{ Tool = $savedTool; Model = $model; RosterId = $rosterId }
+    }
+    if ($DryRun) {
+        Write-Step "implementer: auto - would ask the router (lib/route.py route-issue) for $Repo#$Number, then label the issue impl:<id>"
+        return @{ Tool = $null; Model = $null; RosterId = $null }
+    }
+    $limited = @((Get-ImplementerLimits $Checkout).Keys | Sort-Object) -join ','
+    $arguments = @((Join-Path $script:Lib 'route.py'), 'route-issue', "$Number", '--repo', $Repo, '--label', '--json')
+    if ($limited) { $arguments += @('--limited', $limited) }
+    Write-Step "implementer: auto - asking the router about $Repo#$Number"
+    $saidErr = New-TemporaryFile
+    try {
+        $said = & $script:Python @arguments 2>$saidErr
+        $code = $LASTEXITCODE
+        $errText = (Get-Content -Raw -LiteralPath $saidErr -ErrorAction SilentlyContinue)
+    } finally { Remove-Item -LiteralPath $saidErr -Force -ErrorAction SilentlyContinue }
+    if ($code -ne 0) { throw [ImplementerConflict]::new("-Implementer auto refused: the router chose nothing. $("$errText".Trim())") }
+    foreach ($line in @("$errText" -split "`r?`n" | Where-Object { $_ -match 'warning' })) { Write-Warning $line }
+    try { $choice = ($said -join "`n") | ConvertFrom-Json } catch { throw [ImplementerConflict]::new("-Implementer auto refused: the router's answer is not JSON: $said") }
+    if (-not (Test-ImplementerTool $choice.tool) -or $choice.implementer -isnot [string]) { throw [ImplementerConflict]::new("-Implementer auto refused: the router's answer names no tool: $said") }
+    $model = $null
+    if ($choice.model) { $model = [string]$choice.model }
+    Write-Step "implementer: auto -> $($choice.implementer) ($($choice.rule), $($choice.source)): $($choice.reason)"
+    return @{ Tool = [string]$choice.tool; Model = $model; RosterId = [string]$choice.implementer }
+}
+
+function Get-SavedRosterId([string] $Checkout) {
+    $data = Get-SavedImplementerRecord $Checkout
+    if ($data -and $data.rosterId -is [string] -and $data.rosterId -cmatch $script:RosterIdPattern) { return [string]$data.rosterId }
+    return $null
+}
+
 function Resolve-Implementer {
     <# Which tool runs in the right pane. A checkout keeps the tool it was set up with, so a repair
        run without -Implementer never swaps agents under a running loop. An explicit request that
@@ -1205,17 +1392,35 @@ function Resolve-Implementer {
        ($RequestedBigReview true/false) changes it.
        Waiting out usage limits (#77) is policy too: failover unless saved, and -WaitOnLimit /
        -NoWaitOnLimit ($RequestedOnLimit 'wait'/'failover') changes it.
-       Returns @{ Tool; RevmuxProfile; AutoMerge; Autonomous; BigReview; OnLimit; Conflict }, Conflict being a refusal
+       The model (#109) is saved beside the tool: -ImplementerModel sets it (with -RequestedRosterId, the roster
+       entry it came from); otherwise the saved one stays while the tool does, and a tool switch drops it. A
+       different model is changed like a tool: refused while the right pane holds an agent.
+       Returns @{ Tool; Model; RosterId; RevmuxProfile; AutoMerge; Autonomous; BigReview; OnLimit; Conflict }, Conflict being a refusal
        message or $null. #>
     param([string] $Checkout, [string] $Requested, $Config, $Tree, [switch] $NoProbe, $RequestedAutoMerge = $null,
           $RequestedAutonomous = $null, [string] $RequestedRevmuxProfile, $RequestedBigReview = $null,
-          [string] $RequestedOnLimit)
+          [string] $RequestedOnLimit, [string] $RequestedModel, [string] $RequestedRosterId)
     if ($Requested -and -not (Test-ImplementerTool $Requested)) { throw [ImplementerConflict]::new("-Implementer must be codex, claude or kimi (got '$Requested')") }
+    if ($RequestedModel) {
+        $modelProblem = Get-ModelProblem $RequestedModel
+        if ($modelProblem) { throw [ImplementerConflict]::new("-ImplementerModel: $modelProblem") }
+    }
     $saved = Get-SavedImplementerTool $Checkout
     $tool = $Config.implementer
     if ($saved) { $tool = $saved }
+    $savedModel = $null
+    $savedRosterId = $null
+    if ($saved) { $savedModel = Get-SavedImplementerModel $Checkout $saved; $savedRosterId = Get-SavedRosterId $Checkout }
+    $model = $savedModel
+    $rosterId = $savedRosterId
     $conflict = $null
-    if ($Requested -and $saved -and $Requested -ne $saved) {
+    $toolSwitch = [bool]($Requested -and $saved -and $Requested -ne $saved)
+    # A model switch is a different model, or a roster entry without one (-RequestedRosterId alone) over a saved model.
+    # The same model under another roster id is only a new label on it: no switch, whatever the saved id was.
+    $modelSwitch = [bool]($saved -and -not $toolSwitch -and
+                          (($RequestedModel -and $RequestedModel -cne $savedModel) -or
+                           (-not $RequestedModel -and $RequestedRosterId -and $savedModel)))
+    if ($toolSwitch -or $modelSwitch) {
         $pane = $null
         $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
         if (Test-Path -LiteralPath $registryPath) {
@@ -1225,10 +1430,30 @@ function Resolve-Implementer {
         if ($pane -and -not $NoProbe -and (Find-SessionByPane $Tree $pane)) {
             $live = -not (Test-PaneShellReady $pane (Invoke-Ctl session text --target $pane))
         } elseif ($pane -and $NoProbe) { $live = $true }
-        if ($live) {
+        if ($live -and $toolSwitch) {
             $conflict = "this checkout's right pane '$pane' runs $saved; close that agent (or leave it at a shell prompt) before switching to $Requested, or rerun with -Implementer $saved"
-        } else { $tool = $Requested }
-    } elseif ($Requested) { $tool = $Requested }
+        } elseif ($live) {
+            $now = ' on its default model'
+            if ($savedModel) { $now = " on model '$savedModel'" }
+            if ($RequestedModel -and $RequestedRosterId) { $next = "model '$RequestedModel' (roster entry '$RequestedRosterId', chosen by -Implementer auto or the queue's router)" }
+            elseif ($RequestedModel) { $next = "model '$RequestedModel'" }
+            else { $next = "the roster entry '$RequestedRosterId', which has no model (chosen by -Implementer auto or the queue's router)" }
+            $conflict = "this checkout's right pane '$pane' runs $saved$now; close that agent (or leave it at a shell prompt) before changing it to $next, or rerun without -ImplementerModel / -Implementer auto"
+        } elseif ($toolSwitch) { $tool = $Requested; $model = $null; $rosterId = $null }
+    } elseif ($Requested) {
+        # A first choice of the tool, or the same one again (a switch was handled above): the saved model stays with it.
+        $tool = $Requested
+    }
+    if ($RequestedModel -and -not $conflict) {
+        # The roster entry the model came from; the same model again keeps the saved entry.
+        if ($RequestedRosterId) { $rosterId = $RequestedRosterId }
+        elseif ($RequestedModel -cne $savedModel) { $rosterId = $null }
+        $model = $RequestedModel
+    }
+    elseif ($RequestedRosterId -and -not $conflict) {
+        if ($RequestedRosterId -cne $savedRosterId) { $model = $null }
+        $rosterId = $RequestedRosterId
+    }
     $autoMerge = [bool]$Config.autoMerge
     $savedAutoMerge = Get-SavedSetting $Checkout 'autoMerge'
     if ($null -ne $savedAutoMerge) { $autoMerge = $savedAutoMerge }
@@ -1254,7 +1479,7 @@ function Resolve-Implementer {
     # A queue's explicit profile (#66) wins over the config's; it comes with a conductor launch only.
     $chosenProfile = $Config.revmuxProfile
     if ($RequestedRevmuxProfile) { $chosenProfile = $RequestedRevmuxProfile }
-    return @{ Tool = $tool; RevmuxProfile = (Get-RevmuxProfile $tool $chosenProfile); AutoMerge = $autoMerge;
+    return @{ Tool = $tool; Model = $model; RosterId = $rosterId; RevmuxProfile = (Get-RevmuxProfile $tool $chosenProfile); AutoMerge = $autoMerge;
               Autonomous = $autonomous; BigReview = $bigReview; OnLimit = $onLimit; Cleanup = [string]$Config.cleanup; Conflict = $conflict }
 }
 
@@ -1288,6 +1513,10 @@ function Save-Implementer([string] $Checkout, $Resolved) {
     $record = [pscustomobject]@{ tool = $Resolved.Tool; revmuxProfile = $Resolved.RevmuxProfile; autoMerge = [bool]$Resolved.AutoMerge;
                                  autonomous = [bool]$Resolved.Autonomous; bigReview = [bool]$Resolved.BigReview;
                                  onLimit = [string]$Resolved.OnLimit; cleanup = $cleanup }
+    # The model (#109) and the roster entry it came from, only when there are any: a record without them
+    # is today's, and the pane reads "no model" from it.
+    if ($Resolved.Model) { $record | Add-Member -NotePropertyName model -NotePropertyValue ([string]$Resolved.Model) }
+    if ($Resolved.RosterId) { $record | Add-Member -NotePropertyName rosterId -NotePropertyValue ([string]$Resolved.RosterId) }
     if (Test-Path -LiteralPath $path) {
         try {
             $current = Get-Content -Raw -LiteralPath $path -Encoding UTF8 | ConvertFrom-Json
@@ -1298,11 +1527,14 @@ function Save-Implementer([string] $Checkout, $Resolved) {
                 $current.autonomous -is [bool] -and $current.autonomous -eq $record.autonomous -and
                 $current.bigReview -is [bool] -and $current.bigReview -eq $record.bigReview -and
                 $current.onLimit -ceq $record.onLimit -and
+                [string]$current.model -ceq [string]$record.model -and [string]$current.rosterId -ceq [string]$record.rosterId -and
                 $current.cleanup -ceq $record.cleanup) { return }
         } catch { Write-LaunchLog implementer "replacing unreadable '$path': $_" }
     }
     Write-AtomicJson $path $record
-    Write-Step "implementer: $($record.tool) (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous); big review $(Format-AutoMerge $record.bigReview); on limit $($record.onLimit)"
+    $modelNote = ''
+    if ($record.model) { $modelNote = " model $($record.model)" }
+    Write-Step "implementer: $($record.tool)$modelNote (revmux profile $($record.revmuxProfile)); auto-merge $(Format-AutoMerge $record.autoMerge); autonomous $(Format-AutoMerge $record.autonomous); big review $(Format-AutoMerge $record.bigReview); on limit $($record.onLimit)"
 }
 
 function Format-AutoMerge([bool] $Value) {
@@ -1339,6 +1571,12 @@ function Set-ImplementerLimit([string] $Checkout, [string] $Tool, $Entry) {
     $data.PSObject.Properties.Remove('limits')
     if ($limits.Count) { $data | Add-Member -NotePropertyName limits -NotePropertyValue ([pscustomobject]$limits) }
     Write-AtomicJson $path $data
+}
+
+function Clear-ChosenImplementerLimit([string] $Checkout, [string] $Implementer, [bool] $Failover, [bool] $FromAuto) {
+    # The human choosing a tool explicitly says its limit has reset (#24). A tool the router chose says nothing of
+    # the kind: the router only offers tools without a recorded limit, and a failover never clears one.
+    if ($Implementer -and -not $Failover -and -not $FromAuto) { Set-ImplementerLimit $Checkout $Implementer $null }
 }
 
 function Get-PaneLimit([string] $Text, [string] $Tool) {
@@ -1447,14 +1685,27 @@ function Confirm-PaneStable([string] $Checkout, [string] $Pane, [string] $Tool, 
     }
 }
 
+function Resolve-FailoverOrder($Order, $Roster) {
+    <# failoverOrder as entries (lib/roster.py resolve_order): a roster id is its entry, with its model; a tool
+       name that is no roster id is the bare tool, with no model (today's behaviour: claudeImplementerModel and
+       each tool's own default stay in charge). #>
+    foreach ($item in @($Order)) {
+        $entry = Get-RosterEntry $Roster ([string]$item)
+        if ($entry) { $entry } else { [pscustomobject]@{ id = [string]$item; tool = [string]$item; bare = $true } }
+    }
+}
+
 function Get-FailoverTarget {
-    <# The tool a -Failover switches to (#65): the first in failoverOrder that is not the limited one,
-       has no recorded limit, and - for kimi - is usable (Get-KimiProblem, with the checkout). -NoProbe
-       (the dry run) leaves out only `kimi doctor`, which would run kimi. Returns @{ Target; Reasons }, Target $null when no tool qualifies. #>
+    <# The tool a -Failover switches to (#65): the first element of failoverOrder (a tool, or a roster id, #109)
+       whose tool is not the limited one, has no recorded limit and - for kimi - is usable (Get-KimiProblem,
+       with the checkout). A limited claude-sonnet never fails over to claude-opus: limits are per tool.
+       -NoProbe (the dry run) leaves out only `kimi doctor`, which would run kimi. Returns @{ Target; Entry;
+       Reasons }, Target $null when nothing qualifies; Entry is the roster entry (its model is what gets saved). #>
     param([string] $Checkout, $Config, [string] $Saved, [switch] $NoProbe)
     $recorded = Get-ImplementerLimits $Checkout
     $reasons = @()
-    foreach ($tool in @($Config.failoverOrder)) {
+    foreach ($entry in @(Resolve-FailoverOrder $Config.failoverOrder $Config.implementerRoster)) {
+        $tool = [string]$entry.tool
         if ($tool -eq $Saved) { continue }
         if ($recorded.ContainsKey($tool)) {
             $reasons += "$tool was recorded limited at $($recorded[$tool].at) ('$($recorded[$tool].line)'). Once it has reset, the human clears that with: github-workbench <issue> -Implementer $tool"
@@ -1464,15 +1715,16 @@ function Get-FailoverTarget {
             $problem = Get-KimiProblem -Config $Config -Checkout $Checkout -NoDoctor:$NoProbe
             if ($problem) { $reasons += "kimi is not usable: $problem"; continue }
         }
-        return @{ Target = $tool; Reasons = $reasons }
+        return @{ Target = $tool; Entry = $entry; Reasons = $reasons }
     }
     if (-not $reasons.Count) { $reasons = @("failoverOrder ($(@($Config.failoverOrder) -join ', ')) names no tool but $Saved") }
-    return @{ Target = $null; Reasons = $reasons }
+    return @{ Target = $null; Entry = $null; Reasons = $reasons }
 }
 
 function Invoke-Failover {
     <# Stops a limited implementer (only when it is provably idle at its limit) or accepts an exited
-       one, records the limit, clears the pane, and returns the tool to switch to. A refusal is an
+       one, records the limit, clears the pane, and returns @{ Tool; Entry }: the tool to switch to and the entry it
+       came from (#109; `bare` for a tool name, a roster entry with its model otherwise). A refusal is an
        [ImplementerConflict] (exit 2) and happens before anything is stopped or written. A failure
        after that point is a [FailoverIncomplete] (exit 3): the human relaunches with -Implementer. #>
     param([string] $Checkout, $Config, $Tree)
@@ -1482,6 +1734,9 @@ function Invoke-Failover {
     $choice = Get-FailoverTarget -Checkout $Checkout -Config $Config -Saved $saved
     if (-not $choice.Target) { throw [ImplementerConflict]::new("failover refused: $($choice.Reasons -join '; ')") }
     $target = $choice.Target
+    # What the human types to finish a failover that could not: the tool, and the entry's model when it has one.
+    $relaunch = "-Implementer $target"
+    if ($choice.Entry.model) { $relaunch += " -ImplementerModel $($choice.Entry.model)" }
     $pane = $null
     $registryPath = Join-Path $Checkout '.workbench\state\agents.json'
     if (Test-Path -LiteralPath $registryPath) {
@@ -1523,7 +1778,7 @@ function Invoke-Failover {
             throw [FailoverIncomplete]::new("${incomplete}: the pane showed no shell prompt within $($script:FailoverTiming.ShellWait)s")
         }
         if (Test-Path -LiteralPath $lock) {
-            throw [FailoverIncomplete]::new("${incomplete}: '$lock' appeared while it was being stopped. It was not deleted: check the repository, then run github-workbench <issue> -Implementer $target")
+            throw [FailoverIncomplete]::new("${incomplete}: '$lock' appeared while it was being stopped. It was not deleted: check the repository, then run github-workbench <issue> $relaunch")
         }
     } else { $incomplete = 'failover could not switch' }
     $line = $seen.line
@@ -1536,10 +1791,10 @@ function Invoke-Failover {
     if ($script:OnAgterm) { $clear = 'clear' }
     Invoke-Ctl session type "$clear`n" --target $pane | Out-Null
     if (-not (Wait-ShellPrompt -Pane $pane -TimeoutSeconds $script:FailoverTiming.ShellWait -Adopted)) {
-        throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> -Implementer $target once it is")
+        throw [FailoverIncomplete]::new("${incomplete}: the pane is not a clean shell after Clear-Host; run github-workbench <issue> $relaunch once it is")
     }
     Write-Step "failover: $saved -> $target"
-    return $target
+    return @{ Tool = $target; Entry = $choice.Entry }
 }
 
 function Get-ImplementerName([string] $Tool) {
@@ -2344,7 +2599,7 @@ function Format-AdoptedBlock([string] $Checkout, [string] $Issue) {
 function Invoke-LauncherBody {
     param([string] $Issue, [string] $Repo, [switch] $DryRun, [switch] $Yes, [switch] $NoRelay, [switch] $NewSession,
           [string] $Implementer, $AutoMerge = $null, [switch] $Failover, $Autonomous = $null, [string] $RevmuxProfile,
-          $BigReview = $null, [string] $OnLimit)
+          $BigReview = $null, [string] $OnLimit, [string] $ImplementerModel, [string] $RosterId)
     $script:Launch.ClaudeHerePending = $false
     $script:Launch.ExitCode = 0
     $script:Launch.NewSession = [bool]$NewSession
@@ -2416,6 +2671,16 @@ function Invoke-LauncherBody {
     }
     $hubDir = Join-Path $co.Dir '.workbench'
     $script:Launch.Checkout = $co.Dir
+    $autoChosen = ($Implementer -eq 'auto')
+    if ($autoChosen) {
+        # The router's choice (#109) is made once, here, outside the checkout lock (a model call takes a while):
+        # it becomes an ordinary -Implementer <tool> -ImplementerModel <model> with the roster id it came from.
+        Set-LaunchStage route
+        $routed = Resolve-AutoImplementer -Checkout $co.Dir -Repo $ref.Repo -Number $ref.Number -DryRun:$DryRun
+        $Implementer = $routed.Tool
+        $ImplementerModel = $routed.Model
+        $RosterId = $routed.RosterId
+    }
 
     $claudeLaunch = Get-PaneLaunch 'pane-claude.ps1' @{ Checkout = $co.Dir; Issue = $issueRef }
     # The right pane's commands depend on the implementer tool, which is resolved under the checkout
@@ -2436,7 +2701,7 @@ function Invoke-LauncherBody {
     }
     if ($DryRun) {
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -NoProbe -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
-            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview -RequestedOnLimit $OnLimit
+            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview -RequestedOnLimit $OnLimit -RequestedModel $ImplementerModel -RequestedRosterId $RosterId
         $codexLaunch = (& $implementerLines $resolved.Tool).Launch
         if ($adoptionPlan) {
             Write-Step "would $($adoptionPlan.Mode) session '$($adoptionPlan.Session.id)' as '#$($ref.Number) $slug' in workspace '$workspaceName'"
@@ -2446,14 +2711,18 @@ function Invoke-LauncherBody {
             Write-Step "would open session '#$($ref.Number) $slug' in workspace '$workspaceName'"
             Write-Step "left pane:  $claudeLaunch"
         }
-        Write-Step "implementer: $($resolved.Tool) (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous); big review $(Format-AutoMerge $resolved.BigReview); on limit $($resolved.OnLimit)"
+        $modelNote = ''
+        if ($resolved.Model) { $modelNote = " model $($resolved.Model)" }
+        Write-Step "implementer: $($resolved.Tool)$modelNote (revmux profile $($resolved.RevmuxProfile)); auto-merge $(Format-AutoMerge $resolved.AutoMerge); autonomous $(Format-AutoMerge $resolved.Autonomous); big review $(Format-AutoMerge $resolved.BigReview); on limit $($resolved.OnLimit)"
         if ($resolved.Conflict) { Write-Step "would refuse unless the right pane is a shell: $($resolved.Conflict)" }
         if ($Failover) {
             $choice = Get-FailoverTarget -Checkout $co.Dir -Config $config -Saved $resolved.Tool -NoProbe
             if ($choice.Target) {
                 $probe = ''
                 if ($choice.Target -eq 'kimi') { $probe = " (kimi's other checks pass; a real failover also runs 'kimi doctor' first)" }
-                Write-Step "failover: would check the right pane, stop the limited $($resolved.Tool) only if it is idle at its limit (or accept a shell), record the limit, clear the pane, then switch to $($choice.Target)$probe"
+                $entryNote = ''
+                if ($choice.Entry.model) { $entryNote = " ($($choice.Entry.id), model $($choice.Entry.model))" }
+                Write-Step "failover: would check the right pane, stop the limited $($resolved.Tool) only if it is idle at its limit (or accept a shell), record the limit, clear the pane, then switch to $($choice.Target)$entryNote$probe"
                 foreach ($reason in $choice.Reasons) { Write-Step "failover: skipping $reason" }
             } else {
                 Write-Step "failover: would refuse: $($choice.Reasons -join '; ')"
@@ -2486,11 +2755,19 @@ function Invoke-LauncherBody {
         Set-LaunchStage implementer
         if ($Failover) {
             Set-LaunchStage failover
-            $Implementer = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
+            $failedOver = Invoke-Failover -Checkout $co.Dir -Config $config -Tree (Get-Tree)
+            $Implementer = $failedOver.Tool
+            # A roster id in failoverOrder carries its model and id (#109); a bare tool name has neither.
+            $ImplementerModel = ''
+            $RosterId = ''
+            if (-not $failedOver.Entry.bare) {
+                $RosterId = [string]$failedOver.Entry.id
+                if ($failedOver.Entry.model) { $ImplementerModel = [string]$failedOver.Entry.model }
+            }
             Set-LaunchStage implementer
         }
         $resolved = Resolve-Implementer -Checkout $co.Dir -Requested $Implementer -Config $config -Tree (Get-Tree) -RequestedAutoMerge $AutoMerge -RequestedAutonomous $Autonomous `
-            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview -RequestedOnLimit $OnLimit
+            -RequestedRevmuxProfile $RevmuxProfile -RequestedBigReview $BigReview -RequestedOnLimit $OnLimit -RequestedModel $ImplementerModel -RequestedRosterId $RosterId
         if ($resolved.Conflict) { throw [ImplementerConflict]::new($resolved.Conflict) }
         # Kimi is checked before anything is recorded, so a refusal changes nothing (#65). A failover
         # to kimi checked it before it stopped the limited agent.
@@ -2503,7 +2780,7 @@ function Invoke-LauncherBody {
         }
         Save-Implementer $co.Dir $resolved
         # The human choosing a tool explicitly says its limit has reset (#24).
-        if ($Implementer -and -not $Failover) { Set-ImplementerLimit $co.Dir $Implementer $null }
+        Clear-ChosenImplementerLimit $co.Dir $Implementer ([bool]$Failover) $autoChosen
         $script:Launch.ImplementerTool = $resolved.Tool
         $lines = & $implementerLines $resolved.Tool
         $codexLaunch = $lines.Launch

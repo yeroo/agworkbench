@@ -22,6 +22,12 @@ import cleanup
 import tslog
 import wb
 
+def tool_route(data):
+    """(the tool a launch is routed to, pause reason): conductor.route_entry's entry, tool only."""
+    entry, reason = q.route_entry(data)
+    return (entry['tool'] if entry else None), reason
+
+
 REAL_FREE_BYTES = q.free_bytes          # QueueCase patches it; the real one is tested on its own
 REAL_FREE_RAM = q.free_ram
 
@@ -34,12 +40,16 @@ class QueueCase(unittest.TestCase):
         self.config = self.root / 'config.json'
         self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones')}))
         self.enterContext(patch.dict(os.environ, {'AGWORKBENCH_CONFIG': str(self.config),
-                                                 'AGWINTERM_ENABLED': '1', 'AGWINTERM_SESSION_ID': str(uuid.uuid4())}))
+                                                 'AGWINTERM_ENABLED': '1', 'AGWINTERM_SESSION_ID': str(uuid.uuid4()),
+                                                 'AGWORKBENCH_ROUTE_OUTCOMES': str(self.root / 'route-outcomes.jsonl'),
+                                                 'AGWORKBENCH_ROUTE_ROOT': str(self.root / 'route')}))
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.requests = []
         self.enterContext(patch.object(q.agw, 'request', self.terminal))
         self.enterContext(patch.object(q.agw, 'notify'))
         self.enterContext(patch.object(q.agw, 'set_status'))
+        # #109: a merged or closed member's outcome goes to the router's statistics: not to the real file, no gh.
+        self.outcomes = self.enterContext(patch.object(q.router, 'record_outcome', return_value=None))
         # The in-hand lookups (#28) call gh and the terminal; queue mechanics tests assume none in hand.
         self.real_in_hand = q.in_hand
         self.in_hand = self.enterContext(patch.object(q, 'in_hand', return_value={}))
@@ -2418,9 +2428,9 @@ class LimitWait(unittest.TestCase):
 
     def test_a_wait_queue_never_routes_to_another_tool(self):
         limits = {'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1}}
-        self.assertEqual((None, None), q.tool_route({'config': str(self.config), 'onLimit': 'wait',
+        self.assertEqual((None, None), tool_route({'config': str(self.config), 'onLimit': 'wait',
                                                     'implementer': 'codex', 'toolLimits': limits}))
-        self.assertEqual(('claude', None), q.tool_route({'config': str(self.config), 'onLimit': 'failover',
+        self.assertEqual(('claude', None), tool_route({'config': str(self.config), 'onLimit': 'failover',
                                                         'implementer': 'codex', 'toolLimits': limits}))
 
     def test_a_review_limit_waits_too(self):
@@ -2475,15 +2485,17 @@ class ToolLimits(unittest.TestCase):
 
     def setUp(self):
         QueueCase.setUp(self)
-        self.implementers, self.profiles = [], []
+        self.implementers, self.profiles, self.models = [], [], []
         self.start('o/r#1,2,3', parallel=1)
         self.w = self.worker()
         self.w.notify, self.w.status = Mock(), Mock()
         self.w.tick(); self.w.tick()               # #1 active
         self.implementers.clear()
+        self.models.clear()
 
     def spawn(self, data, m):
         self.implementers.append((m['number'], data.get('implementer')))
+        self.models.append((m['number'], data.get('implementerModel'), data.get('rosterId')))
         self.profiles.append((m['number'], data.get('revmuxProfile')))
         return QueueCase.spawn(self, data, m)
 
@@ -2511,6 +2523,26 @@ class ToolLimits(unittest.TestCase):
         limit = self.store.load()['toolLimits']['codex']
         self.assertEqual(('warning', 1), (limit['kind'], limit['member']))
         self.assertNotIn('implementer', self.store.load())          # the queue's setting stays the human's
+
+    def test_a_failover_to_a_bare_tool_pins_no_model_and_no_roster_id(self):
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        self.assertEqual([(2, None, None)], self.models)           # claudeImplementerModel stays in charge
+
+    def test_a_failover_to_a_roster_id_carries_its_model_and_id(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'failoverOrder': ['claude-opus', 'kimi']}))
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'claude')], self.implementers)
+        self.assertEqual([(2, 'claude-opus-5-5', 'claude-opus')], self.models)
+
+    def test_a_failover_to_the_kimi_entry_keeps_its_roster_id(self):
+        self.config.write_text(json.dumps({'checkoutRoot': str(self.root / 'clones'), 'failoverOrder': ['kimi', 'claude']}))
+        self.record(1)
+        self.next_member()
+        self.assertEqual([(2, 'kimi')], self.implementers)
+        self.assertEqual([(2, None, 'kimi')], self.models)
 
     def test_a_relay_episode_is_read_by_its_tool_not_its_box(self):
         self.record(1, tool='claude', kind='limited', relay=True)   # a Claude implementer in the codex box
@@ -2561,31 +2593,31 @@ class ToolLimits(unittest.TestCase):
         self.record(1)                                               # codex limited
         self.next_member()
         self.assertEqual([(2, 'kimi')], self.implementers)
-        self.assertEqual(('kimi', None), q.tool_route({'config': str(self.config), 'toolLimits': {
+        self.assertEqual(('kimi', None), tool_route({'config': str(self.config), 'toolLimits': {
             'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1}}}))
         both = {'config': str(self.config), 'toolLimits': {
             'codex': {'kind': 'limited', 'member': 1, 'line': 'x', 'at': 1},
             'kimi': {'kind': 'limited', 'member': 2, 'line': 'y', 'at': 2}}}
-        self.assertEqual(('claude', None), q.tool_route(both))
+        self.assertEqual(('claude', None), tool_route(both))
         self.config.write_text(json.dumps({'failoverOrder': ['codex', 'kimi']}))
-        route, reason = q.tool_route(both)
+        route, reason = tool_route(both)
         self.assertIsNone(route)
         self.assertIn('no tool in failoverOrder', reason)
         for bad in (['codex'], ['codex', 'codex'], ['codex', 'aider'], 'codex,claude'):
             with self.subTest(order=bad):
                 self.config.write_text(json.dumps({'failoverOrder': bad}))
-                route, reason = q.tool_route(both)
+                route, reason = tool_route(both)
                 self.assertIsNone(route)
                 self.assertIn('failoverOrder', reason)
 
     def test_the_default_order_keeps_codex_and_claude_as_before(self):
         limits = lambda *tools: {'config': str(self.config), 'toolLimits': {
             tool: {'kind': 'limited', 'member': 1, 'line': tool, 'at': 1} for tool in tools}}
-        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
-        self.assertIn('planner is always Claude', q.tool_route(limits('claude'))[1])
-        self.assertEqual((None, None), q.tool_route(limits('kimi')))    # a codex queue ignores a kimi limit
+        self.assertEqual(('claude', None), tool_route(limits('codex')))
+        self.assertIn('planner is always Claude', tool_route(limits('claude'))[1])
+        self.assertEqual((None, None), tool_route(limits('kimi')))    # a codex queue ignores a kimi limit
         self.config.write_text(json.dumps({'failoverOrder': None}))      # null is the default too (FIX r1 m3)
-        self.assertEqual(('claude', None), q.tool_route(limits('codex')))
+        self.assertEqual(('claude', None), tool_route(limits('codex')))
 
     def test_clear_limit_and_implementer_accept_kimi(self):
         self.record(1, tool='kimi', kind='limited', relay=True)
@@ -3891,3 +3923,339 @@ class Timestamps(unittest.TestCase):
                                     '--pr', 'https://github.com/o/r/pull/9']))
         self.install.assert_not_called()
         self.assertEqual('marked #1 PR https://github.com/o/r/pull/9\n', sys.stdout.getvalue())
+
+
+class AutoRouting(unittest.TestCase):
+    """#109: `-Implementer auto` is a saved queue setting; the conductor asks the router once per member."""
+    terminal, start, gh, member, report = (QueueCase.terminal, QueueCase.start, QueueCase.gh, QueueCase.member, QueueCase.report)
+    ANSWER = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='workhorse', rule='default-code',
+                  source='router')
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.spawned, self.routed, self.answers = [], [], {}
+        self.start('o/r#1,2,3', parallel=1, implementer='auto')
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+
+    def worker(self):
+        return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now,
+                        spawn=self.spawn, route=self.route)
+
+    def route(self, repo, number, settings, limited):
+        self.routed.append((number, tuple(limited)))
+        outcome = self.answers.get(number, self.ANSWER)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return dict(outcome)
+
+    def spawn(self, data, m):
+        self.spawned.append((m['number'], data.get('implementer'), data.get('implementerModel'), data.get('rosterId')))
+        return QueueCase.spawn(self, data, m)
+
+    def settings(self, **extra):
+        self.config.write_text(json.dumps(dict({'checkoutRoot': str(self.root / 'clones')}, **extra)))
+
+    def limit(self, tool, member=1):
+        with self.store.transaction() as data:
+            data.setdefault('toolLimits', {})[tool] = {'kind': 'limited', 'member': member, 'line': f'{tool} limited', 'at': 1}
+
+    def test_auto_is_a_saved_queue_setting_and_other_values_are_refused(self):
+        self.assertEqual('auto', self.store.load()['implementer'])
+        with self.assertRaises(q.UsageError):
+            self.start('o/r#1', implementer='aider')
+        data = json.loads(self.store.path.read_text())
+        data['implementer'] = 'aider'
+        self.store.path.write_text(json.dumps(data))
+        with self.assertRaises(q.StateError):
+            self.store.load()
+
+    def test_each_member_is_routed_once_recorded_and_launched_with_its_tool_and_model(self):
+        self.w.tick(); self.w.tick()
+        self.assertEqual([(1, ())], self.routed)
+        self.assertEqual([(1, 'codex', 'gpt-6.1-sol', 'codex-sol')], self.spawned)
+        route = self.member(1)['route']
+        self.assertEqual(('codex-sol', 'workhorse', 'default-code', 'router'),
+                         (route['implementer'], route['reason'], route['rule'], route['source']))
+        self.assertEqual('auto', self.store.load()['implementer'])           # the queue's setting stays auto
+        self.report(1, 'pr-open')
+        self.answers[2] = dict(self.ANSWER, implementer='kimi', tool='kimi', source='label')
+        self.answers[2].pop('model')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([(1, ()), (2, ())], self.routed)
+        self.assertEqual((2, 'kimi', None, 'kimi'), self.spawned[-1])
+
+    def test_a_restart_or_retry_does_not_route_again(self):
+        self.w.tick(); self.w.tick()
+        with self.store.transaction() as data:
+            m = q.find_member(data, 1)
+            m.update(state='pending', slotReleased=False)
+        self.worker().tick(); self.worker().tick()
+        self.assertEqual([(1, ())], self.routed)
+        self.assertEqual(2, len(self.spawned))
+        self.assertEqual(self.spawned[0][1:], self.spawned[1][1:])
+
+    def test_a_routed_tool_that_has_since_been_limited_is_routed_once_more(self):
+        self.w.tick(); self.w.tick()
+        with self.store.transaction() as data:
+            q.find_member(data, 1).update(state='pending', slotReleased=False)
+        self.limit('codex')
+        self.answers[1] = dict(self.ANSWER, implementer='claude-sonnet', tool='claude', model='claude-sonnet-5-5')
+        self.worker().tick(); self.worker().tick()
+        self.assertEqual([(1, ()), (1, ('codex',))], self.routed)
+        self.assertEqual('claude-sonnet', self.member(1)['route']['implementer'])
+        self.assertEqual((1, 'claude', 'claude-sonnet-5-5', 'claude-sonnet'), self.spawned[-1])
+
+    def test_a_router_failure_defers_the_member_like_any_launch_deferral(self):
+        self.answers[1] = __import__('route').RouteError('the router chose nothing usable')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([], self.spawned)
+        member = self.member(1)
+        self.assertEqual('pending', member['state'])
+        self.assertIn('launch deferred: route: the router chose nothing usable', member['reason'])
+        self.assertNotIn('route', member)
+        self.assertEqual(1, self.store.load()['launchBackoff']['failures'])
+        self.assertEqual(1, self.store.load()['launchBackoff']['member'])
+
+    def test_a_queue_that_waits_limits_out_routes_around_nothing(self):
+        with self.store.transaction() as data:
+            data['onLimit'] = 'wait'
+        self.limit('kimi')
+        self.limit('codex')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([(1, ())], self.routed)                          # the router is told of no limit
+        with self.store.transaction() as data:
+            q.find_member(data, 1).update(state='pending', slotReleased=False)
+        self.worker().tick(); self.worker().tick()
+        self.assertEqual([(1, ())], self.routed)                          # and the codex choice is not dropped
+        self.assertEqual('codex-sol', self.member(1)['route']['implementer'])
+        self.assertEqual((None, None), q.route_entry(self.limits('codex', 'kimi', implementer='auto', onLimit='wait')))
+
+    def test_the_router_is_told_which_tools_are_limited(self):
+        self.limit('kimi')
+        self.w.tick(); self.w.tick()
+        self.assertEqual([(1, ('kimi',))], self.routed)
+
+    def test_the_launcher_gets_the_tool_the_model_and_the_roster_id(self):
+        data = dict(self.store.load(), implementer='codex', implementerModel='gpt-6.1-sol', rosterId='codex-sol')
+        worker = q.Worker(self.store, data['owner']['token'], gh=self.gh, clock=lambda: self.now)
+        real_which = shutil.which
+        with patch.object(q.subprocess, 'Popen') as popen, patch.object(
+                q.shutil, 'which', side_effect=lambda n, *a, **k: '/usr/bin/pwsh' if n == 'pwsh' else real_which(n, *a, **k)):
+            job = worker.spawn_launcher(data, dict(self.member(1), token=str(uuid.uuid4())))
+        job['stream'].close()
+        args = popen.call_args.args[0]
+        self.assertEqual(['-Implementer', 'codex', '-ImplementerModel', 'gpt-6.1-sol', '-RosterId', 'codex-sol'],
+                         args[args.index('-Implementer'):args.index('-Implementer') + 6])
+
+    # tool_route (#61) with the roster (#109)
+
+    def limits(self, *tools, **extra):
+        return dict({'config': str(self.config), 'toolLimits': {
+            t: {'kind': 'limited', 'member': 1, 'line': t, 'at': 1} for t in tools}}, **extra)
+
+    def test_an_auto_queue_routes_nothing_by_tool_unless_every_roster_entry_is_limited(self):
+        self.assertEqual((None, None), tool_route(self.limits('codex', implementer='auto')))
+        self.assertEqual((None, None), tool_route(self.limits('codex', 'kimi', implementer='auto')))
+        self.settings(implementerRoster=[{'id': 'only', 'tool': 'codex', 'note': 'x'}, {'id': 'k', 'tool': 'kimi', 'note': 'y'}])
+        route, reason = tool_route(self.limits('codex', 'kimi', implementer='auto'))
+        self.assertIsNone(route)
+        self.assertIn('every implementerRoster entry is on a limited tool', reason)
+        self.settings(implementerRoster=[{'id': 'only', 'tool': 'codex', 'note': 'x'}])
+        self.assertIn('every implementerRoster entry', tool_route(self.limits('codex', implementer='auto'))[1])
+        self.assertIn('planner is always Claude', tool_route(self.limits('claude', implementer='auto'))[1])
+
+    def test_failover_order_may_name_roster_ids_and_the_chosen_entry_carries_its_model(self):
+        self.settings(failoverOrder=['claude-opus', 'codex', 'kimi'])
+        entry, reason = q.route_entry(self.limits('codex', implementer='codex'))
+        self.assertEqual(('claude-opus', 'claude', 'claude-opus-5-5', None), (entry['id'], entry['tool'], entry['model'], reason))
+        self.assertEqual(('claude', None), tool_route(self.limits('codex', implementer='codex')))
+
+    def test_a_limited_tool_is_not_replaced_by_another_entry_of_the_same_tool(self):
+        self.settings(failoverOrder=['claude-sonnet', 'claude-opus', 'codex-luna', 'kimi'])
+        entry, _ = q.route_entry(self.limits('claude', implementer='claude'))
+        self.assertIsNone(entry)                                   # claude limited: the planner cannot run
+        entry, _ = q.route_entry(self.limits('codex', implementer='codex'))
+        self.assertEqual('claude-sonnet', entry['id'])        # the order names the id itself
+
+    def test_a_bare_tool_in_the_order_is_the_bare_tool_with_no_model_and_no_roster_id(self):
+        entry, _ = q.route_entry(self.limits('codex', implementer='codex'))
+        self.assertEqual(('claude', True, None), (entry['id'], entry.get('bare'), entry.get('model')))
+        self.settings(failoverOrder=['codex', 'kimi'])
+        entry, _ = q.route_entry(self.limits('codex', implementer='codex'))
+        self.assertEqual(('kimi', None, None), (entry['id'], entry.get('bare'), entry.get('model')))   # kimi is a roster id
+
+    def test_an_invalid_failover_order_or_roster_is_a_pause_reason(self):
+        for settings in ({'failoverOrder': ['codex', 'nobody']}, {'failoverOrder': ['claude-sonnet', 'claude-opus']},
+                         {'implementerRoster': []}):
+            with self.subTest(settings=settings):
+                self.settings(**settings)
+                route, reason = tool_route(self.limits('codex', implementer='codex'))
+                self.assertIsNone(route)
+                self.assertRegex(reason, 'failoverOrder|implementerRoster')
+
+    def default_worker(self):
+        """A worker whose `route` is left at its default: Worker.route_issue, over a patched router."""
+        return q.Worker(self.store, self.store.load()['owner']['token'], gh=self.gh, clock=lambda: self.now,
+                        spawn=self.spawn)
+
+    def test_the_default_route_asks_the_router_to_write_the_label_and_launches(self):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER)) as ask:
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual(('o/r', 1), ask.call_args.args)
+        self.assertEqual((True, []), (ask.call_args.kwargs['label'], ask.call_args.kwargs['limited']))
+        self.assertEqual([(1, 'codex', 'gpt-6.1-sol', 'codex-sol')], self.spawned)
+
+    def test_the_label_is_written_for_a_router_answer(self):
+        calls, patched = self.default_route_with(['priority:P2'])
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual([('label', 'create', 'impl:claude-sonnet')], [c[:3] for c in calls if c[0] == 'label'])
+        self.assertEqual(1, len(self.spawned))
+
+    def test_no_label_is_written_for_an_owner_label(self):
+        calls, patched = self.default_route_with(['impl:codex-luna'])
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual([], [c for c in calls if c[0] in ('label', 'issue')])
+        self.assertEqual('label', self.member(1)['route']['source'])
+        self.assertEqual((1, 'codex', 'gpt-6-luna', 'codex-luna'), self.spawned[0])
+
+    def test_a_label_that_cannot_be_written_never_stops_the_launch(self):
+        with patch.object(q.router, 'route_issue', return_value=dict(self.ANSWER, warnings=['the impl: label was not written: denied'])):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual(1, len(self.spawned))
+        self.assertEqual('codex-sol', self.member(1)['route']['implementer'])
+
+    def default_route_with(self, issue_labels):
+        """Worker.route_issue over the real router.route_issue with a fake gh and a fake model: the issue
+        carries `issue_labels`, the model answers claude-sonnet. Returns (gh calls, the patched context)."""
+        calls = []
+        real = q.router.route_issue
+        issue = {'number': 1, 'title': 't', 'body': 'b', 'state': 'open', 'labels': [{'name': n} for n in issue_labels],
+                 'author_association': 'OWNER'}
+
+        def gh(*args, timeout=120):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, json.dumps(issue) if args[0] == 'api' else '', '')
+
+        def model(argv, cwd):
+            answer = dict(implementer='claude-sonnet', reason='fine', rule='default-code')
+            return subprocess.CompletedProcess(argv, 0, json.dumps({'is_error': False, 'structured_output': answer}), '')
+        patched = patch.object(q.router, 'route_issue', side_effect=lambda *a, **k: real(*a, gh=gh, model=model, records=[], **k))
+        return calls, patched
+
+    def route_again(self, route_record, issue_labels, own=None):
+        """Route member 1 once, then make its recorded choice `route_record`, limit codex and route again.
+        `own` is the id the router is recorded to have written on the issue (route-labels.jsonl)."""
+        calls, patched = self.default_route_with(issue_labels)
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+            with self.store.transaction() as data:
+                m = q.find_member(data, 1)
+                m.update(state='pending', slotReleased=False, route=route_record)
+            if own:
+                q.router.record_label('o/r', 1, own)
+            self.limit('codex')
+            calls.clear()
+            w = self.default_worker()
+            w.tick(); w.tick()
+        return calls, w
+
+    def test_a_re_route_after_a_limit_replaces_the_routers_own_stale_label(self):
+        record = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='r', rule='x', source='router')
+        calls, _ = self.route_again(record, ['impl:codex-sol'], own='codex-sol')
+        self.assertEqual('claude-sonnet', self.member(1)['route']['implementer'])
+        edit = next(c for c in calls if c[:2] == ('issue', 'edit'))
+        self.assertEqual(['--add-label', 'impl:claude-sonnet', '--remove-label', 'impl:codex-sol'], list(edit[edit.index('--add-label'):]))
+        self.assertEqual('claude', self.spawned[-1][1])
+
+    def test_a_deferred_re_route_is_still_routable_on_the_next_attempt(self):
+        record = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='r', rule='x', source='router')
+        calls, patched = self.default_route_with(['impl:codex-sol'])
+        with patched:
+            w = self.default_worker()
+            w.tick(); w.tick()
+            with self.store.transaction() as data:
+                q.find_member(data, 1).update(state='pending', slotReleased=False, route=record)
+            q.router.record_label('o/r', 1, 'codex-sol')
+            self.limit('codex')
+        with patch.object(q.router, 'route_issue', side_effect=q.router.RouteError('no claude')):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertIsNone(self.member(1).get('route'))
+        self.assertIn('launch deferred: route: no claude', self.member(1)['reason'])
+        with patched:                                                  # the router is back: the same stale label is no order
+            self.now += 3600
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual('claude-sonnet', self.member(1)['route']['implementer'])
+
+    def test_a_subprocess_timeout_of_the_router_defers_instead_of_aborting_the_tick(self):
+        with patch.object(q.router, 'route_issue', side_effect=subprocess.TimeoutExpired('gh', 1)):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual([], self.spawned)
+        self.assertIn('launch deferred: route:', self.member(1)['reason'])
+
+    def test_a_re_route_of_an_owners_label_on_a_limited_tool_defers(self):
+        record = dict(implementer='codex-sol', tool='codex', model='gpt-6.1-sol', reason='r', rule='x', source='label')
+        _, w = self.route_again(record, ['impl:codex-sol'])           # no router record: the owner's label
+        member = self.member(1)
+        self.assertEqual('pending', member['state'])
+        self.assertIn('usage limit', member['reason'])
+
+    def test_a_router_error_of_the_default_route_defers_the_member(self):
+        with patch.object(q.router, 'route_issue', side_effect=q.router.RouteError('no claude')):
+            w = self.default_worker()
+            w.tick(); w.tick()
+        self.assertEqual([], self.spawned)
+        self.assertIn('launch deferred: route: no claude', self.member(1)['reason'])
+
+
+class OutcomeRecording(unittest.TestCase):
+    """#109: a member that merged or closed hands its loop's outcome to the router's statistics, once."""
+    terminal, start, gh, spawn, worker, member = (QueueCase.terminal, QueueCase.start, QueueCase.gh, QueueCase.spawn,
+                                                  QueueCase.worker, QueueCase.member)
+
+    def setUp(self):
+        QueueCase.setUp(self)
+        self.start('o/r#1,2')
+        self.w = self.worker()
+        self.w.notify, self.w.status = Mock(), Mock()
+        self.w.tick(); self.w.tick()
+
+    def finish(self, n, state, pr=None):
+        with self.store.transaction() as data:
+            q.find_member(data, n).update(state=state, slotReleased=True, pr=pr, phase='pr-open' if pr else 'closed')
+
+    def test_a_merged_member_is_recorded_once_with_its_pr_while_the_checkout_exists(self):
+        self.finish(1, 'merged', 'https://github.com/o/r/pull/7')
+        self.w.tick()
+        self.outcomes.assert_called_once()
+        args, kwargs = self.outcomes.call_args
+        self.assertEqual((self.member(1)['checkout'], 'merged', 7), (str(args[0]), args[1], kwargs['pr']))
+        self.assertTrue(self.member(1)['outcomeRecorded'])
+        self.w.tick(); self.w.tick()
+        self.outcomes.assert_called_once()
+
+    def test_an_issue_closed_without_a_pr_is_a_closed_outcome_and_live_members_record_nothing(self):
+        self.finish(1, 'closed')
+        self.w.tick()
+        self.assertEqual([(self.member(1)['checkout'], 'closed')], [(str(c.args[0]), c.args[1]) for c in self.outcomes.call_args_list])
+        self.assertNotIn('outcomeRecorded', self.member(2))
+
+    def test_a_checkout_that_is_already_gone_is_skipped_and_a_router_error_never_fails_the_tick(self):
+        self.finish(1, 'merged', 'https://github.com/o/r/pull/7')
+        shutil.rmtree(self.member(1)['checkout'])
+        self.w.tick()
+        self.outcomes.assert_not_called()
+        self.finish(2, 'merged', 'https://github.com/o/r/pull/8')
+        self.outcomes.side_effect = OSError('disk full')
+        self.w.tick()
+        self.assertIn('route outcomes', self.w.errors)
