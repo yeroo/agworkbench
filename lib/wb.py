@@ -1663,7 +1663,10 @@ def file_leftovers(root: Path, repo: str, args: argparse.Namespace, items: list[
               and i["key"] not in excluded]
     if not listed or not any(not i.get("url") or i.get("refresh") for i in listed):
         return
-    title = f"Leftovers from #{args.source}: {source_title}"
+    # A follow-up of a follow-up names the root issue's title once ("Leftovers from #974: X"), never
+    # a chain of prefixes ("Leftovers from #974: Leftovers from #948: Leftovers from #938: X").
+    root_title = re.sub(r"^(?:Leftovers from #\d+: )+", "", source_title)
+    title = f"Leftovers from #{args.source}: {root_title}"
     existing = find_leftovers(root, repo, args, items, pool, title)
     active = [i for i in listed if not i.get("url") or (existing and i.get("url") == existing["url"])]
     orphaned = [i for i in listed if i.get("refresh") and i not in active]
