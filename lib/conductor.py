@@ -379,7 +379,8 @@ HELPER_SESSION = re.compile(r'#\d+ (relay|revmux r\d+|your review)')
 
 def pr_reasons(repo, numbers, gh=gh_json):
     """{number: reason} for issues with an OPEN pull request: one that will close it (GitHub's
-    closing references), or one on the workbench's own `issue-<N>-*` branch in this repo."""
+    closing references), or one on the workbench's own `issue-<N>-*` branch in this repo - and for
+    issues GitHub marks "blocked by" a still-open issue."""
     reasons = {}
     pages = gh('api', f'repos/{repo}/pulls?state=open&per_page=100', '--paginate', '--slurp')
     wanted = set(numbers)
@@ -393,7 +394,8 @@ def pr_reasons(repo, numbers, gh=gh_json):
     for start in range(0, len(numbers), 100):
         chunk = numbers[start:start + 100]
         fields = ' '.join(f'i{n}: issue(number: {n}) {{ closedByPullRequestsReferences(first: 10, '
-                          f'includeClosedPrs: false) {{ nodes {{ number state }} }} }}' for n in chunk)
+                          f'includeClosedPrs: false) {{ nodes {{ number state }} }} '
+                          f'blockedBy(first: 10) {{ nodes {{ number state }} }} }}' for n in chunk)
         query = f'query {{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
         result = gh('api', 'graphql', '-f', f'query={query}')
         issues = ((result or {}).get('data') or {}).get('repository')
@@ -404,6 +406,12 @@ def pr_reasons(repo, numbers, gh=gh_json):
             open_prs = [node['number'] for node in nodes if node.get('state') == 'OPEN']
             if open_prs:
                 reasons.setdefault(n, f'pr: open PR #{open_prs[0]} will close it')
+            # GitHub's "blocked by" relation: an issue whose prerequisite is still open is not
+            # claimable - a loop would only find the prerequisite missing and close it unplanned.
+            blockers = (((issues.get(f'i{n}') or {}).get('blockedBy')) or {}).get('nodes') or []
+            open_blockers = sorted(node['number'] for node in blockers if node.get('state') == 'OPEN')
+            if open_blockers:
+                reasons.setdefault(n, 'blocked: by open ' + ', '.join(f'#{b}' for b in open_blockers))
     return reasons
 
 

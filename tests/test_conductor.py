@@ -1105,6 +1105,8 @@ class QueueBugs(unittest.TestCase):
             return [self.pulls]
         if args[:2] == ('api', 'graphql'):
             data = {f'i{n}': {'closedByPullRequestsReferences': {'nodes': nodes}} for n, nodes in self.closing.items()}
+            for n, nodes in getattr(self, 'blocked', {}).items():
+                data.setdefault(f'i{n}', {})['blockedBy'] = {'nodes': nodes}
             return {'data': {'repository': data}}
         raise AssertionError(args)
 
@@ -1129,6 +1131,14 @@ class QueueBugs(unittest.TestCase):
                 self.config.write_text(json.dumps({'bugLabel': bad}))
                 with self.assertRaises(q.UsageError):
                     self.start_bugs()
+
+    def test_an_issue_blocked_by_an_open_issue_is_skipped(self):
+        self.pulls = []
+        self.blocked = {2: [{'number': 560, 'state': 'OPEN'}], 3: [{'number': 77, 'state': 'CLOSED'}]}
+        self.start_bugs()
+        self.assertNotIn(2, self.members())
+        self.assertIn(3, self.members())                 # a closed blocker no longer blocks
+        self.assertIn('#2 skipped: blocked: by open #560', self.output())
 
     def test_each_in_hand_reason_is_skipped_and_reported(self):
         clones = self.root / 'clones'
