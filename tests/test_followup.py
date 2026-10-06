@@ -664,6 +664,15 @@ class Leftovers(unittest.TestCase):
     add = Dedupe.add
     file = Dedupe.file
     items = Dedupe.items
+    def test_a_follow_up_of_a_follow_up_names_the_root_title_once(self):
+        self.add('m0', title='Minor 0', own_issue=False, file='lib/x.py:1')
+        gh = FakeRepo()
+        gh.source_title = 'Leftovers from #948: Leftovers from #938: Terminal docxy pickers'
+        self.assertEqual(0, self.file(gh), self.err.getvalue())
+        titles = [i['title'] for i in gh.issues.values()]
+        self.assertIn('Leftovers from #27: Terminal docxy pickers', titles)
+        self.assertFalse([t for t in titles if t.count('Leftovers from') > 1])
+
     def test_four_minor_and_major_create_two_issues(self):
         for n in range(4):
             self.add(f'm{n}', title=f'Minor {n}', own_issue=False, file=f'lib/x.py:{n + 1}')

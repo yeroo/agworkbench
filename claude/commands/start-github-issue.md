@@ -67,6 +67,14 @@ all stop you exactly as they do without autonomy.
 With or without autonomy: a review that stops at a round with no Major (Phase 4) defers that
 round's remaining minors, and full autonomy defers more (above). Either way:
 
+**Fold before you file.** A follow-up issue is for work that does not belong in this PR, not
+for cheap fixes. Fix in this PR, rather than deferring, every Minor or Immaterial finding that
+stays inside the files the PR already changes and takes a few dozen lines at most. Defer only
+what is genuinely out of scope, needs its own design, or is large. When **this issue is itself a
+follow-up** (`follow-up` or `follow-up-nested` label, or a `Leftovers from` title), fold every
+Minor or Immaterial finding you can into this PR. Defer only the ones that cannot be fixed here,
+and prefer `--own-issue` for those over another leftovers checklist, so leftovers never chain.
+
 Follow-ups are recorded as you go, and filed before the merge. For every finding you defer, and
 (under autonomy) for every "Out of scope" or "Follow-up" item in the agreed plan, record one item:
 
@@ -375,6 +383,29 @@ gh issue view <N> --repo <owner/repo> --json number,title,body,labels,comments,u
 Write it to `.workbench/issue.md` - title, URL, body, and every comment. **Codex has no network,
 so this file is the only way it sees the issue.** Then read the code the issue touches until you can
 say how you would change it.
+
+### Size it before you plan: split a batch
+
+Big issues are where reviews spiral (one ran 14 revmux rounds, each finding a new hole). Before the
+plan, judge the size. An issue is **too big for one loop** when its title starts with `Batch:`, it
+has a `batch` or `big` label, it bundles three or more independent items (several issue references,
+an enumerated feature list, several dialogs or commands), or your honest estimate of the change is
+past `review.bigDiffLines` (1500 lines) or spans several unrelated areas.
+
+Then split it before planning:
+- Choose **one coherent slice** for this loop: the smallest piece that is useful on its own, usually
+  the first item or the shared foundation the others need.
+- File **every other slice as its own issue** (`gh issue create`): same priority label, the parent's
+  other labels except `batch`/`big`, the body quoting the parent's text for that slice, and a first
+  line `Split from #<N>.` Not a `follow-up`: these are planned work, not leftovers.
+- Comment on the parent with a checklist of the slices (its own slice first, the others linked).
+- Plan, implement and review only this loop's slice. Its PR says `Part of #<N>` instead of
+  `Closes #<N>`. The PR for the last open slice, or this loop when it was the only slice left,
+  closes the parent.
+- In queue mode the new issues reach the queue through triage like any other issue. Do not
+  launch them yourself.
+
+An issue that is already one coherent change of reasonable size is not split, however long its text.
 
 ## Phase 2 - the plan, agreed
 
