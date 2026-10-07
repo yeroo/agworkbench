@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import tempfile
 import subprocess
 import sys
 import threading
@@ -1119,6 +1120,16 @@ class QueueBugs(unittest.TestCase):
 
     def output(self):
         return sys.stdout.getvalue()
+
+    def test_front_command_pins_pending_members_and_refuses_others(self):
+        self.start_bugs()
+        path = self.store.path
+        self.assertEqual([3, 1], q.set_front(path, [3, 1]))
+        pending = sorted((m for m in self.store.load()['members'] if m['state'] == 'pending'), key=q.admission_key)
+        self.assertEqual([3, 1], [m['number'] for m in pending][:2])
+        with self.assertRaises(q.UsageError):
+            q.set_front(path, [99])
+        self.assertEqual([3], q.set_front(path, [3], clear=True))
 
     def test_bugs_is_the_configured_label(self):
         self.start_bugs('BUGS')
@@ -4269,3 +4280,12 @@ class OutcomeRecording(unittest.TestCase):
         self.outcomes.side_effect = OSError('disk full')
         self.w.tick()
         self.assertIn('route outcomes', self.w.errors)
+
+
+class FrontOverride(unittest.TestCase):
+    def test_front_members_are_admitted_first_in_the_given_order(self):
+        members = [dict(number=10, priority='P1', createdAt='2026-01-01'),
+                   dict(number=20, priority='P0', createdAt='2026-01-02'),
+                   dict(number=30, priority='P1', createdAt='2026-01-03', front=2),
+                   dict(number=40, priority='P2', createdAt='2026-01-04', front=1)]
+        self.assertEqual([40, 30, 20, 10], [m['number'] for m in sorted(members, key=q.admission_key)])
