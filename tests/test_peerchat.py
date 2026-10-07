@@ -770,3 +770,21 @@ class ExitedAgent(unittest.TestCase):
                     with self.assertRaises(peerchat.Refused):
                         self.run_in(fake, lambda: call(peerchat.PROFILES[tool]))
                     self.assertEqual([], fake.keys)
+
+
+class CodexStatusFooter(unittest.TestCase):
+    """Codex 0.160 draws a status line above its shortcut footer (seen on Linux, docxy #976)."""
+    FRAME = ("• Done: planned edits.\n\n"
+             "› Ask Codex to do anything\n\n"
+             "  GPT-6-Luna medium · ~/source/workbench/docxy-issue-976 · Ожидать план Claude\n"
+             "  ? for shortcuts                                     ⚠ 1 warning · f2 to view\n")
+
+    def test_the_composer_is_found_under_a_status_line(self):
+        self.assertEqual("Ask Codex to do anything", peerchat.codex_composer(self.FRAME))
+
+    def test_a_choice_list_under_the_box_still_refuses(self):
+        frame = ("› Ask Codex to do anything\n"
+                 "  1. Yes\n"
+                 "  2. No\n"
+                 "  ? for shortcuts\n")
+        self.assertNotIn(peerchat.codex_composer(frame), ("", "Ask Codex to do anything"))
