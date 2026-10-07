@@ -864,9 +864,38 @@ def mark_pr(path, number, pr, reason=None):
 
 def admission_key(m):
     """Pending members are admitted P0, P1, untriaged, P2, P3 (#34); oldest issue first within a
-    rank, then the order they were queued."""
+    rank, then the order they were queued. A member the owner put at the front (`conductor.py
+    front`) goes first, in the order given, ahead of every rank."""
     created = m.get('createdAt')
-    return triage.RANK.get(m.get('priority'), 2), created is None, created or '', m.get('since') or 0, m['number']
+    front = m.get('front') or 0
+    return (0 if front else 1, front, triage.RANK.get(m.get('priority'), 2), created is None, created or '',
+            m.get('since') or 0, m['number'])
+
+
+def set_front(path, numbers, clear=False):
+    """The owner's override of admission order: pin these pending members first, in this order
+    (1, 2, ...), after any already pinned. With clear, unpin them. Returns what it changed."""
+    store = Store(path)
+    changed = []
+    with store.transaction() as data:
+        members = {m['number']: m for m in data['members']}
+        missing = [n for n in numbers if n not in members]
+        if missing:
+            raise UsageError('not in this queue: ' + ', '.join(f'#{n}' for n in missing))
+        if clear:
+            for n in numbers:
+                if members[n].pop('front', None) is not None:
+                    changed.append(n)
+            return changed
+        top = max((m.get('front') or 0 for m in data['members']), default=0)
+        for n in numbers:
+            if members[n]['state'] != 'pending':
+                raise UsageError(f'#{n} is {members[n]["state"]}, not pending')
+            if not members[n].get('front'):
+                top += 1
+                members[n]['front'] = top
+                changed.append(n)
+    return changed
 
 
 def defer_launch(data, member, reason, now):
@@ -2168,6 +2197,7 @@ class Worker:
                 if m['checkoutEstablished'] and not Path(m['checkout']).is_dir():
                     m.update(state='failed', slotReleased=True, reason=f'checkout moved or deleted: {m["checkout"]}; restore it or remove the member')
                     continue
+                m.pop('front', None)          # a front pin is spent on launch
                 m.update(state='launching', attempt=m['attempt'] + 1, token=str(uuid.uuid4()),
                          result=None, startedAt=self.clock(), slotReleased=False)
                 launches.append(dict(m))
@@ -2404,6 +2434,10 @@ def main(argv=None):
     run = sub.add_parser('run')
     run.add_argument('--file', required=True)
     run.add_argument('--token', required=True)
+    front = sub.add_parser('front')
+    front.add_argument('--file', required=True)
+    front.add_argument('--clear', action='store_true')
+    front.add_argument('numbers', nargs='+', type=int)
     mark = sub.add_parser('mark')
     mark.add_argument('--file', required=True)
     mark.add_argument('--number', required=True, type=int)
@@ -2445,6 +2479,10 @@ def main(argv=None):
         if args.command == 'run':
             tslog.install()         # the #queue pane: every line timestamped (#78)
             return Worker(Store(args.file), args.token).run()
+        if args.command == 'front':
+            changed = set_front(args.file, args.numbers, args.clear)
+            print(('unpinned ' if args.clear else 'at the front: ') + (', '.join(f'#{n}' for n in changed) or 'nothing changed'))
+            return 0
         if args.command == 'mark':
             mark_pr(args.file, args.number, args.pr, args.reason)
             print(f'marked #{args.number} PR {args.pr}')
