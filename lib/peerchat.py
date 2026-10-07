@@ -84,6 +84,10 @@ CODEX_CONT_RE = re.compile(r"^ {2}\s*(\S.*?)\s*$")
 # Codex indents its footer rows by two spaces. Only the final row is stripped: a multi-row overlay
 # and an indented modal choice have the same shape, so the guard fails closed on both.
 FOOTER_RE = re.compile(r"^ {2}\S")
+# Newer Codex (0.160) draws a second footer row above that one: its status line, "<model>
+# <effort> · <cwd> · <thread title>". Its fixed shape - a model name, a reasoning effort, then
+# "·"-separated fields - is never a modal choice, so it alone may be stripped as well.
+CODEX_STATUS_RE = re.compile(r"^ {2}(?:gpt|codex|o\d)[\w.-]*\s+(?:minimal|low|medium|high|xhigh|max|ultra)\b.*\s·\s", re.I)
 # A highlighted chooser row - a permission prompt, a trust dialog, a picker. Kimi Code marks its
 # approval choice with `▶`.
 CHOOSER_RE = re.compile(r"^\s*[>❯›▶]\s+\d+\.\s+\S")
@@ -241,6 +245,10 @@ def trailing_block(text: str) -> list[str]:
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()
+        if lines and CODEX_STATUS_RE.match(lines[-1]):
+            lines.pop()
+            while lines and not lines[-1].strip():
+                lines.pop()
     start = len(lines)
     while start and lines[start - 1].strip():
         start -= 1
