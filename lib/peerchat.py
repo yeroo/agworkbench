@@ -84,6 +84,7 @@ CODEX_CONT_RE = re.compile(r"^ {2}\s*(\S.*?)\s*$")
 # Codex indents its footer rows by two spaces. Only the final row is stripped: a multi-row overlay
 # and an indented modal choice have the same shape, so the guard fails closed on both.
 FOOTER_RE = re.compile(r"^ {2}\S")
+FOOTER_RIGHT_RE = re.compile(r"^ {12,}\S")
 # Newer Codex (0.160) draws a second footer row above that one: its status line, "<model>
 # <effort> · <cwd> · <thread title>". Its fixed shape - a model name, a reasoning effort, then
 # "·"-separated fields - is never a modal choice, so it alone may be stripped as well.
@@ -241,7 +242,10 @@ def trailing_block(text: str) -> list[str]:
     lines = text.splitlines()[-BOX_LINES:]
     while lines and not lines[-1].strip():
         lines.pop()
-    if lines and FOOTER_RE.match(lines[-1]):
+    # With a draft in the composer, Codex 0.160 drops the left part of its shortcut row and keeps
+    # only the right-aligned notices ("⚠ 1 warning · f2 to view"): a final row indented far past
+    # any continuation row is that footer too.
+    if lines and (FOOTER_RE.match(lines[-1]) or FOOTER_RIGHT_RE.match(lines[-1])):
         lines.pop()
         while lines and not lines[-1].strip():
             lines.pop()

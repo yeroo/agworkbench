@@ -788,3 +788,12 @@ class CodexStatusFooter(unittest.TestCase):
                  "  2. No\n"
                  "  ? for shortcuts\n")
         self.assertNotIn(peerchat.codex_composer(frame), ("", "Ask Codex to do anything"))
+
+    def test_a_draft_is_read_under_the_right_aligned_footer(self):
+        frame = ("› Chat from Workbench: workbench mail from claude: FIX r1 [id\n"
+                 "  20261007T163143Z-claude-ceba] - read it\n"
+                 " \n"
+                 "  GPT-6-Luna medium · ~/source/workbench/docxy-issue-976 · Ожидать план Claude\n"
+                 "                                                      ⚠ 1 warning · f2 to view\n")
+        self.assertEqual("Chat from Workbench: workbench mail from claude: FIX r1 [id "
+                         "20261007T163143Z-claude-ceba] - read it", peerchat.codex_composer(frame))
