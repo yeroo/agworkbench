@@ -759,6 +759,8 @@ class Store:
                 raise ValueError('invalid autoMerge')
             if data.get('bigReview') is not None and type(data['bigReview']) is not bool:
                 raise ValueError('invalid bigReview')
+            if data.get('serial') is not None and type(data['serial']) is not bool:
+                raise ValueError('invalid serial')
             if data.get('onLimit') not in (None, 'wait', 'failover'):
                 raise ValueError('invalid onLimit')
             if data.get('triage') is not None and type(data['triage']) is not bool:
@@ -942,13 +944,14 @@ def pin_conductor(store, owner):
 
 
 def settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on=False,
-                     revmux_profile=None, big_review=None, on_limit=None):
+                     revmux_profile=None, big_review=None, on_limit=None, serial=None):
     """What this start or append changes in a queue's saved settings (#28): {key: [old, new]}. A revmux
     profile is saved only when the human passed one (#66): the kimi default is the launcher's, per launch."""
     current = data or {}
     wanted = {'parallel': parallel, 'yes': True if yes else None, 'implementer': implementer,
               'autoMerge': auto_merge, 'autonomous': autonomous, 'triage': True if triage_on else None,
-              'revmuxProfile': revmux_profile, 'bigReview': big_review, 'onLimit': on_limit}
+              'revmuxProfile': revmux_profile, 'bigReview': big_review, 'onLimit': on_limit,
+              'serial': serial}
     changes = {key: [current.get(key), value] for key, value in wanted.items()
                if value is not None and data is not None and current.get(key) != value}
     if watch and data is not None:
@@ -992,7 +995,7 @@ def check_workspace(workspace, siblings):
 def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=False, dry_run=False, root=None,
                 implementer=None, auto_merge=None, autonomous=None, gh=gh_json, triage_on=False,
                 prune=False, clear_limit=None, name=None, workspace=None, revmux_profile=None, big_review=None,
-                on_limit=None):
+                on_limit=None, serial=None):
     name = queue_name(name)
     if workspace is not None and name is None:
         raise UsageError('-Workspace requires -QueueName: the main queue uses the workspace named after the repo')
@@ -1045,7 +1048,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         live = store.running() if store.worker_lock.exists() else False
         mode = 'start' if existing is None else ('append to a running queue' if live else 'append to a stopped queue')
         changes = settings_changes(existing, parallel, yes, implementer, auto_merge, autonomous, watch, label, triage_on,
-                                   revmux_profile, big_review, on_limit)
+                                   revmux_profile, big_review, on_limit, serial)
         query = dict(query=label.text, matches=matches) if isinstance(label, labelquery.Query) else {}
         limits = dict(clearLimit=dict(tool=clear_limit, recorded=((existing or {}).get('toolLimits') or {}).get(clear_limit))
                       ) if clear_limit else {}
@@ -1075,7 +1078,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
             # members launched from now on; autonomous/autoMerge/bigReview/onLimit are saved explicitly, false included,
             # and -Watch onto a queue started from a list turns watching on.
             changes = settings_changes(data, parallel, yes, implementer, auto_merge, autonomous, watch, label,
-                                       triage_on, revmux_profile, big_review, on_limit)
+                                       triage_on, revmux_profile, big_review, on_limit, serial)
             for key, (_, new) in changes.items():
                 data[key] = new
             cleared = None
@@ -2173,6 +2176,11 @@ class Worker:
             pause = disk or ram or tools
             count = sum(m['state'] in {'launching', 'active', 'blocked'} and not m['slotReleased']
                         for m in data['members'])
+            if data.get('serial'):
+                # Serial: the next member waits until every earlier one is merged or closed, so an open PR
+                # or a blocked member holds the slot too.
+                count = sum(m['state'] in {'launching', 'active', 'blocked', 'pr-open'} or bool(m.get('closePending'))
+                            for m in data['members'])
             live = sum(m['state'] == 'launching' or m['state'] in LIVE_STATES or bool(m.get('closePending'))
                        for m in data['members'])
             ceiling = data['parallel'] + CEILING_EXTRA
@@ -2427,6 +2435,10 @@ def main(argv=None):
     big.add_argument('--big-review', dest='big_review', action='store_const', const=True,
                      help='every member is a big issue: up to review.maxRoundsBig revmux rounds (#75)')
     big.add_argument('--no-big-review', dest='big_review', action='store_const', const=False)
+    serial = start.add_mutually_exclusive_group()
+    serial.add_argument('--serial', dest='serial', action='store_const', const=True,
+                        help='launch the next member only once every earlier one is merged or closed')
+    serial.add_argument('--no-serial', dest='serial', action='store_const', const=False)
     wait = start.add_mutually_exclusive_group()
     wait.add_argument('--wait-on-limit', dest='on_limit', action='store_const', const='wait',
                       help='a member whose agent hits its usage limit waits it out: no failover, no new members (#77)')
@@ -2475,7 +2487,7 @@ def main(argv=None):
                                autonomous=args.autonomous, triage_on=args.triage, prune=args.prune,
                                clear_limit=args.clear_limit, name=args.name, workspace=args.workspace,
                                revmux_profile=args.revmux_profile, big_review=args.big_review,
-                               on_limit=args.on_limit)
+                               on_limit=args.on_limit, serial=args.serial)
         if args.command == 'run':
             tslog.install()         # the #queue pane: every line timestamped (#78)
             return Worker(Store(args.file), args.token).run()
