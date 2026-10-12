@@ -1254,7 +1254,8 @@ class Relay:
             self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
             pointer=lambda message: closer.relay_pointer(message, self.agmsg, self.hub_dir),
             alert=lambda peer, mid, reason: self.alert(peer, mid, reason),
-            resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now())
+            resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now(),
+            read_message=lambda box, mid: self.read_message(box, mid))
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
@@ -1981,6 +1982,17 @@ class Relay:
                 or own.get('name') != f'#{close.issue} relay' or agw.panes_of(own) != [mine]):
             return None
         return mine, own
+
+    def read_message(self, box: str, mid: str) -> dict[str, Any] | None:
+        """One already-read (or archived) message of a box by id, parsed; None when it is unread or
+        unknown. The pointer rescue clears a stale pointer for such mail."""
+        found = closer.mail_file(self.hub_dir, box, mid)
+        if found is None or found[1]:
+            return None
+        try:
+            return self.hub.parse_message(found[0])
+        except (FileNotFoundError, ValueError):
+            return None
 
     def unread_message(self, box: str, mid: str) -> dict[str, Any] | None:
         """One unread message of a box by id, parsed; None when it is not unread (any more)."""

@@ -3954,6 +3954,44 @@ class PointerRescue(PointerRescueFixture):
         self.tick(61)
         self.assertEqual(['\t'], self.keys)            # announced: not rung again
 
+    def test_a_stale_pointer_for_mail_read_meanwhile_is_cleared_and_the_next_mail_rings(self):
+        # #1149 (docxy): the ring typed its pointer, then failed verifying it; the agent read that
+        # mail through its own waiter, and every later ring refused the composer as a draft.
+        self.ring_fails()
+        self.unread['codex'] = []
+        self.r.read_message = lambda box, mid: self.messages['m1'] if (box, mid) == ('codex', 'm1') else None
+        typed_into = self.type_into
+
+        def clearing(pane, text):
+            if text == peerchat.CLEAR_KEY:
+                self.keys.append(text)
+                self.typed = None
+                return
+            typed_into(pane, text)
+        self.enterContext(patch.object(agw, 'type_into', side_effect=clearing))
+        self.look(30)                                  # first look: remembered, nothing pressed
+        self.assertEqual([], self.keys)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)   # cleared, never submitted
+        self.assertIsNone(self.typed)
+        self.assertIn('cleared stale pointer in codex for m1 (its mail is already read)', self.logs)
+        self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'next'}
+        self.unread['codex'] = ['m2']
+        self.takes = lambda keys: True
+        self.keys.clear()
+        self.tick(61)
+        self.assertIn('m2', self.r.state['announced'])
+
+    def test_a_stale_pointer_the_human_edited_is_left_alone(self):
+        self.ring_fails()
+        self.unread['codex'] = []
+        self.r.read_message = lambda box, mid: self.messages['m1'] if (box, mid) == ('codex', 'm1') else None
+        self.look(30)
+        self.typed = self.pointer + ' plus my words'
+        self.look(60)
+        self.look(90)
+        self.assertEqual([], self.keys)
+
     def test_the_rescued_mid_is_saved_as_announced(self):
         self.use_disk_state()
         self.pointer = closer.relay_pointer(self.messages['m1'], self.r.agmsg, self.r.hub_dir)

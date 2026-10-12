@@ -175,9 +175,14 @@ class PointerRescue:
     def __init__(self, peers, *, unread_message: Callable[[str, str], dict | None], pointer: Callable[[dict], str],
                  log: Callable[[str], None], alert: Callable[[object, str, str], None],
                  resolved: Callable[[object, str], None] | None = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 read_message: Callable[[str, str], dict | None] | None = None):
         self.peers = peers
         self.unread_message = unread_message
+        # A pointer for mail the agent has already read is stale: submitting it would only start a
+        # turn, and leaving it makes every later ring refuse the composer as a draft. With this set,
+        # such a pointer is cleared (Ctrl+U) instead, after the same two-look check.
+        self.read_message = read_message
         self.pointer = pointer
         self.log = log
         self.alert = alert
@@ -204,6 +209,9 @@ class PointerRescue:
             content = peerchat.composer_content(peer.tool, text)
             mid = peerchat.pointer_id(content)
             message = self.unread_message(peer.box, mid) if mid else None
+            if message is None and mid and self.read_message is not None:
+                self.clear_stale(peer, mid, content, seen, skip)
+                continue
             if message is None or (skip is not None and skip(peer, message)):
                 continue
             typed = self.pointer(message)
@@ -236,6 +244,32 @@ class PointerRescue:
                 self.forget(next(peer for peer in self.peers if peer.box == box), mid)
         self.last = seen
         return rescued
+
+    def clear_stale(self, peer, mid: str, content: str, seen: dict, skip) -> None:
+        """Clear the pointer for already-read mail `mid` from an idle composer that holds exactly it and
+        held it on the last look too. A failed ring can leave one behind when the agent reads the mail
+        by itself before the relay looks again; without this nothing ever empties that composer."""
+        import peerchat
+        message = self.read_message(peer.box, mid)
+        if message is None or (skip is not None and skip(peer, message)):
+            return
+        typed = self.pointer(message)
+        if not peerchat.owns(content, typed):
+            return
+        seen[peer.box] = (mid, content)
+        if self.last.get(peer.box) != (mid, content):
+            return
+        where = f"stale pointer in {peer.box} for {mid} (its mail is already read)"
+        try:
+            cleared = peerchat.clear_pointer(peer.pane, peerchat.PROFILES[peer.tool], typed)
+        except (peerchat.Refused, peerchat.Failed, agw.CtlError, OSError) as err:
+            self.log(f"could not clear {where}: {err}")
+            return
+        if cleared:
+            seen.pop(peer.box)
+            self.log(f"cleared {where}")
+        else:
+            self.log(f"could not clear {where}: not empty after {peerchat.CLEAR_PRESSES} presses")
 
     def forget(self, peer, mid: str) -> None:
         key = (peer.box, mid)
