@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterator
@@ -57,13 +58,26 @@ def pipe_name() -> str:
     return os.environ.get("AGWINTERM_PIPE") or "agwinterm"
 
 
-def _open_pipe():
+PIPE_BUSY = 231                 # ERROR_PIPE_BUSY: every instance of the pipe is serving another client
+PIPE_OPEN_WAIT = 1.5            # seconds to keep retrying a busy or momentarily absent pipe
+
+
+def _open_pipe(wait: float | None = None):
     """Open the control pipe, or None when it is not there. A separate function so a test can
-    hand the transport a fake handle and exercise the deadline with no terminal running."""
-    try:
-        return open(rf"\\.\pipe\{pipe_name()}", "r+b", buffering=0)
-    except OSError:
-        return None
+    hand the transport a fake handle and exercise the deadline with no terminal running.
+
+    A busy pipe (all instances serving others), or one between instances for a moment, is retried
+    for PIPE_OPEN_WAIT seconds: under load the terminal answers many clients, and giving up at once
+    made a relay ring fail after it had typed its pointer, leaving it unsent."""
+    deadline = time.monotonic() + (PIPE_OPEN_WAIT if wait is None else wait)
+    while True:
+        try:
+            return open(rf"\\.\pipe\{pipe_name()}", "r+b", buffering=0)
+        except OSError as err:
+            transient = isinstance(err, FileNotFoundError) or getattr(err, 'winerror', None) == PIPE_BUSY
+            if not transient or time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
 
 
 def _pipe_roundtrip(handle, payload: dict[str, Any]) -> bytes:
