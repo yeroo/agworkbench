@@ -140,6 +140,35 @@ class QueueCase(unittest.TestCase):
         self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
         self.assertTrue(q.finished(self.store.load()))
 
+    def test_serial_waits_for_merge_or_close_before_the_next_member(self):
+        self.start(parallel=1, serial=True)
+        self.assertIs(True, self.store.load()['serial'])
+        worker = self.worker()
+        worker.tick(); worker.tick()
+        self.report(1)
+        worker.tick(); worker.tick()
+        self.assertEqual('pr-open', self.member(1)['state'])
+        self.assertEqual([1], [x[0] for x in self.launches])     # an open PR holds the slot
+        with self.store.transaction() as data:
+            data['members'][0].update(state='merged')
+        worker.tick(); worker.tick()
+        self.assertEqual([1, 2], [x[0] for x in self.launches])
+        self.report(2, 'blocked', reason='human answer needed')
+        worker.tick(); worker.tick()
+        self.assertEqual([1, 2], [x[0] for x in self.launches])  # so does a blocked one
+        self.report(2, 'closed', reason='duplicate of #9')
+        worker.tick(); worker.tick()
+        self.assertEqual([1, 2, 3], [x[0] for x in self.launches])
+
+    def test_serial_is_saved_and_can_be_turned_off(self):
+        self.start('o/r#1', parallel=1, serial=True)
+        self.start('o/r#2', serial=False)
+        self.assertIs(False, self.store.load()['serial'])
+        with self.store.transaction() as data:
+            data['serial'] = 'yes'
+        with self.assertRaises(Exception):
+            self.store.load()
+
     def test_closed_report_releases_slot_and_is_counted_separately(self):
         self.start(parallel=1)
         worker = self.worker()
