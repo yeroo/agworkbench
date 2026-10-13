@@ -18,6 +18,9 @@
       Codex strips the environment from tool subprocesses. AI_HUB and AI_BOX are copied in so its
       mail lands in this workbench's mailbox, under its own name. Values are TOML LITERAL strings
       (single quotes): a Windows path in a basic string is a run of invalid escapes.
+  -c tui.status_line=[]
+      A configured status line is a second footer row under the composer. peerchat strips exactly
+      one footer row, so with it every ring is refused as "no Codex composer visible".
 
   Codex never touches the terminal from here. Its sandbox denies the agwinterm control pipe; the
   relay reads its mail and rings Claude instead.
@@ -48,7 +51,8 @@ $policy = @(
     '--ask-for-approval', 'never',
     '--cd', $Checkout,
     '-c', "sandbox_workspace_write.network_access=$network",
-    '-c', 'sandbox_workspace_write.writable_roots=[]'
+    '-c', 'sandbox_workspace_write.writable_roots=[]',
+    '-c', 'tui.status_line=[]'
 )
 $inject = @(
     '-c', ('shell_environment_policy.set.AI_HUB=' + (TomlLiteral $hubDir)),
