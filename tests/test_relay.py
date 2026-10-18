@@ -214,6 +214,17 @@ class PaneIds(unittest.TestCase):
     def test_two_distinct_pane_ids_pass(self):
         relay.check_panes(self.GOOD, "d387360b-a120-4e4b-b7a4-4db3171780ab")
 
+    def test_agliteterm_pane_ids_pass(self):
+        # agliteterm shares agwinterm's control API but numbers its panes `lite-N`
+        relay.check_panes("lite-36", "lite-37")
+        relay.check_panes(self.GOOD, "lite-2")
+
+    def test_a_malformed_lite_id_is_not_a_pane(self):
+        with self.assertRaises(SystemExit):
+            relay.check_panes("lite-", self.GOOD)
+        with self.assertRaises(SystemExit):
+            relay.check_panes("lite-x1", self.GOOD)
+
 
 class DeliveryFixture(unittest.TestCase):
     rescue_live = False

@@ -987,6 +987,12 @@ function Test-SessionGuid([string] $Value) {
     return [guid]::TryParse($Value, [ref]$id) -and $id -ne [guid]::Empty
 }
 
+# A terminal pane or session id. agwinterm gives every pane a GUID; agliteterm, which shares the
+# control API, numbers them `lite-N`. Claude conversation ids stay GUIDs (Test-SessionGuid).
+function Test-PaneId([string] $Value) {
+    return (Test-SessionGuid $Value) -or ($Value -match '^lite-[0-9]+$')
+}
+
 function Read-SharedText([string] $Path, [scriptblock] $Read) {
     $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     $reader = $null
@@ -1174,7 +1180,7 @@ function Read-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Role
     $path = Get-ClaudeIdentityPath $Checkout $Role
     $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
     if (-not (Test-SessionGuid $record.sessionId) -or
-        ($null -ne $record.pane -and -not (Test-SessionGuid $record.pane)) -or
+        ($null -ne $record.pane -and -not (Test-PaneId $record.pane)) -or
         -not $record.cwd -or -not [IO.Path]::IsPathRooted([string]$record.cwd) -or
         $record.origin -notin @('fresh', 'adopted', 'recovered') -or $record.issue -ne $Issue -or
         (Normalize-WorkbenchPath $record.checkout) -ne (Normalize-WorkbenchPath $Checkout)) {
@@ -1804,7 +1810,7 @@ function Get-ImplementerName([string] $Tool) {
 }
 
 function Set-PaneRestore([string] $Pane, [string] $Command) {
-    if (-not (Test-SessionGuid $Pane)) { throw "invalid restore pane '$Pane'" }
+    if (-not (Test-PaneId $Pane)) { throw "invalid restore pane '$Pane'" }
     $stage = $script:Launch.Stage
     try {
         Set-LaunchStage restore-pin
@@ -2036,7 +2042,7 @@ function Start-WorkbenchSessionCore {
         $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
             --workspace-name $WorkspaceName --create-workspace @command @selection
         $script:Launch.SessionId = ($id -split '\s+')[0]
-        if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
+        if (-not (Test-PaneId $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
         if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.SessionId }
         $script:Launch.Claude = $script:Launch.SessionId
         $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude
