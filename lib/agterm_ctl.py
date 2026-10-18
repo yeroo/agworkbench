@@ -63,6 +63,38 @@ def caller_pane() -> str | None:
     return pane_id(session, slot)
 
 
+def with_caller_path(command: str) -> str:
+    """Run an agterm --command or restore command with the caller's PATH. agterm spawns a pane's
+    command through `login -p ... bash --noprofile --norc`, so it inherits agterm's own environment,
+    which on macOS is launchd's minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) when agterm was started
+    from Finder: pwsh-preview, claude, gh, git and revmux are then missing in conductor and issue
+    sessions. The PATH is saved to ~/.agworkbench/path and a short wrapper restores it, because
+    agterm rejects commands over 1024 bytes and a PATH alone can exceed that."""
+    path = os.environ.get("PATH")
+    if os.name == "nt" or not path or not command or command == "none":
+        return command
+    home = os.path.join(os.path.expanduser("~"), ".agworkbench")
+    os.makedirs(home, exist_ok=True)
+    saved, wrapper = os.path.join(home, "path"), os.path.join(home, "withpath")
+    try:
+        current = open(saved, encoding="utf-8").read()
+    except OSError:
+        current = None
+    if current != path:
+        with open(saved + ".tmp", "w", encoding="utf-8") as f:
+            f.write(path)
+        os.replace(saved + ".tmp", saved)
+    script = '#!/bin/sh\nPATH="$(cat "$HOME/.agworkbench/path")"; export PATH; exec "$@"\n'
+    try:
+        existing = open(wrapper, encoding="utf-8").read()
+    except OSError:
+        existing = None
+    if existing != script:
+        with open(wrapper, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(wrapper, 0o755)
+    return f"'{wrapper}' {command}"
+
 def bridge_env(env=None) -> None:
     """Give a process in an agterm pane the AGWINTERM_* variables the workbench reads, derived from
     agterm's own. No-op outside agterm, and never overrides values agwinterm itself set."""
@@ -251,7 +283,7 @@ def _session_new(args: dict[str, Any]) -> str:
         if workspace:
             argv += ["--workspace", workspace]
     if args.get("command"):
-        argv += ["--command", str(args["command"])]
+        argv += ["--command", with_caller_path(str(args["command"]))]
     # Never --no-select: an unselected agterm session is not realized and its command never runs.
     result = agtermctl(*argv)
     sid = str(result.get("id") if isinstance(result, dict) else result).lower()
@@ -363,7 +395,7 @@ def request(cmd: str, *, target: str | None = None, args: dict[str, Any] | None 
         if command in ("", "none"):
             agtermctl("session", "restore", "--clear", "--target", sid, "--pane", slot)
             return {"action": "cleared", "pane": pane, "session": sid.lower()}
-        agtermctl("session", "restore", command, "--target", sid, "--pane", slot)
+        agtermctl("session", "restore", with_caller_path(command), "--target", sid, "--pane", slot)
         return {"action": "pinned", "pane": pane, "session": sid.lower(), "command": command}
     if cmd == "session.close":
         sid, _ = resolve(target)

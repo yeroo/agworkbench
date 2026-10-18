@@ -554,6 +554,12 @@ def min_free_ram_gb(config):
     return free_setting(config, 'minFreeRamGB', 3)        # #61
 
 
+def ceiling_extra(config):
+    """Live members tolerated beyond -Parallel (#61). 0 makes -Parallel a hard cap on open issue
+    sessions: a member blocked on a question or waiting on its PR then holds back the next one."""
+    return int(free_setting(config, 'ceilingExtra', CEILING_EXTRA))
+
+
 def free_ram():
     """Available physical memory in bytes, or None where this platform has no way to say (#61)."""
     if os.name == 'nt':
@@ -2183,7 +2189,7 @@ class Worker:
                             for m in data['members'])
             live = sum(m['state'] == 'launching' or m['state'] in LIVE_STATES or bool(m.get('closePending'))
                        for m in data['members'])
-            ceiling = data['parallel'] + CEILING_EXTRA
+            ceiling = data['parallel'] + ceiling_extra(config)
             # While triage is paused (a usage limit, or facts it could not read) nobody waits for it.
             paused = self.clock() < self.triage_paused_until
             backoff = data.get('launchBackoff')

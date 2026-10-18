@@ -175,10 +175,10 @@ function Get-WorkbenchConfig {
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
                  cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask'; claudeImplementerModel = $null;
                  failoverOrder = @('claude', 'codex', 'kimi'); implementerRoster = $null; route = $null; limitRetryMinutes = 30; reviewOnLimit = 'wait';
-                 closeHelpers = $true; restartExited = $true }
+                 closeHelpers = $true; restartExited = $true; cloneReference = $null }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'route', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'route', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited', 'cloneReference')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -2457,7 +2457,15 @@ function New-IssueCheckout {
     } else {
         New-Item -ItemType Directory -Force -Path $Root | Out-Null
         Write-Step "cloning $($Issue.Repo) into $dir"
-        & gh repo clone $Issue.Repo $dir '--' --quiet | Out-Host
+        # "cloneReference": a local clone of the repo to borrow objects from, so a slow link only
+        # downloads what the local clone lacks; --dissociate copies them, so the checkout stays
+        # independent of it (Mac queue, 2026-10-15: GitHub at ~16 KB/s made every clone time out).
+        $cloneArgs = @('--quiet')
+        $reference = [string](Get-WorkbenchConfig).cloneReference
+        if ($reference -and (Test-Path -LiteralPath (Join-Path ([Environment]::ExpandEnvironmentVariables($reference.Replace('~', $HOME))) '.git'))) {
+            $cloneArgs += @('--reference-if-able', $reference.Replace('~', $HOME), '--dissociate')
+        }
+        & gh repo clone $Issue.Repo $dir '--' @cloneArgs | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "gh repo clone failed" }
     }
     Connect-LaunchLog (Join-Path $dir '.workbench\state\launch.log')
