@@ -747,6 +747,13 @@ function Confirm-WindowUsable([string] $Pane) {
         do {
             $minimized = Test-AgwintermMinimized
             $reply = (Invoke-Ctl session metrics $Pane --json) | ConvertFrom-Json
+            if ($reply.ok -ne $true -and "$($reply.error)" -match 'lite subset') {
+                # agliteterm has no session.metrics: its panes cannot be measured, so the launch
+                # goes on as if the window were usable (the pane is the one it just created).
+                Write-Step "agliteterm: pane $Pane cannot be measured (lite subset); assuming a usable window"
+                $script:Launch.Stage = $oldStage
+                return
+            }
             if ($reply.ok -ne $true -or $null -eq $reply.result -or $null -eq $reply.result.cols) {
                 throw "window metrics unavailable for pane $Pane"
             }
