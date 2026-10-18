@@ -298,7 +298,9 @@ def github_time() -> datetime | None:
     return None
 
 
-PANE_ID_RE = __import__("re").compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# agwinterm's pane ids are lowercase GUIDs; agliteterm, which shares the control API, numbers
+# its sessions and panes `lite-N`.
+PANE_ID_RE = __import__("re").compile(r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|lite-[0-9]+)$")
 
 
 def check_panes(claude: str, codex: str) -> None:
