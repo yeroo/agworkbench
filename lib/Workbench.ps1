@@ -830,8 +830,8 @@ function Get-PaneIds($Session) {
     if ($hasIds) { $ids = @($Session.paneIds) }
     if ($ids.Count -lt 1 -or $ids.Count -gt 2) { throw "session '$($Session.id)' has unsupported panes: $($ids -join ', ')" }
     foreach ($id in $ids) {
-        $guid = [guid]::Empty
-        if ($id -isnot [string] -or -not [guid]::TryParse($id, [ref]$guid) -or $guid -eq [guid]::Empty) {
+        # agwinterm pane ids are GUIDs; agliteterm's are `lite-N` (Test-PaneId takes both).
+        if ($id -isnot [string] -or -not (Test-PaneId $id)) {
             throw "session '$($Session.id)' has invalid pane id '$id'"
         }
     }
@@ -998,6 +998,11 @@ function Test-SessionGuid([string] $Value) {
 # control API, numbers them `lite-N`. Claude conversation ids stay GUIDs (Test-SessionGuid).
 function Test-PaneId([string] $Value) {
     return (Test-SessionGuid $Value) -or ($Value -match '^lite-[0-9]+$')
+}
+
+# A workspace id: agwinterm's are GUIDs, agliteterm's are small integers.
+function Test-WorkspaceId([string] $Value) {
+    return (Test-SessionGuid $Value) -or ($Value -match '^[0-9]+$')
 }
 
 function Read-SharedText([string] $Path, [scriptblock] $Read) {
@@ -1863,8 +1868,7 @@ function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $WorkspaceName, [i
     }
     $workspaceId = $null
     if ($workspaces.Count) {
-        $guid = [guid]::Empty
-        if (-not [guid]::TryParse([string]$workspaces[0].id, [ref]$guid) -or $guid -eq [guid]::Empty) {
+        if (-not (Test-WorkspaceId ([string]$workspaces[0].id))) {
             throw [AdoptRefused]::new("workspace '$WorkspaceName' has no valid id")
         }
         $workspaceId = $workspaces[0].id
@@ -1946,8 +1950,7 @@ function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $Workspac
     $workspaceId = $Plan.TargetWorkspace
     if (-not $workspaceId) {
         $workspaceId = (Invoke-Ctl workspace new $WorkspaceName).Trim()
-        $guid = [guid]::Empty
-        if (-not [guid]::TryParse($workspaceId, [ref]$guid) -or $guid -eq [guid]::Empty) {
+        if (-not (Test-WorkspaceId $workspaceId)) {
             throw "workspace new returned an invalid id: '$workspaceId'"
         }
     }
