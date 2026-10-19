@@ -1368,6 +1368,26 @@ class CloseBackstop(unittest.TestCase):
             self.w.close_backstop()
             self.now += step
 
+    def test_a_pending_checkout_cleanup_is_retried_once_its_sessions_are_gone(self):
+        # #128: after-close left the cleanup owed; the conductor retries it on its ticks, waiting
+        # while a session of the issue is open, at most every CLEANUP_RETRY seconds.
+        import cleanup
+        q.atomic_json(self.state / cleanup.PENDING_NAME, {'repo': 'o/r', 'issue': 7, 'pr': 42, 'mode': 'merged',
+                                                           'reason': 'kept: still open after 600s: #7 relay'})
+        calls = []
+        def retry(checkout, tree, gh=None):
+            calls.append(Path(checkout))
+            return ('waiting: still open: #7 relay', False) if tree['workspaces'][0]['sessions'] else ('deleted (merged): freed 1.0 MB', True)
+        with patch.object(cleanup, 'retry_pending', side_effect=retry):
+            self.w.cleanup_backstop()
+            self.w.cleanup_backstop()                        # within CLEANUP_RETRY: no second try
+            self.assertEqual([self.checkout.resolve()], [c.resolve() for c in calls])
+            self.now += q.CLEANUP_RETRY
+            self.tree['workspaces'][0]['sessions'] = []
+            self.w.cleanup_backstop()
+            self.assertEqual(2, len(calls))
+            self.assertNotIn(7, self.w.cleanups)
+
     def relay_gone(self):
         self.tree['workspaces'][0]['sessions'] = self.tree['workspaces'][0]['sessions'][:1]
 
@@ -1448,6 +1468,7 @@ class CloseBackstop(unittest.TestCase):
         (directory / 'read').mkdir(exist_ok=True)
         clock = Clock()
         self.enterContext(patch.object(q.agw, 'type_into', side_effect=type_into))
+        self.enterContext(patch.object(q.agw, 'press_key', side_effect=type_into))   # Ctrl+U is a key press (#128)
         self.enterContext(patch.object(q.agw, 'cursor_column', side_effect=q.agw.CtlError('no cursor in fixture')))
         self.enterContext(patch.object(peerchat, 'now', clock.now))
         self.enterContext(patch.object(peerchat, 'pause', clock.pause))

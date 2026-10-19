@@ -256,6 +256,7 @@ def skip_claimed(skipped, claimed, fresh):
 
 
 CLOSE_BACKSTOP_AFTER = 900.0   # a merged or no-PR closed member's pending close gets the backstop (#33)
+CLEANUP_RETRY = 300.0            # how often a pending checkout cleanup is retried (#128)
 CLOSE_ISSUE_CHECK_INTERVAL = 60.0  # GitHub CLOSED gate during a no-PR backstop wait
 TRIAGE_JOB_TIMEOUT = 600.0     # one triage.py run for one member (#34)
 TRIAGE_PAUSE = 1800.0          # after a triage run stopped on a usage limit/auth or incomplete facts
@@ -1348,6 +1349,7 @@ class Worker:
         self.last_display = {}
         self.last_skips = {}          # the last rescan's skip reasons, kept in memory only (#28)
         self.closes = {}              # member -> {'since', 'attempt'}: the close backstop (#33), memory only
+        self.cleanups = {}    # member -> when its pending checkout cleanup was last retried (#128)
         self._name = _UNREAD          # the queue's name (#66), read once: it never changes
 
     def error(self, key, err):
@@ -1944,6 +1946,38 @@ class Worker:
             refuse(f'still waiting after {closer.CLOSE_WAIT:.0f}s: {detail}',
                    stuck='the backstop close timed out: ' + detail)
 
+    def cleanup_backstop(self):
+        """Retry the checkout cleanup after-close left pending (#128: it waited for a session that
+        stayed open) for every finished member, at most every CLEANUP_RETRY seconds each, once the
+        issue's sessions are gone. Never raises."""
+        import cleanup
+        data = self.store.load()
+        tree = None
+        for m in data['members']:
+            number = m['number']
+            if m['state'] not in {'merged', 'closed'} or not m.get('checkout'):
+                self.cleanups.pop(number, None)
+                continue
+            checkout = Path(m['checkout'])
+            if not (checkout / '.workbench' / 'state' / cleanup.PENDING_NAME).exists():
+                self.cleanups.pop(number, None)
+                continue
+            last = self.cleanups.get(number)
+            if last is not None and self.clock() - last < CLEANUP_RETRY:
+                continue
+            self.cleanups[number] = self.clock()
+            try:
+                if tree is None:
+                    tree = agw.tree()
+                what, deleted = cleanup.retry_pending(checkout, tree, gh=self.gh)
+            except (agw.CtlError, OSError, ValueError, KeyError) as err:
+                self.error(f'cleanup #{number}', err)
+                continue
+            if deleted or not what.startswith('waiting'):
+                print(f'{self.tag}#{number}: cleanup: {what}', flush=True)
+            if deleted:
+                self.cleanups.pop(number, None)
+
     def end_close(self, m, pr, hub_dir, stuck):
         path = hub_dir / 'state' / 'relay.json'
         state = read_json(path)
@@ -2159,6 +2193,7 @@ class Worker:
         self.refresh_priorities()
         self.step_triage()
         self.close_backstop()
+        self.cleanup_backstop()
         self.record_outcomes()
         launches = []
         orphan_timeouts = []

@@ -26,6 +26,7 @@ class Submission(unittest.TestCase):
     @contextlib.contextmanager
     def environment(self, fake):
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'press_key', fake.type_into), \
                 patch.object(agw, 'cursor_column', fake.cursor_column), \
                 patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
                 patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
@@ -654,6 +655,7 @@ class Rescue(unittest.TestCase):
 
     def run_in(self, fake, call):
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'press_key', fake.type_into), \
                 patch.object(agw, 'cursor_column', fake.cursor_column), \
                 patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
                 patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
@@ -743,6 +745,7 @@ class ExitedAgent(unittest.TestCase):
 
     def run_in(self, fake, call):
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'press_key', fake.type_into), \
                 patch.object(agw, 'cursor_column', fake.cursor_column), \
                 patch.object(agw, 'request', side_effect=AssertionError('real terminal request')), \
                 patch.object(peerchat, 'now', self.clock.now), patch.object(peerchat, 'pause', self.clock.pause):
