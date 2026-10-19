@@ -397,6 +397,7 @@ class Delivery(DeliveryFixture):
         fake = FakeAgw('claude', frames=[CLAUDE_SUGGESTION], cursors=[2])
         self.send.side_effect = self.real_send
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'press_key', fake.type_into), \
                 patch.object(agw, 'cursor_column', fake.cursor_column):
             self.tick(0)
             self.tick(540)
@@ -488,6 +489,7 @@ class Delivery(DeliveryFixture):
         clock = Clock()
         self.send.side_effect = self.real_send
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'press_key', fake.type_into), \
                 patch.object(agw, 'cursor_column', fake.cursor_column), \
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
             self.tick(0)
@@ -651,6 +653,7 @@ class Delivery(DeliveryFixture):
         clock = Clock()
         self.send.side_effect = self.real_send
         with patch.object(agw, 'pane_text', fake.pane_text), patch.object(agw, 'type_into', fake.type_into), \
+                patch.object(agw, 'press_key', fake.type_into), \
                 patch.object(agw, 'cursor_column', fake.cursor_column), \
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
             self.tick(0)
@@ -2820,6 +2823,18 @@ class AutonomousClose(unittest.TestCase):
         self.assertFalse((self.state / 'helpers' / f'{self.REVMUX}.done').exists())     # its marker is gone
         self.assertGreaterEqual(self.t, closer.CLOSE_SETTLE)                            # panes had to settle
 
+    def test_an_agent_pane_that_no_longer_exists_does_not_block_the_close(self):
+        # #128: the implementer's pane was closed by hand (or a terminal restart renumbered it):
+        # it is nothing to wait for, and the planner's pane still closes with the session.
+        self.tree['workspaces'][0]['sessions'][0]['paneIds'] = [self.PLANNER]
+        del self.text[self.IMPLEMENTER]
+        self.r.close_after_merge(7)
+        self.assertEqual([self.REVMUX, self.PLANNER, self.RELAY], self.closes())
+        self.assertIn(f'codex pane {self.IMPLEMENTER} is gone: nothing left to close there', self.log())
+        self.assertNotIn('pane unreadable', self.log())
+        unpinned = [t for a, t in self.actions if a == 'unpin']
+        self.assertNotIn(self.IMPLEMENTER, unpinned, 'nothing to unpin in a pane that is gone')
+
     def test_no_pr_close_uses_the_same_gates_and_cleanup(self):
         self.write('loop-done.json', {'pr': None, 'noPr': True, 'issue': 7, 'at': 1})
         with patch.object(relay, 'gh_json', side_effect=lambda args: [] if args[:2] == ['pr', 'list'] else {'state': 'CLOSED'}):
@@ -3919,6 +3934,7 @@ class PointerRescueFixture(DeliveryFixture):
         self.send.side_effect = self.real_send
         self.enterContext(patch.object(agw, 'pane_text', side_effect=self.screen))
         self.enterContext(patch.object(agw, 'type_into', side_effect=self.type_into))
+        self.enterContext(patch.object(agw, 'press_key', side_effect=self.type_into))
         self.enterContext(patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor in fixture')))
         self.enterContext(patch.object(peerchat, 'now', self.clock.now))
         self.enterContext(patch.object(peerchat, 'pause', self.clock.pause))
@@ -3980,6 +3996,7 @@ class PointerRescue(PointerRescueFixture):
                 return
             typed_into(pane, text)
         self.enterContext(patch.object(agw, 'type_into', side_effect=clearing))
+        self.enterContext(patch.object(agw, 'press_key', side_effect=clearing))
         self.look(30)                                  # first look: remembered, nothing pressed
         self.assertEqual([], self.keys)
         self.look(60)
@@ -4159,6 +4176,7 @@ class StalePointers(unittest.TestCase):
         AutonomousClose.setUp(self)
         self.keys = []
         self.enterContext(patch.object(agw, 'type_into', side_effect=self.type_into))
+        self.enterContext(patch.object(agw, 'press_key', side_effect=self.type_into))
         self.enterContext(patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor in fixture')))
         clock = Clock()
         self.enterContext(patch.object(peerchat, 'now', clock.now))

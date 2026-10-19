@@ -584,8 +584,19 @@ class Closer:
             self.log(f"ignoring unread post-merge mail for the implementer: {', '.join(ignored)}")
         if (self.hub_dir.parent / '.git' / 'index.lock').exists():
             hard.append('.git/index.lock exists')
+        snapshot = None
         for peer in self.peers:
             try:
+                if snapshot is None:
+                    snapshot = agw.tree()
+                if agw.find_pane(peer.pane, snapshot) is None:
+                    # The pane no longer exists: closed by hand, or a terminal restart gave the
+                    # agents new ids (#128). Nothing is left there to wait for or to close, so it
+                    # is not a blocker; an unreadable pane that does exist still is.
+                    if self.decided.get(f'__gone__{peer.box}') != peer.pane:
+                        self.decided[f'__gone__{peer.box}'] = peer.pane
+                        self.log(f'{peer.box} pane {peer.pane} is gone: nothing left to close there')
+                    continue
                 text = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 hard.append(f'{peer.box} pane unreadable: {err}')
@@ -727,13 +738,15 @@ class Closer:
     def close_issue_session(self) -> None:
         agents = {peer.pane for peer in self.peers}
         snapshot = agw.tree()
+        # The session holding the agent panes, and nothing but agent panes: one of them may be
+        # gone already (#128); a human's split beside them must never go with it.
         issue_session = next((session for _, session in agw.sessions(snapshot)
-                              if set(agw.panes_of(session)) == agents), None)
+                              if agents & set(agw.panes_of(session)) and set(agw.panes_of(session)) <= agents), None)
         if issue_session is None:
             self.log('the issue session is already gone')
             return
         self.log(f"closing the issue session {issue_session.get('name')} ({issue_session.get('id')})")
-        for pane in sorted(agents):
+        for pane in sorted(agents & set(agw.panes_of(issue_session))):
             agw.clear_restore(pane)
         agw.close_session(issue_session.get('id'))
 

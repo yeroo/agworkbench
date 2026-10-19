@@ -206,6 +206,8 @@ def _cli_args(payload: dict[str, Any]) -> list[str]:
     out = [area] + ([verb] if verb else [])
     if cmd in ("session.type", "session.write", "session.paste"):
         out += ["--select", str(args_in.get("text", ""))]
+        if args_in.get("allow-control"):
+            out.append("--allow-control")
     elif cmd == 'session.new':
         for key, value in args_in.items():
             if isinstance(value, bool):
@@ -334,6 +336,15 @@ def cursor_column(pane_id: str) -> int:
 def type_into(pane_id: str, text: str) -> None:
     """Type keystrokes into a pane. A newline is Enter; a tab is Tab."""
     request("session.type", target=pane_id, args={"text": text})
+
+
+def press_key(pane_id: str, key: str) -> None:
+    """Press a key that is a control byte (Ctrl+U, an escape sequence), not text. agliteterm's
+    `session.type` refuses a control byte in typed text unless the caller says it is meant
+    (`allow-control`, the CLI's `--allow-control`): a NUL or an ESC inside a message would steer the
+    TUI instead of printing. peerchat refuses control characters inside a message's text, so only a
+    deliberate key reaches here. agwinterm and agterm type the byte either way."""
+    request("session.type", target=pane_id, args={"text": key, "allow-control": True})
 
 
 def close_session(session_id: str) -> None:

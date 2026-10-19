@@ -723,7 +723,8 @@ def clear_pointer(pane: str, profile: Profile, typed: str) -> bool:
         mine = owns(content, typed) if not pressed else compact(content) in compact(typed)
         if not mine:
             raise Refused(f"the composer holds something other than the pointer: {content[:60]!r}")
-        agw.type_into(pane, CLEAR_KEY)
+        # A key, not text: agliteterm refuses a control byte typed as text (#128).
+        agw.press_key(pane, CLEAR_KEY)
         pressed += 1
         pause(SETTLE)
 

@@ -15,6 +15,25 @@ def busy():
     return err
 
 
+class KeyPresses(unittest.TestCase):
+    """#128: a control key (Ctrl+U) is pressed, not typed as text: agliteterm refuses a control
+    byte in typed text unless the request says it is meant."""
+
+    def test_press_key_marks_the_control_byte_as_meant(self):
+        seen = []
+        with patch.object(agw, 'request', side_effect=lambda cmd, **kw: seen.append((cmd, kw))):
+            agw.press_key('p1', '\x15')
+            agw.type_into('p1', 'hello\n')
+        self.assertEqual(('session.type', {'target': 'p1', 'args': {'text': '\x15', 'allow-control': True}}), seen[0])
+        self.assertEqual(('session.type', {'target': 'p1', 'args': {'text': 'hello\n'}}), seen[1])
+
+    def test_the_cli_fallback_passes_allow_control_through(self):
+        pressed = agw._cli_args({'cmd': 'session.type', 'target': 'p1', 'args': {'text': '\x15', 'allow-control': True}})
+        typed = agw._cli_args({'cmd': 'session.type', 'target': 'p1', 'args': {'text': 'hello'}})
+        self.assertEqual(['session', 'type', '--select', '\x15', '--allow-control', '--target', 'p1'], pressed)
+        self.assertNotIn('--allow-control', typed)
+
+
 class OpenPipe(unittest.TestCase):
     def setUp(self):
         self.sleeps = []

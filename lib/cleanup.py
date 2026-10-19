@@ -45,6 +45,9 @@ HERE = Path(__file__).resolve().parent
 MODES = ('merged', 'build', 'off')
 BUILD_DIRS = frozenset({'target', 'node_modules', 'bin', 'obj'})
 AFTER_CLOSE_WAIT = 600.0        # how long after-close waits for the issue's sessions to go
+# A cleanup that gave up waiting leaves this in the checkout's `.workbench/state`, and the queue
+# conductor retries it on its ticks once the sessions are gone (`retry_pending`, #128).
+PENDING_NAME = 'cleanup-pending.json'
 AFTER_CLOSE_POLL = 5.0
 RENAME_TRIES = 3
 LOG_NAME = '.agworkbench-cleanup.log'
@@ -473,6 +476,7 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int | None, mode: str
             reason = f'kept: still open after {AFTER_CLOSE_WAIT:.0f}s: ' + ', '.join(live)
             log(root, checkout, reason)
             close_log(checkout, reason)
+            leave_pending(checkout, repo, issue, pr, mode, reason)
             return 1
         pause(AFTER_CLOSE_POLL)
     head = None
@@ -490,6 +494,56 @@ def after_close(checkout: Path, repo: str, issue: int, pr: int | None, mode: str
         close_log(checkout, 'kept: ' + '; '.join(reasons))
         return 1
     return 0
+
+
+def leave_pending(checkout: Path, repo: str, issue: int | str, pr: int | None, mode: str, reason: str) -> None:
+    """Record that this checkout's cleanup is owed (#128): after-close gave up waiting for a session
+    that stayed open (a relay that could not close its own session, a pane left by hand). The queue
+    conductor retries it once the issue's sessions are gone; `-Cleanup` sweeps it too."""
+    path = Path(checkout) / '.workbench' / 'state' / PENDING_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conductor.atomic_json(path, {'repo': repo, 'issue': int(issue), 'pr': pr, 'mode': mode, 'reason': reason,
+                                     'at': datetime.now(timezone.utc).isoformat(timespec='seconds')})
+        log(checkout.parent, checkout, 'cleanup pending: retried by the queue conductor once the sessions are gone')
+    except (OSError, ValueError) as err:
+        log(checkout.parent, checkout, f'could not record the pending cleanup: {err}')
+
+
+def retry_pending(checkout: Path, tree, gh=conductor.gh_json, pause: Callable[[float], None] = time.sleep) -> tuple[str, bool]:
+    """One try at a cleanup after-close left pending (#128): `(what happened, deleted)`. Nothing is
+    deleted while any `#N` session of the issue is open, or while the marker cannot be read; a
+    cleanup kept for another reason keeps its marker, with the reason returned, so the next try is
+    the sweep's or a human's."""
+    checkout = Path(checkout).resolve()
+    path = checkout / '.workbench' / 'state' / PENDING_NAME
+    try:
+        pending = conductor.read_json(path)
+        repo, issue, mode = pending['repo'], int(pending['issue']), pending['mode']
+        pr = pending.get('pr')
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        return f'kept: unreadable {PENDING_NAME}: {err}', False
+    try:
+        live = live_sessions(repo, issue, tree, closer.workspace_of(checkout / '.workbench', repo))
+    except ValueError as err:
+        return f'kept: {err}', False
+    if live:
+        return 'waiting: still open: ' + ', '.join(live), False
+    head = None
+    outcome = 'closed' if pr is None else None
+    if pr is not None:
+        try:
+            head = pr_head_of(repo, pr, gh)
+            outcome = 'merged' if head else 'closed'
+        except (OSError, ValueError, subprocess.SubprocessError) as err:
+            log(checkout.parent, checkout, f'PR head unknown ({err}); checking against remote-tracking refs only')
+    deleted, reasons, size = clean(checkout, repo=repo, issue=issue, root=checkout.parent, mode=mode, tree=tree,
+                                   pr_head=head, pause=pause, outcome=outcome, pr=pr)
+    if deleted:
+        return f'deleted ({mode}): freed {human(size)}', True
+    reason = 'kept: ' + '; '.join(reasons)
+    close_log(checkout, 'cleanup retry: ' + reason)
+    return reason, False
 
 
 # --- sweep -----------------------------------------------------------------------------------
