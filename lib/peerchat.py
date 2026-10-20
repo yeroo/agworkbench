@@ -729,6 +729,38 @@ def clear_pointer(pane: str, profile: Profile, typed: str) -> bool:
         pause(SETTLE)
 
 
+def clear_composer(pane: str, profile: Profile, content: str) -> bool:
+    """Delete `content`, whatever it is, from the composer with Ctrl+U, re-reading before each press
+    (#130). The first press needs the composer to show exactly that content (folded); later ones what
+    our presses left of it. True once the composer looks empty, False after CLEAR_PRESSES presses.
+    Refused, with nothing (more) pressed, when the composer cannot be read safely or shows other text.
+    """
+    pressed = 0
+    expected = compact(content)
+    while True:
+        text = agw.pane_text(pane)
+        if dialog_visible(text):
+            raise Refused("a chooser or approval dialog is on screen in the target pane")
+        now_content, state, _ = composer_state(pane, profile, text)
+        if now_content is not None and state == 'empty':
+            return True
+        if pressed >= CLEAR_PRESSES:
+            return False
+        if state in ('dialog', 'changing') or now_content is None:
+            raise Refused(f"the composer cannot be read safely ({state}); not clearing")
+        if state == 'ambiguous' and not pressed:
+            raise AmbiguousComposer(now_content)
+        folded = compact(now_content)
+        mine = folded == expected if not pressed else folded in expected
+        if not mine:
+            raise Refused(f"the composer shows other text than the stalled one; not clearing: {now_content[:60]!r}")
+        # A key, not text: agliteterm refuses a control byte typed as text (#128).
+        agw.press_key(pane, CLEAR_KEY)
+        pressed += 1
+        expected = folded
+        pause(SETTLE)
+
+
 def send(pane: str, profile: Profile, text: str, *, dry_run: bool, retry: bool) -> str:
     attempts = RETRY_ATTEMPTS if retry else 1
     for attempt in range(1, attempts + 1):

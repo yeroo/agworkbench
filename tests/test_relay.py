@@ -261,6 +261,9 @@ class DeliveryFixture(unittest.TestCase):
         # the reads a test scripted for deliver_mail.
         if not self.rescue_live:
             self.enterContext(patch.object(relay.Relay, 'rescue_pointers'))
+            # #130: likewise the composer watch is test_composer_watch's to test; its pane reads would
+            # use up the reads scripted here.
+            self.enterContext(patch.object(relay.Relay, 'watch_composers'))
 
     def tick(self, instant):
         self.t = instant

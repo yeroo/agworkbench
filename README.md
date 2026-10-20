@@ -1010,6 +1010,13 @@ changes. After two periods of silence it no longer does, and the pointer names i
   `stall`). The pointer quotes the implementer's last line, and the CI result on the open PR's head
   in a line `CI on the PR head: ...` (#94). As a defensive backstop it sends the `ci` mail instead
   if none named that result.
+- Text that sits typed-but-unsent in an agent's composer is the relay's, not yours (#130): nobody
+  types into an automatic session's panes by hand. Composer content older than `composerStallSeconds`
+  (default 60) is stalled: it no longer counts as a turn in progress for the stall watch, a pointer
+  for mail still unread is submitted by the pointer rescue, and anything else (copies of a pointer
+  typed over each other, a pointer for mail already read, text nobody can account for) is cleared
+  with Ctrl+U once the pane is idle, logged with the text removed, so the unread mail rings again
+  into an empty composer. Text that is not a relay pointer alerts you once.
 - After two more periods with no progress, and both panes idle for a whole period, it reports the
   loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
   a reason starting `stalled:` in queue mode.
@@ -1103,6 +1110,7 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
 | `minFreeRamGB` | `3` | the queue admits no member while less memory is free (GiB); `0` turns the guard off |
 | `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
+| `composerStallSeconds` | `60` | seconds text may sit typed-but-unsent in an agent's composer before the relay treats it as stalled and clears or submits it (see Stalls, #130); `0` turns the composer watch off |
 | `limitRetryMinutes` | `30` | with `-WaitOnLimit`: minutes between the relay's probes of an agent waiting out its usage limit, and the wait before rerunning a review round a reviewer's limit stopped (more than 0; see A slow queue that waits out usage limits) |
 | `closeHelpers` | `true` | the relay closes a finished revmux or suite helper session once its result mail has been read (see Finished helpers, before the merge); `false` keeps them until the loop's close |
 | `restartExited` | `true` | the relay restarts an agent that exited to its pane's shell with the pane's pinned command, at most 3 times an hour (see Exited agents); `false` leaves the pane alone |

@@ -67,6 +67,16 @@ Seven jobs, one loop, one process per issue, running in its own visible agwinter
    revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/` stay; each close is
    logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
 
+8. **Stalled composer text (#130).** Nobody types into an automatic session's panes by hand, so
+   text that sits typed-but-unsent in an agent's composer is the relay's: a pointer the TUI did not
+   take, one typed over another when the composer parser missed a draft, one left behind once its
+   mail was read some other way. Every `--limit-interval` seconds, watching, draining and in the
+   close, composer content older than `composerStallSeconds` (config, default 60; 0 = off) is
+   stalled: the stall watch no longer counts it as a turn in progress; exactly the pointer for mail
+   still unread is left to the pointer rescue (#96); anything else is cleared with Ctrl+U on the idle
+   pane (never mid-turn), logged with the text removed, and the unread mail rings again into the
+   empty composer. Text that is not a relay pointer alerts the human once.
+
 7. **Exited agents (#98).** On the same reads, whatever exempts the stall watch, it looks for an
    agent pane back at its root shell: the tree's `foregroundShells` names a live shell with no child
    in it, and the last row is a bare `PS X:\\...> ` prompt (a crash leaves the agent's frame above it,
@@ -126,6 +136,7 @@ sys.path.insert(0, str(HERE))
 from peerchat import is_busy  # noqa: E402 - also available as relay.is_busy
 import limits  # noqa: E402
 import closer  # noqa: E402
+import composer_watch  # noqa: E402
 import tslog  # noqa: E402
 
 PR_FIELDS = ("number,url,state,createdAt,updatedAt,closedAt,reviewDecision,mergedAt,reviews,comments,headRefName,"
@@ -136,6 +147,7 @@ ALERT_EVERY = 300.0
 TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
+COMPOSER_STALL_SECONDS = composer_watch.COMPOSER_STALL_SECONDS   # `composerStallSeconds` (#130), 0 = off
 # A pending set unchanged this long is stuck, not running (#94 r1): wait-ci's default --timeout, the
 # bound the CI-running exemption had while every planner ran wait-ci.
 CI_STUCK_MINUTES = 90.0
@@ -354,18 +366,30 @@ class PrFetch:
     previous: dict[str, Any] | None = None
 
 
-def stall_setting() -> float:
-    """`stallMinutes` from ~/.agworkbench.json (AGWORKBENCH_CONFIG honoured): a number >= 0, 0 = off.
-    The launcher refuses an invalid value; one that slips through here reads as the default."""
+def _config_number(key: str, default: float) -> float:
+    """A number >= 0 from ~/.agworkbench.json (AGWORKBENCH_CONFIG honoured); anything else reads as
+    the default."""
     path = Path(os.environ.get("AGWORKBENCH_CONFIG") or (Path.home() / ".agworkbench.json"))
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return STALL_MINUTES
-    value = config.get("stallMinutes") if isinstance(config, dict) else None
+        return default
+    value = config.get(key) if isinstance(config, dict) else None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        return STALL_MINUTES
+        return default
     return float(value)
+
+
+def stall_setting() -> float:
+    """`stallMinutes` from ~/.agworkbench.json (AGWORKBENCH_CONFIG honoured): a number >= 0, 0 = off.
+    The launcher refuses an invalid value; one that slips through here reads as the default."""
+    return _config_number("stallMinutes", STALL_MINUTES)
+
+
+def composer_stall_setting() -> float:
+    """`composerStallSeconds` from ~/.agworkbench.json (#130): seconds composer text may sit
+    typed-but-unsent before the relay clears or submits it; 0 turns the composer watch off."""
+    return _config_number("composerStallSeconds", COMPOSER_STALL_SECONDS)
 
 
 def _bool_setting(key: str) -> tuple[bool, str]:
@@ -703,8 +727,13 @@ class StallWatch:
             text = texts.get(peer.box)
             if not isinstance(text, str):
                 reasons.append(f"{peer.box} pane unreadable")
-            else:
-                reasons += closer.idle_blockers(peer, text)
+                continue
+            blockers = closer.idle_blockers(peer, text)
+            if self.relay.composers.stalled(peer.box):
+                # #130: text that has sat in the composer past composerStallSeconds is stalled text the
+                # composer watch deals with, not an agent at work; it must not hide a stall.
+                blockers = [reason for reason in blockers if 'composer is not provably empty' not in reason]
+            reasons += blockers
         return reasons
 
     # --- the tick -------------------------------------------------------------------------------
@@ -1191,7 +1220,8 @@ class ExitWatch:
 class Relay:
     def __init__(self, hub_dir: Path, peers: list[Peer], repo: str, branch: str,
                  mail_interval: float, pr_interval: float, dry_run: bool = False,
-                 limit_interval: float = 30.0, stall_minutes: float = 0.0):
+                 limit_interval: float = 30.0, stall_minutes: float = 0.0,
+                 composer_stall_seconds: float = COMPOSER_STALL_SECONDS):
         os.environ["AI_HUB"] = str(hub_dir)
         import hub  # noqa: E402 - imported after AI_HUB is set so its paths point at this workbench
         hub.reload_paths()
@@ -1251,6 +1281,13 @@ class Relay:
             self._save()
         self.agmsg = HERE / "agmsg.py"
         self.holds: dict[tuple[str, str], Hold] = {}
+        # #130: composer text that sits past composerStallSeconds is stalled: cleared, or left to the
+        # rescue when it is exactly the pointer for unread mail; the stall watch and deliver_mail read it.
+        self.composers = composer_watch.ComposerWatch(
+            self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
+            pointer=lambda message: closer.relay_pointer(message, self.agmsg, self.hub_dir),
+            alert=lambda peer, reason: self.alert_pane(peer, f"{peer.box} composer: {reason}"),
+            clock=lambda: now(), stall_seconds=composer_stall_seconds)
         # #96: a pointer left typed-but-unsent in a composer gets submitted on a later look.
         self.rescue = closer.PointerRescue(
             self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
@@ -1320,8 +1357,11 @@ class Relay:
                 self.alert(peer, mid, entry.reason)
 
     def alert(self, peer: Peer, mid: str, reason: str) -> None:
+        self.alert_pane(peer, f"workbench mail for {peer.box} ({mid}) is waiting: {reason}")
+
+    def alert_pane(self, peer: Peer, message: str) -> None:
+        """Blocked status, sound and a notification on the peer's pane, logged as ALERT."""
         import agw
-        message = f"workbench mail for {peer.box} ({mid}) is waiting: {reason}"
         self.log(f"ALERT {message}")
         # Attempt the notification even if setting status failed (and vice versa).
         try:
@@ -1893,6 +1933,8 @@ class Relay:
             except (agw.CtlError, OSError) as err:
                 close.log(f"helper check failed: {err}")
             try:
+                # #130: stalled composer text is cleared first; it would block the close as a draft.
+                self.watch_composers()
                 # #96: a pointer for mail still unread is submitted; one nobody needs to read is cleared.
                 self.rescue_pointers(skip=lambda peer, message: close.needs_no_reading(number, peer, message))
                 self.rung(close.clear_stale_pointers(number))
@@ -2014,6 +2056,13 @@ class Relay:
             return
         self.rung(self.rescue.step(self.read_panes(), skip=skip))
 
+    def watch_composers(self) -> None:
+        """One composer-watch look at both panes (#130): text that has sat typed-but-unsent past
+        composerStallSeconds is cleared (or, exactly the pointer for unread mail, left to the rescue)."""
+        if self.dry_run:
+            return
+        self.composers.step(self.read_panes())
+
     def rung(self, pointers) -> None:
         """Count each (peer, mid) whose pointer is dealt with - rescued, or cleared by the close - as
         rung: announced (saved, so neither deliver_mail nor a restart types it again), hold cleared."""
@@ -2095,7 +2144,8 @@ class Relay:
                     self.hold(peer, mid, str(refusal))
                     continue
                 except peerchat.Failed as failure:
-                    # Next tick may retry only through peerchat's empty-composer precheck.
+                    # Next tick may retry only through peerchat's empty-composer precheck; what a
+                    # failed ring leaves in the composer, the composer watch clears (#130).
                     self.hold(peer, mid, str(failure), failed=True)
                     continue
                 except (agw.CtlError, OSError) as err:
@@ -2502,6 +2552,10 @@ class Relay:
                 # Watching and draining alike (#96): a late pointer is rung while the drain runs.
                 next_rescue = now() + self.limit_interval
                 try:
+                    self.watch_composers()
+                except Exception as err:  # noqa: BLE001 - a watch bug must never stop the doorbell
+                    self.log(f"composer watch failed: {type(err).__name__}: {err}")
+                try:
                     self.rescue_pointers()
                 except Exception as err:  # noqa: BLE001 - a rescue bug must never stop the doorbell
                     self.log(f"pointer rescue failed: {type(err).__name__}: {err}")
@@ -2594,7 +2648,8 @@ def main(argv: list[str] | None = None) -> int:
     peers = peers_for(args)
     relay = Relay(Path(args.hub), peers, args.repo, args.branch, args.mail_interval,
                   args.pr_interval, dry_run=args.dry_run, limit_interval=args.limit_interval,
-                  stall_minutes=args.stall_minutes if args.stall_minutes is not None else stall_setting())
+                  stall_minutes=args.stall_minutes if args.stall_minutes is not None else stall_setting(),
+                  composer_stall_seconds=composer_stall_setting())
     try:
         return relay.run()
     except KeyboardInterrupt:
