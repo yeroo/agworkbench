@@ -339,7 +339,7 @@ class Submission(unittest.TestCase):
                       stable_frames(wrapped, CLAUDE_IDLE), cursors=[2])
         self.assertEqual('submitted', self.send(fake))
         self.assertEqual([TEXT, '\n'], fake.keys)
-        self.assertAlmostEqual(2 * peerchat.SETTLE + .25, self.clock.t)
+        self.assertAlmostEqual(2 * peerchat.SETTLE + .25 + peerchat.ECHO_TIMEOUT, self.clock.t)  # #130: the echo wait
 
     def test_second_snapshot_dialog_withholds_typing_and_submit(self):
         for after_typing in [False, True]:

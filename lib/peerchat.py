@@ -60,12 +60,16 @@ RETRY_DELAY = 10.0
 SETTLE = 0.35            # let the TUI redraw before reading it back
 VERIFY_TIMEOUT = 3.0
 SUBMIT_TIMEOUT = 5.0
+ECHO_TIMEOUT = 2.0       # after the composer emptied, how long the transcript gets to echo the text (#130)
 SUBMIT_RETRIES = 3
 MAX_TYPED = 1200         # longer than this belongs in the inbox, not in a composer
 FRAGMENT = 24            # how much of the typed text must be visible before submitting
 CLEAR_KEY = "\x15"       # Ctrl+U: delete to the start of the line; inert on an empty one
 CLEAR_PRESSES = 3
 POINTER_ID_RE = re.compile(r"\[id\s+([^\]\s]+)\]")
+# The same across a row break inside the id (a wrapped composer joins rows with a space, #130 r3):
+# the group is folded with `compact` before use.
+WRAPPED_ID_RE = re.compile(r"\[id\s+([^\]]+)\]")
 QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
 CLAUDE_BUSY_RE = re.compile(r"…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·")
 
@@ -154,6 +158,68 @@ PROFILES = {
 }
 
 
+def _note_to_stderr(text: str) -> None:
+    print(f"peer-chat: {text}", file=sys.stderr)
+
+
+# Where a send's remarks go that are not its outcome (#130): the relay points this at its log.
+NOTE = _note_to_stderr
+
+
+def note(text: str) -> None:
+    NOTE(text)
+
+
+def composer_block_start(lines: list[str]) -> int:
+    """Where the last non-blank block begins in `lines`, after the trailing blank, footer and status
+    rows `trailing_block` strips; a rule row inside that block is the composer's top edge, so the
+    history cell drawn right above the rule stays transcript (#130 r3)."""
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if end and (FOOTER_RE.match(lines[end - 1]) or FOOTER_RIGHT_RE.match(lines[end - 1])):
+        end -= 1
+        while end and not lines[end - 1].strip():
+            end -= 1
+        if end and CODEX_STATUS_RE.match(lines[end - 1]):
+            end -= 1
+            while end and not lines[end - 1].strip():
+                end -= 1
+    start = end
+    while start and lines[start - 1].strip():
+        start -= 1
+    for i in range(end - 1, start - 1, -1):
+        if RULE_RE.match(lines[i]):
+            return i
+    return start
+
+
+def transcript_rows(tool: str, frame: str) -> str:
+    """The pane above its composer region: for Claude everything before the rule above the prompt,
+    for Codex and Kimi everything before the composer block (`composer_block_start`)."""
+    lines = frame.splitlines()
+    if tool == 'claude':
+        rules = [i for i, line in enumerate(lines) if RULE_RE.match(line)]
+        if len(rules) >= 2:
+            return "\n".join(lines[:rules[-2]])
+        return frame
+    return "\n".join(lines[:composer_block_start(lines)])
+
+
+def echoed(tool: str, frame: str, typed: str, before: str | None = None) -> bool:
+    """The typed text shows in the transcript (the pane above its composer) as the echo of what was
+    submitted: its message id, or its first FRAGMENT characters, and not already there in `before`,
+    the frame read before the text was typed (a stale echo of an earlier send, or the same probe text
+    sent an hour ago, is no evidence). Read only once the composer is empty."""
+    visible = compact(transcript_rows(tool, frame))
+    was = compact(transcript_rows(tool, before)) if before is not None else ''
+    marker = POINTER_ID_RE.search(typed)
+    needle = compact(marker.group(0)) if marker else compact(typed)[:FRAGMENT]
+    if not needle or needle not in visible:
+        return False
+    return needle not in was
+
+
 class Refused(RuntimeError):
     """A pre-write check failed. Nothing was typed, so retrying is safe."""
 
@@ -201,10 +267,17 @@ def owns(content: str, typed: str) -> bool:
     return len(visible) * 2 >= len(attempted)
 
 
+def pointer_ids(content: str | None) -> list[str]:
+    """Every message id (`[id X]`) in composer content, in order, once each, read across a row
+    break inside the id (#130 r3): a wrapped composer joins its rows with a space."""
+    found = [compact(group) for group in WRAPPED_ID_RE.findall(content or "")]
+    return list(dict.fromkeys(mid for mid in found if mid))
+
+
 def pointer_id(content: str | None) -> str | None:
     """The message id of a relay pointer (`[id X]`) in composer content; None without a whole one."""
-    found = POINTER_ID_RE.search(content or "")
-    return found.group(1) if found else None
+    ids = pointer_ids(content)
+    return ids[0] if ids else None
 
 
 def queued_for(text: str, typed: str) -> bool:
@@ -517,7 +590,9 @@ def resolve_target(to: str, pane_opt: str | None, session_opt: str | None) -> tu
 
 # --- sending --------------------------------------------------------------------------------
 
-def precheck(pane: str, profile: Profile) -> None:
+def precheck(pane: str, profile: Profile) -> str:
+    """Refuse a composer that is not provably empty; returns the frame it read, the one `send_once`
+    hands `verify_submitted` as the state before typing (#130)."""
     text = agw.pane_text(pane)
     if dialog_visible(text):
         raise Refused("a chooser or approval dialog is on screen in the target pane")
@@ -534,6 +609,7 @@ def precheck(pane: str, profile: Profile) -> None:
         if profile.tool != 'claude':
             raise Refused(f"the target composer is not empty: {content[:60]!r}")
         raise Refused(f"composer holds a draft: {content[:60]!r}")
+    return text
 
 
 def verify_typed(pane: str, profile: Profile, typed: str) -> None:
@@ -574,17 +650,19 @@ def verify_typed(pane: str, profile: Profile, typed: str) -> None:
 
 
 def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: int | None = None,
-                     fallback: bool = True) -> str:
+                     fallback: bool = True, before: str | None = None) -> str:
     """Verify an empty composer; retry only the key, with a fresh guard before each press.
     `max_retries` bounds the extra submit keys (SUBMIT_RETRIES by default) and `fallback` allows
     Codex's one Return after them; `resubmit` turns both off so that one rescue attempt is exactly
-    one key."""
+    one key. `before` is the frame read before the text was typed: the echo that proves the submit
+    (#130) must be new relative to it. Each extra key is noted (`NOTE`) with what the composer showed."""
     limit = SUBMIT_RETRIES if max_retries is None else max_retries
     retries = 0
     returned = False
     suffix = ''
     needs_key = False
     deadline = now() + SUBMIT_TIMEOUT
+    empty_since = None
     content = None
     phase = 'verifying submit'
     try:
@@ -605,8 +683,24 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
                 # Ambiguous with a literal draft before typing; only accept it after our submit.
                 return 'queued' + suffix
             elif state == 'empty':
-                outcome = 'queued' if profile.tool == 'codex' and queued_for(fresh, typed) else 'submitted'
-                return ('submitted' if returned else outcome) + suffix
+                if profile.tool == 'codex' and queued_for(fresh, typed) and not returned:
+                    return 'queued' + suffix
+                # Ask 1 of #130: the submit is proven by the transcript's echo of the text, not by
+                # the composer alone, which a slow redraw or a hidden draft can show empty. The
+                # transcript gets ECHO_TIMEOUT to draw it; without an echo the send still counts
+                # (a scrolled transcript or a TUI that draws no echo would otherwise make every
+                # delivery a retype) and the shortfall is noted for the relay's log; the composer
+                # watch clears a copy that was never sent.
+                if echoed(profile.tool, fresh, typed, before):
+                    return 'submitted' + suffix
+                if empty_since is None:
+                    empty_since = now()
+                if now() - empty_since < ECHO_TIMEOUT:
+                    pause(0.25)
+                    continue
+                note(f"submit not confirmed by an echo in the transcript within {ECHO_TIMEOUT:.0f}s "
+                     f"({typed[:60]!r}); counted as submitted")
+                return 'submitted' + suffix
             elif state == 'ambiguous' and not owns(content, typed):
                 if now() >= deadline:
                     raise Failed('pointer not confirmed in the composer; composer shows other text with '
@@ -620,6 +714,8 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
                     key = profile.submit
                     phase = f'retry {retries}'
                     suffix = f' after retry {retries}'
+                    note(f"submit retry {retries} of {limit} for {typed[:40]!r}: the composer still shows "
+                         f"{(content or '')[:60]!r}")
                 elif (fallback and profile.tool == 'codex' and not returned and not any(
                         is_busy(snapshot) or 'esc to interrupt' in snapshot.lower()
                         or 'queued follow-up inputs' in snapshot.lower() for snapshot in (frame, fresh))):
@@ -627,6 +723,8 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
                     returned = True
                     phase = 'Return fallback'
                     suffix = ' after Return'
+                    note(f"submit Return fallback for {typed[:40]!r}: Tab did not take it, the composer still "
+                         f"shows {(content or '')[:60]!r}")
                 else:
                     raise Failed(f"pointer still unsent in composer: {content!r}; submit retries exhausted")
                 agw.type_into(pane, key)
@@ -634,6 +732,7 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
                 phase = 'verifying submit' + suffix
                 deadline = now() + SUBMIT_TIMEOUT
                 needs_key = False
+                empty_since = None      # the key that took gets its own echo window (#130 r3)
                 continue
             elif now() >= deadline:
                 # Re-read before any additional key: the deadline frame is not authorization
@@ -647,7 +746,7 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
 
 def send_once(pane: str, profile: Profile, text: str, *, dry_run: bool) -> str:
     reject_control_bytes(text)   # defence in depth: every path into a pane passes through here
-    precheck(pane, profile)
+    before = precheck(pane, profile)
     if dry_run:
         print(f"[dry-run] would type {len(text)} chars into pane {pane} "
               f"and submit with {'Tab' if profile.submit == chr(9) else 'Return'}", file=sys.stderr)
@@ -662,7 +761,7 @@ def send_once(pane: str, profile: Profile, text: str, *, dry_run: bool) -> str:
         phase = 'submitting'
         agw.type_into(pane, profile.submit)
         pause(SETTLE)
-        return verify_submitted(pane, profile, text)
+        return verify_submitted(pane, profile, text, before=before)
     except (agw.CtlError, OSError) as err:
         raise Failed(f"{phase}: {err}") from err
 
@@ -696,7 +795,41 @@ def resubmit(pane: str, profile: Profile, typed: str) -> str:
         pause(SETTLE)
     except (agw.CtlError, OSError) as err:
         raise Failed(f"submitting: {err}") from err
-    return verify_submitted(pane, profile, typed, max_retries=0, fallback=False)
+    return verify_submitted(pane, profile, typed, max_retries=0, fallback=False, before=text)
+
+
+def _clear(pane: str, profile: Profile, mine: Callable[[str, int], bool], what: str,
+           idle: Callable[[str], bool] | None = None, on_press: Callable[[], None] | None = None) -> bool:
+    """Delete what `mine(content, presses_so_far)` owns from the composer with Ctrl+U, re-reading
+    before each press. True once the composer looks empty, False after CLEAR_PRESSES presses. Refused,
+    with nothing (more) pressed, when the composer cannot be read safely, shows other text, or `idle`
+    says a turn has started in either of the two snapshots read before the press: never a key into a
+    running turn (#130). `on_press` is told of each key, so a caller can tell an interrupted clear
+    (a read that failed after a press) from one that never pressed."""
+    pressed = 0
+    while True:
+        text = agw.pane_text(pane)
+        if dialog_visible(text):
+            raise Refused("a chooser or approval dialog is on screen in the target pane")
+        content, state, fresh = composer_state(pane, profile, text)
+        if content is not None and state == 'empty':
+            return True
+        if pressed >= CLEAR_PRESSES:
+            return False
+        if state in ('dialog', 'changing') or content is None:
+            raise Refused(f"the composer cannot be read safely ({state}); not clearing")
+        if state == 'ambiguous' and not pressed:
+            raise AmbiguousComposer(content)
+        if not mine(content, pressed):
+            raise Refused(f"the composer holds something other than {what}: {content[:60]!r}")
+        if idle is not None and not (idle(text) and idle(fresh)):
+            raise Refused("a turn started in the target pane; not pressing into it")
+        # A key, not text: agliteterm refuses a control byte typed as text (#128).
+        agw.press_key(pane, CLEAR_KEY)
+        pressed += 1
+        if on_press is not None:
+            on_press()
+        pause(SETTLE)
 
 
 def clear_pointer(pane: str, profile: Profile, typed: str) -> bool:
@@ -706,27 +839,30 @@ def clear_pointer(pane: str, profile: Profile, typed: str) -> bool:
     (a part of the pointer, which our own press made). True once the composer looks empty, False
     after CLEAR_PRESSES presses. Refused, with nothing (more) pressed, on anything else.
     """
-    pressed = 0
-    while True:
-        text = agw.pane_text(pane)
-        if dialog_visible(text):
-            raise Refused("a chooser or approval dialog is on screen in the target pane")
-        content, state, _ = composer_state(pane, profile, text)
-        if content is not None and state == 'empty':
-            return True
-        if pressed >= CLEAR_PRESSES:
-            return False
-        if state in ('dialog', 'changing') or content is None:
-            raise Refused(f"the composer cannot be read safely ({state}); not clearing")
-        if state == 'ambiguous' and not pressed:
-            raise AmbiguousComposer(content)
-        mine = owns(content, typed) if not pressed else compact(content) in compact(typed)
-        if not mine:
-            raise Refused(f"the composer holds something other than the pointer: {content[:60]!r}")
-        # A key, not text: agliteterm refuses a control byte typed as text (#128).
-        agw.press_key(pane, CLEAR_KEY)
-        pressed += 1
-        pause(SETTLE)
+    return _clear(pane, profile,
+                  lambda content, pressed: owns(content, typed) if not pressed else compact(content) in compact(typed),
+                  'the pointer')
+
+
+def clear_composer(pane: str, profile: Profile, content: str,
+                   idle: Callable[[str], bool] | None = None,
+                   on_press: Callable[[], None] | None = None) -> bool:
+    """Delete `content`, whatever it is, from the composer with Ctrl+U, re-reading before each press
+    (#130). The first press needs the composer to show exactly that content (folded); later ones what
+    our presses left of it. `idle(frame)` false before a press refuses it: a turn has started. True once
+    the composer looks empty, False after CLEAR_PRESSES presses; Refused, with nothing (more) pressed,
+    when the composer cannot be read safely or shows other text.
+    """
+    expected = [compact(content)]
+
+    def mine(now_content: str, pressed: int) -> bool:
+        folded = compact(now_content)
+        ok = folded == expected[0] if not pressed else folded in expected[0]
+        if ok:
+            expected[0] = folded
+        return ok
+
+    return _clear(pane, profile, mine, 'the stalled text', idle, on_press)
 
 
 def send(pane: str, profile: Profile, text: str, *, dry_run: bool, retry: bool) -> str:

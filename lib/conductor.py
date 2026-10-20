@@ -522,6 +522,19 @@ def watched_spec(data):
     return 'where: ' + data['query'] if data.get('query') else 'label:' + data['label']
 
 
+def composer_stall_setting(config):
+    """`composerStallSeconds` from the queue's config file (#130): a number >= 0 (0 turns the
+    conductor's composer watch off, as it does the relay's); anything else reads as None, the default."""
+    try:
+        settings = read_json(config) if config else {}
+    except (OSError, ValueError, TypeError):
+        return None
+    value = settings.get('composerStallSeconds') if isinstance(settings, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
 def config_path():
     return Path(os.environ.get('AGWORKBENCH_CONFIG', Path.home() / '.agworkbench.json')).resolve()
 
@@ -1855,7 +1868,8 @@ class Worker:
             peers = [types.SimpleNamespace(box=box, tool=registry[box].get('tool', box), pane=registry[box]['pane'])
                      for box in ('claude', 'codex')]
             watch['attempt'] = closer.Closer(hub_dir, data['repo'], number, peers, workspace=queue_workspace(data),
-                                             log=lambda text: print(f'{self.tag}#{number} {text}', flush=True), clock=self.clock)
+                                             log=lambda text: print(f'{self.tag}#{number} {text}', flush=True), clock=self.clock,
+                                             composer_stall_seconds=composer_stall_setting(data.get('config')))
             subject = f'PR #{pr} (issue #{number}) merged' if pr is not None else f'issue #{number} closed without a PR'
             watch['attempt'].log(f'{subject} and its relay is gone; the conductor runs the close')
             if str(m.get('closeStuck', '')).startswith(RELAY_ALIVE):
@@ -1920,6 +1934,8 @@ class Worker:
                 return
         attempt.step_helpers(gate=(lambda: attempt.issue_closed(self.gh)[0] is True) if pr is None else None)
         try:
+            # #130: stalled composer text goes first; it would block the close as a draft.
+            attempt.watch_composers(pr)
             # #96: a pointer for mail still unread is submitted; one nobody needs to read is cleared.
             attempt.rescue_pointers(pr)
             attempt.clear_stale_pointers(pr)
