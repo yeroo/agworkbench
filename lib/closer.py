@@ -689,26 +689,35 @@ class Closer:
                 texts[peer.box] = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 texts[peer.box] = err
-        return self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message))
+        return self.pointers_dealt_with(
+            self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message)))
 
-    def watch_composers(self, number: int | None = None) -> list:
+    def pointers_dealt_with(self, pointers: list) -> list:
+        """Pointers the backstop's rescue submitted or its stale clear deleted are pending from no
+        interrupted clear in this close's own composer watch (#130 r4, round 5), so its next empty
+        look does not report them as cleared. Returns `pointers` for the caller."""
+        if self.composers is not None:
+            for peer, mid in pointers:
+                self.composers.sent(peer.box, mid)
+        return pointers
+
+    def watch_composers(self) -> list:
         """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
         relay runs its own. Stalled text goes before the agents are judged idle, so a duplicated or
         mangled pointer for mail the close does not wait for cannot hold the close until its timeout.
-        The conductor types no pointer, so a pointer for mail the close waits for (the planner's,
-        pre-merge implementer mail) is never cleared here, however often the rescue failed to submit
-        it: it stays for the rescue and the human, and the unread mail holds the close."""
+        The conductor types no pointer, so text carrying a pointer for the planner's unread mail,
+        whose hold no timeout lifts, is never cleared here, exact, duplicated or mangled, however
+        often the rescue failed to submit it (the watch's `skip`): it stays for the rescue and the
+        human, logged once, and the unread mail holds the close. Text for the implementer's mail is
+        cleared as anywhere else: its pre-merge mail holds the close for the #44 ten minutes and no
+        longer, as the README says, and a stuck pointer must not turn that into a refusal."""
         if self.dry_run:
             return []
         if self.composers is None:
             import composer_watch
 
             def exhausted(box: str, mid: str) -> bool:
-                if self.rescue is None or self.rescue.attempts.get((box, mid), 0) < RESCUE_ATTEMPTS:
-                    return False
-                peer = next((p for p in self.peers if p.box == box), None)
-                message = self.unread_message(box, mid)
-                return peer is not None and message is not None and self.needs_no_reading(number, peer, message)
+                return self.rescue is not None and self.rescue.attempts.get((box, mid), 0) >= RESCUE_ATTEMPTS
             self.composers = composer_watch.ComposerWatch(
                 self.peers, unread_message=self.unread_message,
                 pointer=lambda message: relay_pointer(message, AGMSG, self.hub_dir), log=self.log,
@@ -724,7 +733,7 @@ class Closer:
                 texts[peer.box] = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 texts[peer.box] = err
-        return self.composers.step(texts)
+        return self.composers.step(texts, skip=lambda peer, message: message is not None and peer.box != 'codex')
 
     def clear_stale_pointers(self, number: int | None) -> list:
         """Delete a relay pointer that no longer needs reading from a settled, idle composer (#96).
@@ -782,7 +791,7 @@ class Closer:
                 cleared_pointers.append((peer, mid))
             else:
                 self.log(f"could not clear {where}: not empty after {peerchat.CLEAR_PRESSES} presses")
-        return cleared_pointers
+        return self.pointers_dealt_with(cleared_pointers)
 
     def close_issue_session(self) -> None:
         agents = {peer.pane for peer in self.peers}

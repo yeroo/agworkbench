@@ -80,11 +80,13 @@ Eight jobs, one loop, one process per issue, running in its own visible agwinter
    rings again into the empty composer. Text that is not the relay's alerts the human once; in a
    pane that is not the workbench's (an adopted Claude planner, whatever the loop's autonomy; a
    manual launch) only the relay's own text is cleared and a draft is left alone. The conductor's
-   backstop clears the same way but types no pointer, so it never clears a pointer for mail the
-   close waits for: the planner's unread mail still holds its close.
+   backstop clears the same way but types no pointer, so text for the planner's unread mail, whose
+   hold no timeout lifts, is never cleared there and that mail still holds its close; text for the
+   implementer's mail is cleared as anywhere else, its ten-minute hold before the merge standing.
    A ring that failed after typing settles before anything is typed into that composer again: the
    composer must read empty for `composerStallSeconds` (a slow redraw hides typed text for seconds;
-   typing again doubled it), or the rescue or the watch must have dealt with the text. A submit is
+   typing again doubled it; with the watch off, 0, the wait is SETTLE_SECONDS_WHEN_OFF, 60 s), or
+   the rescue or the watch must have dealt with the text. A submit is
    proven by the transcript's echo of the text within ECHO_TIMEOUT; without one the send still
    counts and the shortfall is logged.
 
@@ -159,6 +161,9 @@ TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
 COMPOSER_STALL_SECONDS = composer_watch.COMPOSER_STALL_SECONDS   # `composerStallSeconds` (#130), 0 = off
+# How long a failed ring settles when the composer watch is off: 0 cannot mean "type again at once",
+# which is what doubled the pointer on docxy-project-pro #12.
+SETTLE_SECONDS_WHEN_OFF = composer_watch.COMPOSER_STALL_SECONDS
 # A pending set unchanged this long is stuck, not running (#94 r1): wait-ci's default --timeout, the
 # bound the CI-running exemption had while every planner ran wait-ci.
 CI_STUCK_MINUTES = 90.0
@@ -1311,7 +1316,7 @@ class Relay:
             alert=lambda peer, mid, reason: self.alert(peer, mid, reason),
             resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now(),
             read_message=lambda box, mid: self.read_message(box, mid),
-            cleared=lambda peer, mid: self.settle(peer.box))
+            cleared=lambda peer, mid: self.pointer_gone(peer, mid))
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
@@ -2095,6 +2100,12 @@ class Relay:
             self.state["announced"] = sorted(announced)
             self._save()
 
+    def pointer_gone(self, peer: Peer, mid: str) -> None:
+        """The rescue deleted a stale pointer (#96): the composer a failed ring typed into has
+        settled, and the mail is pending from no interrupted clear (#130 r4, round 4)."""
+        self.settle(peer.box)
+        self.composers.sent(peer.box, mid)
+
     def settle(self, box: str) -> None:
         """The composer of `box` is accounted for: rings may go into it again (#130)."""
         if box in self.unsettled:
@@ -2103,13 +2114,14 @@ class Relay:
 
     def unsettled_reason(self, peer: Peer) -> str | None:
         """Why nothing is typed into this box yet after a ring failed into it (#130), or None once it
-        has settled: the composer read empty for composerStallSeconds (a slow redraw hides typed text
-        for seconds, and typing again would double it, as it did on docxy-project-pro #12)."""
+        has settled: the composer read empty for composerStallSeconds, or SETTLE_SECONDS_WHEN_OFF with
+        the watch off (a slow redraw hides typed text for seconds, and typing again would double it,
+        as it did on docxy-project-pro #12)."""
         import agw
         import peerchat
         if peer.box not in self.unsettled:
             return None
-        wait = self.composers.stall_seconds if self.composers.stall_seconds > 0 else COMPOSER_STALL_SECONDS
+        wait = self.composers.stall_seconds if self.composers.stall_seconds > 0 else SETTLE_SECONDS_WHEN_OFF
         try:
             text = agw.pane_text(peer.pane)
             content, state, _ = peerchat.composer_state(peer.pane, peerchat.PROFILES[peer.tool], text)
@@ -2143,6 +2155,9 @@ class Relay:
             announced.add(mid)
             self.clear(peer, mid)
             self.settle(peer.box)
+            # Pending from an interrupted clear no more: the pointer is dealt with, submitted or
+            # deleted (#130 r4, round 2).
+            self.composers.sent(peer.box, mid)
         self.state["announced"] = sorted(announced)
         self._save()
 
@@ -2233,6 +2248,9 @@ class Relay:
                     self.hold(peer, mid, f"terminal not reachable: {err}")
                     continue
                 announced.add(mid)
+                # Pending from an interrupted clear no more: the pointer went (#130 r4, round 3), so
+                # the next empty look does not un-announce it and ring it twice.
+                self.composers.sent(peer.box, mid)
                 self.state["announced"] = sorted(announced)
                 self._save()
 

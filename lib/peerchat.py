@@ -69,8 +69,12 @@ CLEAR_PRESSES = 3
 POINTER_ID_RE = re.compile(r"\[id\s+([^\]\s]+)\]")
 # The same across a row break inside the id (a wrapped composer joins rows with a space, #130 r3):
 # the group is folded with `compact` before use.
-WRAPPED_ID_RE = re.compile(r"\[id\s+([^\]]+)\]")
+# No `[` inside: an unmatched `[id ` earlier in the text must not swallow the whole marker after it.
+WRAPPED_ID_RE = re.compile(r"\[id\s+([^\[\]]+)\]")
 QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
+# What Claude Code draws in its composer while a submitted message waits for the running turn: not
+# a draft, nothing to clear (#130: the composer watch leaves it; `verify_submitted` counts it sent).
+CLAUDE_QUEUED_HINT = 'Press up to edit queued messages'
 CLAUDE_BUSY_RE = re.compile(r"…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·")
 
 # Claude Code draws its composer as a `>` line between two horizontal rules; agwinterm renders the
@@ -679,7 +683,7 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
             elif content is None:
                 if needs_key or now() >= deadline:
                     raise Failed('composer disappeared after submit; further keys withheld')
-            elif profile.tool == 'claude' and content == 'Press up to edit queued messages':
+            elif profile.tool == 'claude' and content == CLAUDE_QUEUED_HINT:
                 # Ambiguous with a literal draft before typing; only accept it after our submit.
                 return 'queued' + suffix
             elif state == 'empty':
