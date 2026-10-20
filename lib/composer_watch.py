@@ -40,6 +40,8 @@ draft, so a member can hang for hours on it.
   Claude (the caller's own session, `claude.json` origin `adopted`) is the human's whatever the loop's
   autonomy. In a pane that is not automatic only text the relay typed (it starts with
   `closer.POINTER_LABEL`) is cleared; a human's draft is logged once and left alone.
+- Claude Code's "Press up to edit queued messages" is a submitted message waiting for the running
+  turn, not a draft: it is never timed or cleared.
 - While the pane runs a turn nothing is pressed: the clock runs, the key waits for the idle pane, and
   `clear_composer` refuses between presses if a turn starts.
 
@@ -109,6 +111,11 @@ class ComposerWatch:
                 continue
             if state in ('missing', 'changing', 'dialog'):
                 # Unreadable or moving: the clock keeps what it has, nothing is judged on this look.
+                continue
+            if peer.tool == 'claude' and content == peerchat.CLAUDE_QUEUED_HINT:
+                # A submitted message waiting for the running turn, drawn where a draft would be:
+                # nothing sits unsent, nothing is cleared (seen on balatro #10, 2026-10-20).
+                self.forget(peer.box)
                 continue
             if state == 'empty':
                 self.forget(peer.box)

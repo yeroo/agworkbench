@@ -432,6 +432,21 @@ class InterruptedClearRemainder(ComposerWatchFixture):
         self.assertEqual([self.pointer, '\t'], self.keys, 'typed once')
 
 
+class QueuedHint(ComposerWatchFixture):
+    def test_claude_codes_queued_messages_hint_is_not_stalled_text(self):
+        def state(pane, profile, text):
+            if profile.tool == 'claude':
+                return peerchat.CLAUDE_QUEUED_HINT, 'draft', text
+            return None, 'empty', text
+        self.enterContext(patch.object(peerchat, 'composer_state', side_effect=state))
+        self.look(0)
+        self.look(61)
+        self.look(122)
+        self.assertEqual([], self.keys, 'nothing is cleared')
+        self.assertFalse(self.r.composers.stalled('claude'))
+        self.assertEqual([], [line for line in self.logs if 'stalled' in line or 'could not clear' in line])
+
+
 class WrappedIds(unittest.TestCase):
     def test_an_unmatched_id_opener_does_not_swallow_the_marker_after_it(self):
         # An accepted subject may contain `[id `; the whole marker after it is still the pointer's.
