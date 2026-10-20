@@ -695,10 +695,12 @@ class Closer:
         """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
         relay runs its own. Stalled text goes before the agents are judged idle, so a duplicated or
         mangled pointer for mail the close does not wait for cannot hold the close until its timeout.
-        The conductor types no pointer, so text carrying a pointer for mail the close waits for (the
-        planner's, pre-merge implementer mail) is never cleared here, exact, duplicated or mangled,
-        however often the rescue failed to submit it (the watch's `skip`): it stays for the rescue
-        and the human, logged once, and the unread mail holds the close."""
+        The conductor types no pointer, so text carrying a pointer for the planner's unread mail,
+        whose hold no timeout lifts, is never cleared here, exact, duplicated or mangled, however
+        often the rescue failed to submit it (the watch's `skip`): it stays for the rescue and the
+        human, logged once, and the unread mail holds the close. Text for the implementer's mail is
+        cleared as anywhere else: its pre-merge mail holds the close for the #44 ten minutes and no
+        longer, as the README says, and a stuck pointer must not turn that into a refusal."""
         if self.dry_run:
             return []
         if self.composers is None:
@@ -721,8 +723,7 @@ class Closer:
                 texts[peer.box] = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 texts[peer.box] = err
-        return self.composers.step(
-            texts, skip=lambda peer, message: message is not None and not self.needs_no_reading(number, peer, message))
+        return self.composers.step(texts, skip=lambda peer, message: message is not None and peer.box != 'codex')
 
     def clear_stale_pointers(self, number: int | None) -> list:
         """Delete a relay pointer that no longer needs reading from a settled, idle composer (#96).

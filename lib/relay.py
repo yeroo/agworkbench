@@ -1315,7 +1315,7 @@ class Relay:
             alert=lambda peer, mid, reason: self.alert(peer, mid, reason),
             resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now(),
             read_message=lambda box, mid: self.read_message(box, mid),
-            cleared=lambda peer, mid: self.settle(peer.box))
+            cleared=lambda peer, mid: self.pointer_gone(peer, mid))
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
@@ -2098,6 +2098,12 @@ class Relay:
         if changed:
             self.state["announced"] = sorted(announced)
             self._save()
+
+    def pointer_gone(self, peer: Peer, mid: str) -> None:
+        """The rescue deleted a stale pointer (#96): the composer a failed ring typed into has
+        settled, and the mail is pending from no interrupted clear (#130 r4, round 4)."""
+        self.settle(peer.box)
+        self.composers.sent(peer.box, mid)
 
     def settle(self, box: str) -> None:
         """The composer of `box` is accounted for: rings may go into it again (#130)."""

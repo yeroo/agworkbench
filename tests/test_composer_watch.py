@@ -400,6 +400,20 @@ class InterruptedClearRemainder(ComposerWatchFixture):
         self.assertEqual(['m1'], self.r.state['announced'], 'm1 was sent, not lost')
         self.assertEqual([], [line for line in self.logs if 'never went' in line])
 
+    def test_a_stale_pointer_the_rescue_deletes_leaves_nothing_pending(self):
+        # Three ineffective presses left m1 pending; the mail was read meanwhile and the rescue
+        # deleted the stale pointer. Its callback drops m1 too, so the next empty look reports
+        # nothing and m1 stays announced.
+        self.r.composers.pending['codex'] = ['m1']
+        self.r.state['announced'] = ['m1']
+        peer = next(p for p in self.r.peers if p.box == 'codex')
+        self.r.rescue.cleared(peer, 'm1')
+        self.assertEqual({}, self.r.composers.pending)
+        self.typed = None
+        self.look(0)
+        self.assertEqual(['m1'], self.r.state['announced'])
+        self.assertEqual([], [line for line in self.logs if 'never went' in line])
+
     def test_a_ring_after_an_interrupted_clear_leaves_nothing_pending(self):
         # The clear was interrupted after its press with the composer in fact empty (or the relay
         # restarted between the two), so m1 is pending when the next tick rings it. The ring drops
@@ -786,10 +800,10 @@ class CloserBackstop(unittest.TestCase):
         self.assertTrue(any('ALERT codex composer: composer held text' in line for line in logs),
                         'no mail is waiting: the alert says what happened')
 
-    def backstop(self, typed_text, *, attempts, no_reading):
-        """Two looks 30 s apart at a codex composer holding `typed_text` under the backstop, with the
-        rescue's attempts at m1 and `needs_no_reading` answering `no_reading`: (keys, cleared, logs)."""
-        peer = relay.Peer('codex', 'codex', 'codex-pane')
+    def backstop(self, typed_text, *, attempts, box='codex'):
+        """Three looks 30 s apart at a Codex-drawn composer of mailbox `box` holding `typed_text`
+        under the backstop, with the rescue's attempts at m1: (keys, cleared, logs)."""
+        peer = relay.Peer(box, 'codex', f'{box}-pane')
         folder = Path(__file__).resolve().parent / ('closer composer ' + os.urandom(4).hex())
         (folder / 'state').mkdir(parents=True)
         (folder / 'state' / 'queue-member.json').write_text('{}', encoding='utf-8')
@@ -810,9 +824,8 @@ class CloserBackstop(unittest.TestCase):
                 typed[0] = None
         close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False,
                               composer_stall_seconds=30.0)
-        close.unread_message = lambda box, mid: message if mid == 'm1' else None
-        close.needs_no_reading = lambda number, peer, message: no_reading
-        close.rescue = SimpleNamespace(attempts={('codex', 'm1'): attempts})
+        close.unread_message = lambda b, mid: message if mid == 'm1' else None
+        close.rescue = SimpleNamespace(attempts={(box, 'm1'): attempts})
         with patch.object(agw, 'pane_text', side_effect=screen), patch.object(agw, 'press_key', side_effect=key), \
                 patch.object(agw, 'type_into', side_effect=key), patch.object(agw, 'set_status'), \
                 patch.object(agw, 'notify'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')), \
@@ -824,26 +837,33 @@ class CloserBackstop(unittest.TestCase):
             cleared += close.watch_composers(5)
         return keys, [(p.box, mid) for p, mid in cleared], logs
 
-    def test_the_backstop_leaves_an_exhausted_pointer_for_mail_the_close_waits_for(self):
-        keys, cleared, logs = self.backstop('POINTER', attempts=closer.RESCUE_ATTEMPTS, no_reading=False)
+    def test_the_backstop_leaves_an_exhausted_pointer_for_the_planners_mail(self):
+        keys, cleared, logs = self.backstop('POINTER', attempts=closer.RESCUE_ATTEMPTS, box='claude')
         self.assertEqual([], keys, 'the pointer stays for the rescue and the human')
         self.assertEqual([], cleared)
         self.assertEqual(1, len([line for line in logs if 'which the close waits for; left' in line]), 'logged once')
         self.assertEqual([], [line for line in logs if 'cleared stalled composer text' in line])
 
-    def test_the_backstop_clears_an_exhausted_pointer_for_mail_the_close_does_not_wait_for(self):
-        keys, cleared, logs = self.backstop('POINTER', attempts=closer.RESCUE_ATTEMPTS, no_reading=True)
+    def test_the_backstop_clears_an_exhausted_pointer_for_the_implementers_mail(self):
+        # Pre-merge or not: the implementer's mail holds the close for ten minutes at most, so its
+        # stuck pointer goes and the mail's own hold applies.
+        keys, cleared, logs = self.backstop('POINTER', attempts=closer.RESCUE_ATTEMPTS)
         self.assertEqual([peerchat.CLEAR_KEY], keys)
         self.assertEqual([('codex', 'm1')], cleared)
         self.assertTrue(any('which the rescue gave up on' in line for line in logs))
 
-    def test_the_backstop_leaves_a_duplicated_pointer_for_mail_the_close_waits_for(self):
+    def test_the_backstop_leaves_a_duplicated_pointer_for_the_planners_mail(self):
         # Two copies own nothing, so this is not the rescue's exact pointer; the mail still holds the
         # close, so the text stays for a human to submit.
-        keys, cleared, logs = self.backstop('POINTERPOINTER', attempts=0, no_reading=False)
+        keys, cleared, logs = self.backstop('POINTERPOINTER', attempts=0, box='claude')
         self.assertEqual([], keys)
         self.assertEqual([], cleared)
         self.assertTrue(any('which the close waits for; left' in line for line in logs))
+
+    def test_the_backstop_clears_a_duplicated_pointer_for_the_implementers_mail(self):
+        keys, cleared, logs = self.backstop('POINTERPOINTER', attempts=0)
+        self.assertEqual([peerchat.CLEAR_KEY], keys)
+        self.assertEqual([('codex', 'm1')], cleared)
 
     def test_the_conductor_reads_the_queues_composer_stall_seconds(self):
         import conductor
