@@ -289,6 +289,92 @@ class InterruptedClearRemainder(ComposerWatchFixture):
         self.assertEqual([], self.r.state.get('announced', []), 'm1 rings again')
         self.assertEqual(0, self.notify.call_count, 'the relay\'s own text: no alert')
 
+    def interrupted_clears(self, outcomes):
+        """Each Ctrl+U leaves the next of `outcomes` in the composer (None: empty) and, unless it is
+        None, the pane goes quiet for one look afterwards."""
+        state = {'fail_reads': 0}
+        original_screen = self.screen
+        queue = list(outcomes)
+
+        def key(pane, text):
+            self.keys.append(text)
+            if text == peerchat.CLEAR_KEY:
+                self.typed = queue.pop(0)
+                if self.typed is not None:
+                    state['fail_reads'] = 1
+
+        def screen(pane):
+            if state['fail_reads']:
+                state['fail_reads'] -= 1
+                raise agw.CtlError('pane busy')
+            return original_screen(pane)
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=screen))
+        self.enterContext(patch.object(agw, 'press_key', side_effect=key))
+        self.enterContext(patch.object(agw, 'type_into', side_effect=key))
+
+    def test_a_remainder_that_still_shows_the_marker_reports_nothing_when_the_rescue_sends_it(self):
+        # Ctrl+U took the second copy and left exactly the pointer: the rescue's to submit. Once it
+        # has gone, the empty look reports nothing: m1 stays announced, its pointer did go.
+        self.typed = self.pointer + self.pointer
+        self.interrupted_clears([self.pointer])
+        self.r.state['announced'] = ['m1']
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.look(61)
+        self.assertEqual({}, self.r.composers.pending, 'the marker is shown: the text reports itself')
+        self.typed = None            # the rescue pressed the submit key
+        self.look(62)
+        self.assertEqual(['m1'], self.r.state['announced'], 'm1 was sent, not lost')
+        self.assertEqual([], [line for line in self.logs if 'never went' in line])
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+
+    def test_a_second_interrupted_clear_that_changes_nothing_keeps_the_inherited_ids(self):
+        self.typed = self.pointer + self.pointer
+        remainder = 'Chat from Workbench: work'
+        self.interrupted_clears([remainder, remainder, None])
+        self.r.state['announced'] = ['m1']
+        self.look(0)
+        self.look(60)            # first clear: the marker goes, a prefix stays
+        self.look(61)            # the remainder is seen
+        self.look(121)           # second clear: nothing changes, the pane is quiet again
+        self.assertEqual([peerchat.CLEAR_KEY] * 2, self.keys)
+        self.assertEqual(['m1'], self.r.composers.pending['codex'][0], 'm1 is not in the text: still carried')
+        self.look(122)           # third clear takes it
+        self.assertEqual([peerchat.CLEAR_KEY] * 3, self.keys)
+        self.assertIsNone(self.typed)
+        self.assertEqual(1, len(self.cleared_lines()))
+        self.assertIn('the remainder of an interrupted clear that carried m1', self.cleared_lines()[0])
+        self.assertEqual([], self.r.state.get('announced', []), 'm1 rings again')
+
+    def test_a_clear_that_runs_out_of_presses_keeps_the_ids_for_the_clear_that_finishes_it(self):
+        # Three presses took the second copy and the marker, not the prefix: `clear_composer` gave
+        # up, and the remainder carries m1 into the clear that removes it.
+        self.typed = self.pointer + self.pointer
+        remainder = 'Chat from Workbench: work'
+        calls = []
+
+        def clear_composer(pane, profile, content, idle=None, on_press=None):
+            calls.append(content)
+            for _ in range(peerchat.CLEAR_PRESSES if len(calls) == 1 else 1):
+                self.keys.append(peerchat.CLEAR_KEY)
+                on_press()
+            self.typed = remainder if len(calls) == 1 else None
+            return len(calls) > 1
+        self.enterContext(patch.object(peerchat, 'clear_composer', side_effect=clear_composer))
+        self.r.state['announced'] = ['m1']
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY] * 3, self.keys)
+        self.assertTrue(any('not empty after 3 presses' in line for line in self.logs))
+        self.assertEqual((['m1'], peerchat.compact(self.pointer + self.pointer)), self.r.composers.pending['codex'])
+        self.look(61)
+        self.assertEqual(['m1'], self.r.composers.pending['codex'][0], 'the remainder shows no marker')
+        self.look(121)
+        self.assertEqual([peerchat.CLEAR_KEY] * 4, self.keys)
+        self.assertIn('the remainder of an interrupted clear that carried m1', self.cleared_lines()[0])
+        self.assertEqual([], self.r.state.get('announced', []), 'm1 rings again')
+
 
 class WrappedIds(unittest.TestCase):
     def test_an_unmatched_id_opener_does_not_swallow_the_marker_after_it(self):
