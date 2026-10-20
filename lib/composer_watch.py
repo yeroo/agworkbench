@@ -8,23 +8,27 @@ seconds late), or a pointer left behind once its mail was read some other way. S
 pane look busy to the stall watch and to the close, and every later ring refuses the composer as a
 draft, so a member can hang for hours on it.
 
-- `step(texts)` looks at every agent pane once per limit interval, with the texts the limit check
-  read. Composer content that is not the tool's empty placeholder is timed from the first look that
-  showed it, by its folded text, so a redraw does not restart the clock. Content older than
-  `stall_seconds` (config `composerStallSeconds`, default 60; 0 turns the watch off) is STALLED:
-  `stalled(box)` says so, and the stall watch no longer counts that composer as a turn in progress.
+- `step(texts)` looks at every agent pane once per limit interval, with the panes read for it by the
+  caller (the relay's `watch_composers` reads them; `composer_state` reads each pane once more, so a
+  look costs two reads per pane). Composer content that is not the tool's empty placeholder is timed
+  from the first look that showed it, by its folded text, so a redraw does not restart the clock.
+  Content older than `stall_seconds` (config `composerStallSeconds`, default 60; 0 turns the watch
+  off) is STALLED: `stalled(box)` says so, and the stall watch no longer counts that composer as a
+  turn in progress.
 - A stalled composer that holds exactly the relay's pointer for mail still unread is the pointer
   rescue's (#96), which presses the submit key, until the rescue has given up on it
   (`rescue_exhausted`): then the watch clears it so the mail rings afresh.
 - Anything else stalled, on an idle pane with no dialog, is cleared with Ctrl+U
   (`peerchat.clear_composer`): copies of a pointer typed over each other, a pointer for mail already
   read, the relay's own probe or resume text, text nobody can account for. Every clear is logged with
-  the text it removed and reported to the caller as (peer, mid) so the mail's announcement can be
-  taken back and the ring repeated into the empty composer. Text that is not the relay's alerts the
-  human once.
-- In a session the workbench did not launch as automatic (`automatic()` false: an adopted Claude, a
-  manual launch) only text the relay typed (it starts with `closer.POINTER_LABEL`) is cleared; a
-  human's draft is logged once and left alone.
+  the text it removed and reported to the caller as (peer, mid) for every unread mail whose pointer
+  the text carried, so each mail's announcement can be taken back and its ring repeated into the
+  empty composer; a clear interrupted after a press (the pane unreadable for a moment) is reported
+  on the next look that finds the composer empty. Text that is not the relay's alerts the human once.
+- `automatic(peer)` says whose pane it is: a queue member's panes are the workbench's; an adopted
+  Claude (the caller's own session, `claude.json` origin `adopted`) is the human's whatever the loop's
+  autonomy. In a pane that is not automatic only text the relay typed (it starts with
+  `closer.POINTER_LABEL`) is cleared; a human's draft is logged once and left alone.
 - While the pane runs a turn nothing is pressed: the clock runs, the key waits for the idle pane, and
   `clear_composer` refuses between presses if a turn starts.
 
@@ -43,7 +47,7 @@ COMPOSER_STALL_SECONDS = 60.0
 class ComposerWatch:
     def __init__(self, peers, *, unread_message: Callable[[str, str], dict | None],
                  pointer: Callable[[dict], str], log: Callable[[str], None],
-                 alert: Callable[[object, str], None], automatic: Callable[[], bool],
+                 alert: Callable[[object, str], None], automatic: Callable[[object], bool],
                  rescue_exhausted: Callable[[str, str], bool] | None = None,
                  clock: Callable[[], float] = time.monotonic,
                  stall_seconds: float = COMPOSER_STALL_SECONDS):
@@ -60,14 +64,15 @@ class ComposerWatch:
         self.stalled_boxes: set[str] = set()
         self.alerted: set[tuple[str, str]] = set()         # (box, folded content) alerted once
         self.left_alone: set[tuple[str, str]] = set()      # (box, folded content) logged once as not ours
+        self.pending: dict[str, list[str | None]] = {}     # box -> mids of a clear interrupted after a press
 
     def stalled(self, box: str) -> bool:
         """Text has sat in this box's composer past the stall period."""
         return box in self.stalled_boxes
 
     def step(self, texts: dict) -> list[tuple[object, str | None]]:
-        """One look at every pane; returns (peer, mid) for each composer it cleared, `mid` the unread
-        mail whose pointer the text carried (None for text that names none)."""
+        """One look at every pane; returns (peer, mid) for each unread mail whose pointer a cleared
+        composer carried, (peer, None) for a clear that carried none."""
         import closer
         import limits
         import peerchat
@@ -93,6 +98,11 @@ class ComposerWatch:
                 continue
             if state == 'empty':
                 self.forget(peer.box)
+                if peer.box in self.pending:
+                    # The clear went through after all: report what it carried.
+                    for mid in self.pending.pop(peer.box):
+                        cleared.append((peer, mid))
+                    self.log(f"{peer.box} composer is empty after an interrupted clear")
                 continue
             if state == 'ambiguous':
                 # A greyed suggestion or a draft with its caret at the start: not text we can own.
@@ -112,33 +122,44 @@ class ComposerWatch:
             if closer.agent_busy(peer, fresh) or peerchat.dialog_visible(fresh):
                 # The clock runs; the key waits for the idle pane.
                 continue
-            mid = peerchat.pointer_id(content)
-            message = self.unread_message(peer.box, mid) if mid else None
+            mids = list(dict.fromkeys(peerchat.POINTER_ID_RE.findall(content)))
+            unread = [mid for mid in mids if self.unread_message(peer.box, mid) is not None]
             ours = content.startswith(closer.POINTER_LABEL)
-            if message is not None and peerchat.owns(content, self.pointer(message)):
+            exact = len(unread) == 1 and len(mids) == 1 and peerchat.owns(
+                content, self.pointer(self.unread_message(peer.box, unread[0])))
+            if exact:
                 # Exactly the pointer for mail still unread: the rescue submits it (#96), until it
                 # has given up; then the text goes and the mail rings afresh.
-                if self.rescue_exhausted is None or not self.rescue_exhausted(peer.box, mid):
+                if self.rescue_exhausted is None or not self.rescue_exhausted(peer.box, unread[0]):
                     continue
-                what = f"the pointer for {mid}, which the rescue gave up on"
-            elif not ours and not self.automatic():
-                # Not an automatic session: a human may be drafting here. Only the relay's own text
+                what = f"the pointer for {unread[0]}, which the rescue gave up on"
+            elif not ours and not self.automatic(peer):
+                # Not the workbench's pane: a human may be drafting here. Only the relay's own text
                 # is ever cleared; this is logged once and left.
                 if (peer.box, folded) not in self.left_alone:
                     self.left_alone.add((peer.box, folded))
-                    self.log(f"stalled text in {peer.box} is not the relay's and this is not an automatic "
-                             f"session; left alone: {content[:120]!r}")
+                    self.log(f"stalled text in {peer.box} is not the relay's and the pane is not an "
+                             f"automatic session's; left alone: {content[:120]!r}")
                 continue
-            elif mid:
-                what = f"a pointer for {mid}" + ("" if message is not None else ", whose mail is not unread")
+            elif mids:
+                what = "pointers for " + ", ".join(mids) if len(mids) > 1 else f"a pointer for {mids[0]}"
+                if not unread:
+                    what += ", whose mail is not unread"
             elif ours:
                 what = "the relay's own text"
             else:
                 what = "text that is not a relay pointer"
+            carried: list[str | None] = list(unread) or [None]
+            pressed = []
             idle = lambda frame, peer=peer: not closer.agent_busy(peer, frame)  # noqa: E731
             try:
-                done = peerchat.clear_composer(peer.pane, profile, content, idle=idle)
+                done = peerchat.clear_composer(peer.pane, profile, content, idle=idle,
+                                               on_press=lambda: pressed.append(True))
             except (peerchat.Refused, peerchat.Failed, agw.CtlError, OSError) as err:
+                if pressed:
+                    # A key went in before the pane stopped answering: the text may be gone. The
+                    # next look that finds the composer empty reports what it carried.
+                    self.pending[peer.box] = carried
                 self.log(f"could not clear stalled composer text in {peer.box}: {err}")
                 continue
             if not done:
@@ -147,7 +168,7 @@ class ComposerWatch:
                 continue
             self.log(f"cleared stalled composer text in {peer.box} after {age:.0f}s ({what}): {content[:200]!r}")
             self.forget(peer.box)
-            cleared.append((peer, mid if message is not None else None))
+            cleared.extend((peer, mid) for mid in carried)
             if not ours and (peer.box, folded) not in self.alerted:
                 self.alerted.add((peer.box, folded))
                 self.alert(peer, f"composer held text for {age:.0f}s that no ring of the relay explains; "

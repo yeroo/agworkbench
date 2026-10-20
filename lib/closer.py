@@ -286,8 +286,12 @@ class PointerRescue:
 
 class Closer:
     def __init__(self, hub_dir: Path, repo: str, issue: str | int | None, peers, *, log: Callable[[str], None],
-                 clock: Callable[[], float] = time.monotonic, dry_run: bool = False, workspace: str | None = None):
+                 clock: Callable[[], float] = time.monotonic, dry_run: bool = False, workspace: str | None = None,
+                 composer_stall_seconds: float | None = None):
         self.hub_dir = Path(hub_dir)
+        # The queue's composerStallSeconds (#130), for the conductor's composer watch; None reads as
+        # the default.
+        self.composer_stall_seconds = composer_stall_seconds
         self.repo = repo
         self.issue = str(issue) if issue else None
         # The conductor passes its queue's workspace; the relay reads its checkout's (#66).
@@ -644,7 +648,10 @@ class Closer:
             return None
 
     def pointer_alert(self, peer, mid: str, reason: str) -> None:
-        message = f"workbench mail for {peer.box} ({mid}) is waiting: {reason}"
+        self.pane_alert(peer, f"workbench mail for {peer.box} ({mid}) is waiting: {reason}")
+
+    def pane_alert(self, peer, message: str) -> None:
+        """Blocked status, sound and a notification on the peer's pane, logged as ALERT."""
         self.log(f"ALERT {message}")
         if self.dry_run:
             return
@@ -687,7 +694,8 @@ class Closer:
     def watch_composers(self) -> list:
         """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
         relay runs its own. Stalled text goes before the agents are judged idle, so a duplicated or
-        mangled pointer cannot hold the close until its timeout."""
+        mangled pointer for mail the close does not wait for cannot hold the close until its timeout
+        (the planner's unread mail still does: the conductor types no pointer)."""
         if self.dry_run:
             return []
         if self.composers is None:
@@ -695,11 +703,13 @@ class Closer:
             self.composers = composer_watch.ComposerWatch(
                 self.peers, unread_message=self.unread_message,
                 pointer=lambda message: relay_pointer(message, AGMSG, self.hub_dir), log=self.log,
-                alert=lambda peer, reason: self.pointer_alert(peer, 'composer', reason),
-                automatic=lambda: self.autonomous() or (self.hub_dir / 'state' / 'queue-member.json').exists(),
+                alert=lambda peer, reason: self.pane_alert(peer, f"{peer.box} composer: {reason}"),
+                automatic=lambda peer: automatic_pane(self.hub_dir, peer),
                 rescue_exhausted=lambda box, mid: (self.rescue is not None
                                                    and self.rescue.attempts.get((box, mid), 0) >= RESCUE_ATTEMPTS),
-                clock=self.clock)
+                clock=self.clock,
+                stall_seconds=(composer_watch.COMPOSER_STALL_SECONDS if self.composer_stall_seconds is None
+                               else self.composer_stall_seconds))
         texts = {}
         for peer in self.peers:
             try:
@@ -808,6 +818,29 @@ def idle_blockers(peer, text: str, *, stalled: bool = False) -> list[str]:
                        ' for an adopted Claude set "promptSuggestionEnabled": false in ~/.claude/settings.json)')
         reasons.append(reason)
     return reasons
+
+
+def automatic_pane(hub_dir: Path, peer) -> bool:
+    """Whose pane this is (#130): a queue member's panes are the workbench's; otherwise an autonomous
+    loop's are, except the planner pane the launcher adopted from the caller (`claude.json` origin
+    `adopted`), which is the human's own session whatever the loop's autonomy."""
+    state = Path(hub_dir) / 'state'
+    if (state / 'queue-member.json').exists():
+        return True
+    try:
+        settings = json.loads((state / 'implementer.json').read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return False
+    if not (isinstance(settings, dict) and settings.get('autonomous') is True):
+        return False
+    if getattr(peer, 'tool', None) == 'claude':
+        try:
+            identity = json.loads((state / 'claude.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            identity = {}
+        if isinstance(identity, dict) and identity.get('origin') == 'adopted':
+            return False
+    return True
 
 
 def relay_alive(repo: str, issue: str, snapshot, workspace: str | None = None) -> bool:

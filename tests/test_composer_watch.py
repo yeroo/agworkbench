@@ -39,7 +39,7 @@ class ComposerWatchFixture(DeliveryFixture):
         self.takes = False           # does the pane take a submit key?
         self.automatic = True        # a queue member or an autonomous loop
         self.send.side_effect = self.real_send
-        self.r.composers.automatic = lambda: self.automatic
+        self.r.composers.automatic = lambda peer: self.automatic
         self.enterContext(patch.object(agw, 'pane_text', side_effect=self.screen))
         self.enterContext(patch.object(agw, 'type_into', side_effect=self.key))
         self.enterContext(patch.object(agw, 'press_key', side_effect=self.key))
@@ -175,6 +175,7 @@ class StalledText(ComposerWatchFixture):
         self.assertEqual([], self.keys, 'a human may be drafting here')
         self.assertEqual(0, self.notify.call_count)
         self.assertEqual(1, len([line for line in self.logs if line.startswith('stalled text in codex is not the relay')]))
+        self.assertTrue(any("the pane is not an automatic session's" in line for line in self.logs))
         self.assertTrue(self.r.composers.stalled('codex'), 'stalled all the same, for the stall watch')
         self.typed = self.pointer + self.pointer
         self.look(180)
@@ -200,8 +201,9 @@ class StalledText(ComposerWatchFixture):
 
         def screen(pane):
             reads.append(pane)
-            # The watch's two reads see an idle pane; the clear's own read sees a turn begin.
-            self.busy = len(reads) > 2
+            # The watch's two reads and the clear's first see an idle pane; the clear's second
+            # snapshot (composer_state's own read) sees a turn begin.
+            self.busy = len(reads) > 3
             return ComposerWatchFixture.screen(self, pane)
         with patch.object(agw, 'pane_text', side_effect=screen):
             self.look(60)
@@ -241,6 +243,125 @@ class StalledText(ComposerWatchFixture):
         self.assertTrue(any(line.startswith('could not clear stalled composer text in codex: not empty after')
                             for line in self.logs))
         self.assertTrue(self.r.composers.stalled('codex'), 'still stalled, tried again next look')
+
+
+class StalledTextMore(ComposerWatchFixture):
+    def test_two_distinct_pointers_in_one_composer_are_both_announced_no_more(self):
+        self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'second'}
+        self.unread['codex'] = ['m1', 'm2']
+        pointer2 = closer.relay_pointer(self.messages['m2'], self.r.agmsg, self.r.hub_dir)
+        self.r.state['announced'] = ['m1', 'm2']
+        self.typed = self.pointer + pointer2
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertIn('(pointers for m1, m2)', self.cleared_lines()[0])
+        self.assertEqual([], self.r.state['announced'])
+        self.takes = True
+        self.keys.clear()
+        self.tick(61)
+        self.assertEqual(['m1', 'm2'], self.r.state['announced'])
+
+    def test_a_clear_interrupted_after_a_press_reports_on_the_next_empty_look(self):
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer + self.pointer
+        self.look(0)
+
+        def screen(pane):
+            if peerchat.CLEAR_KEY in self.keys:
+                raise agw.CtlError('pane unreadable for a moment')
+            return ComposerWatchFixture.screen(self, pane)
+        with patch.object(agw, 'pane_text', side_effect=screen):
+            self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys, 'one press went in before the pane stopped answering')
+        self.assertTrue(any(line.startswith('could not clear stalled composer text in codex') for line in self.logs))
+        self.assertEqual(['m1'], self.r.state['announced'], 'not yet: the clear is not known to have taken')
+        # The next look finds the composer empty: the pointer's mail is announced no more.
+        self.look(90)
+        self.assertIn('codex composer is empty after an interrupted clear', self.logs)
+        self.assertEqual([], self.r.state['announced'])
+        self.assertEqual({}, self.r.composers.pending)
+
+    def test_an_adopted_claude_pane_of_an_autonomous_loop_is_the_humans(self):
+        folder = Path(__file__).resolve().parent / ('adopted ' + os.urandom(4).hex())
+        (folder / 'state').mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, folder)
+        (folder / 'state' / 'implementer.json').write_text(json.dumps({'autonomous': True}), encoding='utf-8')
+        (folder / 'state' / 'claude.json').write_text(json.dumps({'origin': 'adopted', 'sessionId': 'x'}), encoding='utf-8')
+        claude_peer = relay.Peer('claude', 'claude', 'claude-pane')
+        codex_peer = relay.Peer('codex', 'codex', 'codex-pane')
+        self.assertFalse(closer.automatic_pane(folder, claude_peer), "the caller's own Claude")
+        self.assertTrue(closer.automatic_pane(folder, codex_peer), 'the Codex pane the workbench launched')
+        (folder / 'state' / 'claude.json').write_text(json.dumps({'origin': 'fresh'}), encoding='utf-8')
+        self.assertTrue(closer.automatic_pane(folder, claude_peer))
+        (folder / 'state' / 'implementer.json').write_text(json.dumps({'autonomous': False}), encoding='utf-8')
+        self.assertFalse(closer.automatic_pane(folder, codex_peer), 'not autonomous, not a member')
+        (folder / 'state' / 'queue-member.json').write_text('{}', encoding='utf-8')
+        self.assertTrue(closer.automatic_pane(folder, claude_peer), "a queue member's panes are the workbench's")
+
+
+class Settling(ComposerWatchFixture):
+    def test_the_settle_check_reads_once_per_peer_per_tick(self):
+        self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'second'}
+        self.messages['m3'] = {'id': 'm3', 'from': 'claude', 'subject': 'third'}
+        self.unread['codex'] = ['m1', 'm2', 'm3']
+        self.tick(0)                      # m1 fails after typing; m2 and m3 wait
+        self.typed = None
+        reads = []
+
+        def screen(pane):
+            reads.append(pane)
+            return ComposerWatchFixture.screen(self, pane)
+        with patch.object(agw, 'pane_text', side_effect=screen):
+            self.tick(5)
+        self.assertEqual(2, len(reads), 'one settle check (two snapshots) for the whole box')
+        for mid in ('m1', 'm2', 'm3'):
+            self.assertIn('composer read empty for', self.r.holds[('codex', mid)].reason)
+
+    def test_a_greyed_suggestion_settles_and_the_precheck_names_it(self):
+        self.tick(0)                      # the ring fails after typing
+        self.typed = None
+        with patch.object(peerchat, 'composer_state', return_value=('run a third round', 'ambiguous', 'frame')):
+            self.tick(5)
+        self.assertIn('codex composer settled; rings resume', self.logs)
+        self.assertIn('ambiguous', self.r.holds[('codex', 'm1')].reason)
+
+
+class Transcript(unittest.TestCase):
+    def test_transcript_rows_drop_the_composer_region(self):
+        from frames import CLAUDE_IDLE, claude
+        self.assertNotIn('> draft', peerchat.transcript_rows('claude', claude('draft')))
+        self.assertIn('Brewed', peerchat.transcript_rows('claude', CLAUDE_IDLE))
+        frame = codex('draft text', '• earlier line')
+        rows = peerchat.transcript_rows('codex', frame)
+        self.assertIn('earlier line', rows)
+        self.assertNotIn('draft text', rows)
+
+    def test_a_stale_echo_is_no_evidence(self):
+        pointer = peerchat.compose_text('Chat from Workbench: ', 'review [id m1] - read it')
+        before = codex('Ask Codex to do anything', '• ' + pointer)
+        self.assertTrue(peerchat.echoed('codex', before, pointer))
+        self.assertFalse(peerchat.echoed('codex', before, pointer, before), 'already there before typing')
+        probe = peerchat.compose_text('Chat from Workbench: ', relay.PROBE_TEXT)
+        old = codex('Ask Codex to do anything', '• ' + probe)
+        self.assertFalse(peerchat.echoed('codex', old, probe, old), 'an hour-old probe is not this one')
+        self.assertFalse(peerchat.echoed('codex', codex(pointer), pointer), 'text still in the composer rows is no echo')
+
+
+class Retries(unittest.TestCase):
+    def test_each_extra_submit_key_is_noted(self):
+        notes = []
+        clock = Clock()
+        pointer = peerchat.compose_text('Chat from Workbench: ', 'review [id m1] - read it')
+        with patch.object(peerchat, 'NOTE', notes.append), patch.object(peerchat, 'now', clock.now), \
+                patch.object(peerchat, 'pause', clock.pause), patch.object(agw, 'pane_text', return_value=codex(pointer)), \
+                patch.object(agw, 'type_into'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')):
+            with self.assertRaises(peerchat.Failed):
+                peerchat.verify_submitted('pane', peerchat.PROFILES['codex'], pointer)
+        retries = [n for n in notes if n.startswith('submit retry')]
+        self.assertEqual(peerchat.SUBMIT_RETRIES, len(retries))
+        self.assertIn('the composer still shows', retries[0])
+        self.assertTrue(any(n.startswith('submit Return fallback') for n in notes))
 
 
 class StallWatchReadsIt(ComposerWatchFixture):
@@ -363,18 +484,41 @@ class CloserBackstop(unittest.TestCase):
             keys.append(text)
             if text == peerchat.CLEAR_KEY:
                 typed[0] = None
-        close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False)
+        close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False,
+                              composer_stall_seconds=30.0)
         close.unread_message = lambda box, mid: None
         with patch.object(agw, 'pane_text', side_effect=screen), patch.object(agw, 'press_key', side_effect=key), \
                 patch.object(agw, 'type_into', side_effect=key), patch.object(agw, 'set_status'), \
                 patch.object(agw, 'notify'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')), \
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
             close.watch_composers()
-            clock.pause(60)
+            clock.pause(30)
             cleared = close.watch_composers()
-        self.assertEqual([peerchat.CLEAR_KEY], keys)
+        self.assertEqual([peerchat.CLEAR_KEY], keys, "the queue's composerStallSeconds, 30, applied")
         self.assertEqual([(peer, None)], cleared)
         self.assertTrue(any('cleared stalled composer text in codex' in line for line in logs))
+        self.assertTrue(any('ALERT codex composer: composer held text' in line for line in logs),
+                        'no mail is waiting: the alert says what happened')
+
+    def test_the_conductor_reads_the_queues_composer_stall_seconds(self):
+        import conductor
+        folder = Path(__file__).resolve().parent / ('conductor setting ' + os.urandom(4).hex())
+        folder.mkdir()
+        self.addCleanup(shutil.rmtree, folder)
+        path = folder / 'config.json'
+        self.assertIsNone(conductor.composer_stall_setting(str(path)), 'no file: the default')
+        path.write_text(json.dumps({'composerStallSeconds': 0}), encoding='utf-8')
+        self.assertEqual(0.0, conductor.composer_stall_setting(str(path)))
+        path.write_text(json.dumps({'composerStallSeconds': 'soon'}), encoding='utf-8')
+        self.assertIsNone(conductor.composer_stall_setting(str(path)))
+        self.assertIsNone(conductor.composer_stall_setting(None))
+        peer = relay.Peer('codex', 'codex', 'codex-pane')
+        off = closer.Closer(folder, 'o/r', 5, [peer], log=lambda t: None, dry_run=False, composer_stall_seconds=0.0)
+        with patch.object(agw, 'pane_text', return_value=codex('stuck')), patch.object(agw, 'press_key') as press, \
+                patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')):
+            off.watch_composers()
+            off.watch_composers()
+        press.assert_not_called()
 
 
 class Setting(unittest.TestCase):
