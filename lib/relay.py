@@ -70,16 +70,18 @@ Eight jobs, one loop, one process per issue, running in its own visible agwinter
 7. **Stalled composer text (#130).** Nobody types into an automatic session's panes by hand, so
    text that sits typed-but-unsent in an agent's composer is the relay's: a pointer the TUI did not
    take, one typed over another when the composer parser missed a draft, one left behind once its
-   mail was read some other way. Every `--limit-interval` seconds, watching, draining and in the
-   close (the conductor's close backstop runs the same watch), composer content older than
+   mail was read some other way. Every `--limit-interval` seconds while watching and draining,
+   every mail interval in the relay's close loop, and every conductor tick in the close backstop,
+   composer content older than
    `composerStallSeconds` (config, default 60; 0 = off) is stalled: the stall watch no longer counts
    it as a turn in progress; exactly the pointer for mail still unread is left to the pointer rescue
    (#96) until that has given up on it; anything else is cleared with Ctrl+U on the idle pane (never
    mid-turn), logged with the text removed, its mail's announcement taken back, and the unread mail
    rings again into the empty composer. Text that is not the relay's alerts the human once; in a
-   pane that is not the workbench's (an adopted Claude, whatever the loop's autonomy; a manual
-   launch) only the relay's own text is cleared and a draft is left alone. The conductor's backstop
-   clears the same way but types no pointer: the planner's unread mail still holds its close.
+   pane that is not the workbench's (an adopted Claude planner, whatever the loop's autonomy; a
+   manual launch) only the relay's own text is cleared and a draft is left alone. The conductor's
+   backstop clears the same way but types no pointer, so it never clears a pointer for mail the
+   close waits for: the planner's unread mail still holds its close.
    A ring that failed after typing settles before anything is typed into that composer again: the
    composer must read empty for `composerStallSeconds` (a slow redraw hides typed text for seconds;
    typing again doubled it), or the rescue or the watch must have dealt with the text. A submit is

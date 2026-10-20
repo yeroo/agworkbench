@@ -67,6 +67,9 @@ FRAGMENT = 24            # how much of the typed text must be visible before sub
 CLEAR_KEY = "\x15"       # Ctrl+U: delete to the start of the line; inert on an empty one
 CLEAR_PRESSES = 3
 POINTER_ID_RE = re.compile(r"\[id\s+([^\]\s]+)\]")
+# The same across a row break inside the id (a wrapped composer joins rows with a space, #130 r3):
+# the group is folded with `compact` before use.
+WRAPPED_ID_RE = re.compile(r"\[id\s+([^\]]+)\]")
 QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
 CLAUDE_BUSY_RE = re.compile(r"…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·")
 
@@ -167,17 +170,40 @@ def note(text: str) -> None:
     NOTE(text)
 
 
+def composer_block_start(lines: list[str]) -> int:
+    """Where the last non-blank block begins in `lines`, after the trailing blank, footer and status
+    rows `trailing_block` strips; a rule row inside that block is the composer's top edge, so the
+    history cell drawn right above the rule stays transcript (#130 r3)."""
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if end and (FOOTER_RE.match(lines[end - 1]) or FOOTER_RIGHT_RE.match(lines[end - 1])):
+        end -= 1
+        while end and not lines[end - 1].strip():
+            end -= 1
+        if end and CODEX_STATUS_RE.match(lines[end - 1]):
+            end -= 1
+            while end and not lines[end - 1].strip():
+                end -= 1
+    start = end
+    while start and lines[start - 1].strip():
+        start -= 1
+    for i in range(end - 1, start - 1, -1):
+        if RULE_RE.match(lines[i]):
+            return i
+    return start
+
+
 def transcript_rows(tool: str, frame: str) -> str:
     """The pane above its composer region: for Claude everything before the rule above the prompt,
-    for Codex and Kimi everything before the last block (the prompt and its footer)."""
+    for Codex and Kimi everything before the composer block (`composer_block_start`)."""
     lines = frame.splitlines()
     if tool == 'claude':
         rules = [i for i, line in enumerate(lines) if RULE_RE.match(line)]
         if len(rules) >= 2:
             return "\n".join(lines[:rules[-2]])
         return frame
-    block = trailing_block(frame)
-    return "\n".join(lines[:len(lines) - len(block)]) if block else frame
+    return "\n".join(lines[:composer_block_start(lines)])
 
 
 def echoed(tool: str, frame: str, typed: str, before: str | None = None) -> bool:
@@ -241,10 +267,17 @@ def owns(content: str, typed: str) -> bool:
     return len(visible) * 2 >= len(attempted)
 
 
+def pointer_ids(content: str | None) -> list[str]:
+    """Every message id (`[id X]`) in composer content, in order, once each, read across a row
+    break inside the id (#130 r3): a wrapped composer joins its rows with a space."""
+    found = [compact(group) for group in WRAPPED_ID_RE.findall(content or "")]
+    return list(dict.fromkeys(mid for mid in found if mid))
+
+
 def pointer_id(content: str | None) -> str | None:
     """The message id of a relay pointer (`[id X]`) in composer content; None without a whole one."""
-    found = POINTER_ID_RE.search(content or "")
-    return found.group(1) if found else None
+    ids = pointer_ids(content)
+    return ids[0] if ids else None
 
 
 def queued_for(text: str, typed: str) -> bool:
@@ -699,6 +732,7 @@ def verify_submitted(pane: str, profile: Profile, typed: str, *, max_retries: in
                 phase = 'verifying submit' + suffix
                 deadline = now() + SUBMIT_TIMEOUT
                 needs_key = False
+                empty_since = None      # the key that took gets its own echo window (#130 r3)
                 continue
             elif now() >= deadline:
                 # Re-read before any additional key: the deadline frame is not authorization

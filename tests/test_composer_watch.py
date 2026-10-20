@@ -262,6 +262,46 @@ class StalledTextMore(ComposerWatchFixture):
         self.tick(61)
         self.assertEqual(['m1', 'm2'], self.r.state['announced'])
 
+    def test_an_id_wrapped_across_rows_is_still_the_pointers(self):
+        # Codex breaks a row before a letter that follows a hyphen; the joined rows read
+        # "[id 2026…Z- claude-abcd]".
+        mid = '20261020T120000Z-claude-abcd'
+        self.messages[mid] = {'id': mid, 'from': 'claude', 'subject': 'review'}
+        self.unread['codex'] = [mid]
+        self.r.state['announced'] = [mid]
+        pointer = closer.relay_pointer(self.messages[mid], self.r.agmsg, self.r.hub_dir)
+        wrapped = pointer.replace('20261020T120000Z-claude-abcd]', '20261020T120000Z- claude-abcd]', 1)
+        self.assertEqual(['20261020T120000Z-claude-abcd'], peerchat.pointer_ids(wrapped))
+        self.typed = wrapped + wrapped
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertEqual([], self.r.state['announced'], 'the wrapped id still names its mail')
+
+    def test_an_interrupted_clear_is_forgotten_once_the_text_is_seen_again(self):
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer + self.pointer
+        self.look(0)
+
+        def screen(pane):
+            if peerchat.CLEAR_KEY in self.keys:
+                raise agw.CtlError('pane unreadable for a moment')
+            return ComposerWatchFixture.screen(self, pane)
+        with patch.object(agw, 'pane_text', side_effect=screen):
+            self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        # The press did not take: the text is still there on the next look, so the interrupted
+        # clear is forgotten and the clear that does take, on that look, reports it once.
+        self.typed = self.pointer + self.pointer
+        self.keys.clear()
+        self.look(90)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertEqual({}, self.r.composers.pending)
+        self.assertEqual([], self.r.state['announced'])
+        self.assertEqual(1, len([line for line in self.logs if 'its pointer never went' in line]))
+        self.look(150)
+        self.assertEqual(1, len([line for line in self.logs if 'its pointer never went' in line]), 'reported once')
+
     def test_a_clear_interrupted_after_a_press_reports_on_the_next_empty_look(self):
         self.r.state['announced'] = ['m1']
         self.typed = self.pointer + self.pointer
@@ -290,8 +330,11 @@ class StalledTextMore(ComposerWatchFixture):
         (folder / 'state' / 'claude.json').write_text(json.dumps({'origin': 'adopted', 'sessionId': 'x'}), encoding='utf-8')
         claude_peer = relay.Peer('claude', 'claude', 'claude-pane')
         codex_peer = relay.Peer('codex', 'codex', 'codex-pane')
+        claude_implementer = relay.Peer('codex', 'claude', 'impl-pane')
         self.assertFalse(closer.automatic_pane(folder, claude_peer), "the caller's own Claude")
         self.assertTrue(closer.automatic_pane(folder, codex_peer), 'the Codex pane the workbench launched')
+        self.assertTrue(closer.automatic_pane(folder, claude_implementer),
+                        'a Claude implementer is the workbench\'s: the adoption is the planner pane\'s')
         (folder / 'state' / 'claude.json').write_text(json.dumps({'origin': 'fresh'}), encoding='utf-8')
         self.assertTrue(closer.automatic_pane(folder, claude_peer))
         (folder / 'state' / 'implementer.json').write_text(json.dumps({'autonomous': False}), encoding='utf-8')
@@ -328,6 +371,37 @@ class Settling(ComposerWatchFixture):
 
 
 class Transcript(unittest.TestCase):
+    def test_the_composer_block_is_found_as_trailing_block_finds_it(self):
+        pointer = 'Chat from Workbench: workbench mail from claude: FIX r1 [id 20261007T163143Z-claude-ceba] - read it'
+        # The status row plus the right-aligned footer, as Codex 0.160 draws a draft.
+        frame = "\n".join([
+            "• earlier cell",
+            "─" * 50,
+            "› Chat from Workbench: workbench mail from claude: FIX r1 [id",
+            "  20261007T163143Z-claude-ceba] - read it",
+            " ",
+            "  GPT-6-Luna medium · ~/source/workbench/docxy-issue-976 · plan",
+            "                                                      ⚠ 1 warning · f2 to view",
+        ]) + "\n"
+        self.assertEqual("• earlier cell", peerchat.transcript_rows('codex', frame))
+        self.assertEqual("• earlier cell", peerchat.transcript_rows("codex", frame[:-1]))
+        self.assertFalse(peerchat.echoed('codex', frame, pointer), "the pointer is the composer's, not an echo")
+        # Trailing blank rows under the footer do not leak composer rows into the transcript.
+        from frames import CODEX_UNSUBMITTED
+        for blanks in (0, 2, 3):
+            rows = peerchat.transcript_rows('codex', CODEX_UNSUBMITTED + "\n" * blanks)
+            self.assertNotIn('Chat from Workbench', rows, f'{blanks} blank rows')
+        # A two-row echo cell glued to the rule is transcript.
+        echo = "\n".join([
+            "• Chat from Workbench: workbench mail from claude: FIX r1 [id",
+            "  20261007T163143Z-claude-ceba] - read it",
+            "─" * 50,
+            "› Ask Codex to do anything",
+            "  gpt-6-astra high · fixture",
+        ]) + "\n"
+        self.assertIn('claude-ceba', peerchat.transcript_rows('codex', echo))
+        self.assertTrue(peerchat.echoed('codex', echo, pointer))
+
     def test_transcript_rows_drop_the_composer_region(self):
         from frames import CLAUDE_IDLE, claude
         self.assertNotIn('> draft', peerchat.transcript_rows('claude', claude('draft')))
@@ -349,6 +423,32 @@ class Transcript(unittest.TestCase):
 
 
 class Retries(unittest.TestCase):
+    def test_a_retry_key_gets_its_own_echo_window(self):
+        # The composer reads empty while the typed line is undrawn, then shows the draft; the retry
+        # key takes it and the echo draws within the window: no 'not confirmed' note.
+        notes = []
+        clock = Clock()
+        pointer = peerchat.compose_text('Chat from Workbench: ', 'review [id m1] - read it')
+        frames = [codex('Ask Codex to do anything')] * 9 + [codex(pointer)] * 30
+        echoed = codex('Ask Codex to do anything', '• ' + pointer)
+        state = {'keys': 0}
+
+        def pane_text(pane):
+            if state['keys']:
+                return echoed if len(frames) < 25 else frames.pop(0)
+            return frames.pop(0) if len(frames) > 1 else frames[0]
+
+        def type_into(pane, text):
+            state['keys'] += 1
+            del frames[:len(frames) - 20]
+        with patch.object(peerchat, 'NOTE', notes.append), patch.object(peerchat, 'now', clock.now), \
+                patch.object(peerchat, 'pause', clock.pause), patch.object(agw, 'pane_text', side_effect=pane_text), \
+                patch.object(agw, 'type_into', side_effect=type_into), \
+                patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')):
+            outcome = peerchat.verify_submitted('pane', peerchat.PROFILES['codex'], pointer)
+        self.assertTrue(outcome.startswith('submitted after retry'), outcome)
+        self.assertEqual([], [n for n in notes if 'not confirmed' in n])
+
     def test_each_extra_submit_key_is_noted(self):
         notes = []
         clock = Clock()
@@ -487,6 +587,7 @@ class CloserBackstop(unittest.TestCase):
         close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False,
                               composer_stall_seconds=30.0)
         close.unread_message = lambda box, mid: None
+        close.needs_no_reading = lambda number, peer, message: False
         with patch.object(agw, 'pane_text', side_effect=screen), patch.object(agw, 'press_key', side_effect=key), \
                 patch.object(agw, 'type_into', side_effect=key), patch.object(agw, 'set_status'), \
                 patch.object(agw, 'notify'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')), \

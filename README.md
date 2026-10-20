@@ -1024,7 +1024,8 @@ changes. After two periods of silence it no longer does, and the pointer names i
   `composerStallSeconds`, or the rescue or the watch must have dealt with the text, since a slow
   redraw hides typed text for seconds and typing again doubled it. The conductor's close backstop
   runs the same watch (under the queue's `composerStallSeconds`) for text whose mail the close does
-  not wait for; it types no pointer, so the planner's unread mail still holds that close.
+  not wait for; it types no pointer, so a pointer for mail the close waits for is never cleared there
+  and the planner's unread mail still holds that close.
 - After two more periods with no progress, and both panes idle for a whole period, it reports the
   loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
   a reason starting `stalled:` in queue mode.

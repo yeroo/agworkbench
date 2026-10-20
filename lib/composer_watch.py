@@ -8,9 +8,10 @@ seconds late), or a pointer left behind once its mail was read some other way. S
 pane look busy to the stall watch and to the close, and every later ring refuses the composer as a
 draft, so a member can hang for hours on it.
 
-- `step(texts)` looks at every agent pane once per limit interval, with the panes read for it by the
-  caller (the relay's `watch_composers` reads them; `composer_state` reads each pane once more, so a
-  look costs two reads per pane). Composer content that is not the tool's empty placeholder is timed
+- `step(texts)` looks at every agent pane with the panes read for it by the caller: the relay's
+  `watch_composers` reads them every limit interval while watching and draining, every mail interval
+  in its close loop, and the conductor's backstop every conductor tick (`composer_state` reads each
+  pane once more, so a look costs two reads per pane). Composer content that is not the tool's empty placeholder is timed
   from the first look that showed it, by its folded text, so a redraw does not restart the clock.
   Content older than `stall_seconds` (config `composerStallSeconds`, default 60; 0 turns the watch
   off) is STALLED: `stalled(box)` says so, and the stall watch no longer counts that composer as a
@@ -104,6 +105,9 @@ class ComposerWatch:
                         cleared.append((peer, mid))
                     self.log(f"{peer.box} composer is empty after an interrupted clear")
                 continue
+            # A readable composer that is not empty: an interrupted clear did not take after all,
+            # so what it carried is reported by the clear that does, not twice.
+            self.pending.pop(peer.box, None)
             if state == 'ambiguous':
                 # A greyed suggestion or a draft with its caret at the start: not text we can own.
                 continue
@@ -122,7 +126,7 @@ class ComposerWatch:
             if closer.agent_busy(peer, fresh) or peerchat.dialog_visible(fresh):
                 # The clock runs; the key waits for the idle pane.
                 continue
-            mids = list(dict.fromkeys(peerchat.POINTER_ID_RE.findall(content)))
+            mids = peerchat.pointer_ids(content)
             unread = [mid for mid in mids if self.unread_message(peer.box, mid) is not None]
             ours = content.startswith(closer.POINTER_LABEL)
             exact = len(unread) == 1 and len(mids) == 1 and peerchat.owns(
