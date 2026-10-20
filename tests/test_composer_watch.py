@@ -400,6 +400,23 @@ class InterruptedClearRemainder(ComposerWatchFixture):
         self.assertEqual(['m1'], self.r.state['announced'], 'm1 was sent, not lost')
         self.assertEqual([], [line for line in self.logs if 'never went' in line])
 
+    def test_a_ring_after_an_interrupted_clear_leaves_nothing_pending(self):
+        # The clear was interrupted after its press with the composer in fact empty (or the relay
+        # restarted between the two), so m1 is pending when the next tick rings it. The ring drops
+        # it: the empty look that follows reports nothing and m1 stays announced, typed once.
+        self.r.composers.pending['codex'] = ['m1']
+        self.typed = None
+        self.takes = True
+        self.tick(0)
+        self.assertEqual([self.pointer, '\t'], self.keys)
+        self.assertEqual(['m1'], self.r.state['announced'])
+        self.assertEqual({}, self.r.composers.pending, 'the ring dealt with m1')
+        self.look(1)
+        self.assertEqual([], [line for line in self.logs if 'never went' in line])
+        self.assertEqual(['m1'], self.r.state['announced'], 'm1 stays announced')
+        self.tick(2)
+        self.assertEqual([self.pointer, '\t'], self.keys, 'typed once')
+
 
 class WrappedIds(unittest.TestCase):
     def test_an_unmatched_id_opener_does_not_swallow_the_marker_after_it(self):
