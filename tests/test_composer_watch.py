@@ -434,17 +434,23 @@ class InterruptedClearRemainder(ComposerWatchFixture):
 
 class QueuedHint(ComposerWatchFixture):
     def test_claude_codes_queued_messages_hint_is_not_stalled_text(self):
-        def state(pane, profile, text):
-            if profile.tool == 'claude':
-                return peerchat.CLAUDE_QUEUED_HINT, 'draft', text
-            return None, 'empty', text
-        self.enterContext(patch.object(peerchat, 'composer_state', side_effect=state))
+        # A Claude pane drawing the hint, read by the real parser (no cursor in the fixture, so the
+        # hint reads as a draft, the state the deployed relay saw on balatro #10).
+        from frames import claude
+        self.r.peers.append(relay.Peer('claude', 'claude', 'claude-pane'))
+        codex_screen = self.screen
+
+        def screen(pane):
+            return claude(peerchat.CLAUDE_QUEUED_HINT) if pane == 'claude-pane' else codex_screen(pane)
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=screen))
+        content, state, _ = peerchat.composer_state('claude-pane', peerchat.PROFILES['claude'], screen('claude-pane'))
+        self.assertEqual((peerchat.CLAUDE_QUEUED_HINT, 'draft'), (content, state), 'the parser reads the hint as a draft')
         self.look(0)
         self.look(61)
         self.look(122)
         self.assertEqual([], self.keys, 'nothing is cleared')
         self.assertFalse(self.r.composers.stalled('claude'))
-        self.assertEqual([], [line for line in self.logs if 'stalled' in line or 'could not clear' in line])
+        self.assertEqual([], [line for line in self.logs if 'claude' in line and ('stalled' in line or 'could not clear' in line)])
 
 
 class WrappedIds(unittest.TestCase):
