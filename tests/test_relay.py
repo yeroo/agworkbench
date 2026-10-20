@@ -355,6 +355,7 @@ class Delivery(DeliveryFixture):
         self.r.hub.parse_message.assert_not_called()
 
     def test_failed_ring_alerts_throttles_and_recovers(self):
+        self.pane.return_value = CODEX_IDLE
         self.send.side_effect = peerchat.Failed("pointer still unsent in composer: 'the pointer'")
         self.tick(0)
         self.assert_unannounced()
@@ -369,10 +370,13 @@ class Delivery(DeliveryFixture):
         self.tick(300)
         self.assertEqual(2, self.notify.call_count)
         self.send.side_effect = None
+        # #130: the composer first read empty at 299; a minute later the failed ring has settled.
         self.tick(310)
+        self.assert_unannounced()
+        self.tick(360)
         self.assertEqual(['m1'], self.r.state['announced'])
         self.r._save.assert_called_once()
-        self.assertIn('rang codex for m1 (review) [submitted] after holding 310s', self.logs)
+        self.assertIn('rang codex for m1 (review) [submitted] after holding 360s', self.logs)
         self.status.assert_called_with('idle', pane_id=self.peer.pane)
         self.assertEqual({}, self.r.holds)
 
@@ -550,19 +554,23 @@ class Delivery(DeliveryFixture):
         self.assert_unannounced()
 
     def test_failed_idle_reset_is_retried_without_another_ring(self):
+        self.pane.return_value = CODEX_IDLE
         self.send.side_effect = peerchat.Failed('submit failed')
         self.tick(0)
         self.send.side_effect = None
         self.status.side_effect = [agw.CtlError('reset unavailable'), None]
+        # #130: the failed ring settles once the composer has read empty for a minute.
         self.tick(5)
+        self.assert_unannounced()
+        self.tick(65)
         self.assertEqual(['m1'], self.r.state['announced'])
         self.assertTrue(self.r.holds[('codex', 'm1')].clear_pending)
         sends = self.send.call_count
-        self.tick(10)
+        self.tick(70)
         self.assertEqual(sends, self.send.call_count)
         self.assertEqual({}, self.r.holds)
         self.assertEqual([call('idle', pane_id=self.peer.pane)] * 2, self.status.call_args_list[-2:])
-        self.assertIn('cleared hold codex for m1; last reason: submit failed', self.logs)
+        self.assertTrue(any(line.startswith('cleared hold codex for m1; last reason:') for line in self.logs))
 
     def test_independently_read_mail_keeps_retrying_failed_status_reset(self):
         self.send.side_effect = peerchat.Failed('submit failed')
@@ -577,19 +585,21 @@ class Delivery(DeliveryFixture):
 
     def test_pending_status_reset_survives_a_real_restart(self):
         self.use_disk_state()
+        self.pane.return_value = CODEX_IDLE
         self.send.side_effect = peerchat.Failed('submit failed')
         self.tick(0)
         self.send.side_effect = None
         self.status.side_effect = [agw.CtlError('reset unavailable'), agw.CtlError('still unavailable'), None]
         self.tick(5)
+        self.tick(65)
         stored = json.loads(self.r.state_file.read_text(encoding='utf-8'))
         self.assertEqual(['codex'], stored['reset_pending'])
         self.assertEqual(['m1'], stored['announced'])
         self.restart_from_disk()
         self.send.reset_mock()
-        self.tick(10)
+        self.tick(70)
         self.assertEqual(['codex'], json.loads(self.r.state_file.read_text(encoding='utf-8'))['reset_pending'])
-        self.tick(15)
+        self.tick(75)
         self.assertEqual([], json.loads(self.r.state_file.read_text(encoding='utf-8'))['reset_pending'])
         self.assertEqual({}, self.r.holds)
         self.send.assert_not_called()
@@ -609,14 +619,21 @@ class Delivery(DeliveryFixture):
     def test_other_alerted_message_prevents_early_status_clear(self):
         self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'second'}
         self.unread['codex'].append('m2')
+        # #130: m1's ring fails after typing; the composer shows the text, so m2 is held too, and
+        # m2's hold alerts after HOLD_ALERT_AFTER. The composer reads empty from tick 5 on, so the
+        # failed ring settles at 65, with m2 already alerted.
+        self.pane.return_value = codex('what the failed ring typed')
         self.send.side_effect = peerchat.Failed('submit failed')
         self.tick(0)
+        self.pane.return_value = CODEX_IDLE
         self.send.side_effect = ['submitted', peerchat.Refused('holds a draft')]
         self.tick(5)
+        self.tick(60)
+        self.tick(65)
         self.assertEqual(['m1'], self.r.state['announced'])
         self.assertNotIn(call('idle', pane_id=self.peer.pane), self.status.call_args_list)
         self.send.side_effect = None
-        self.tick(10)
+        self.tick(70)
         self.status.assert_called_with('idle', pane_id=self.peer.pane)
         self.assertEqual(['m1', 'm2'], self.r.state['announced'])
 
@@ -636,10 +653,12 @@ class Delivery(DeliveryFixture):
         self.notify.side_effect = agw.CtlError('notify broken')
         self.tick(0)
         self.notify.assert_called_once()
-        self.assertEqual(['m2'], self.r.state['announced'])
+        # #130: m1's failed ring left text in the composer, so m2 waits for it to settle too.
+        self.assertEqual([], self.r.state['announced'])
         self.assertTrue(any('could not set blocked status' in line for line in self.logs))
         self.assertTrue(any('could not notify' in line for line in self.logs))
         self.assertIn(('codex', 'm1'), self.r.holds)
+        self.assertIn(('codex', 'm2'), self.r.holds)
 
     def test_holds_are_keyed_by_recipient_and_message(self):
         self.r.peers.append(relay.Peer('claude', 'claude', 'claude-pane'))
@@ -665,8 +684,13 @@ class Delivery(DeliveryFixture):
             self.tick(5)
             self.assertEqual([pointer] + ['\t'] * 4, fake.keys)
             self.assertEqual(1, self.notify.call_count)
-            fake.frames = stable_frames(CODEX_IDLE, codex(pointer), CODEX_IDLE)
+            # #130: the composer emptied (the agent took the text by itself); the failed ring settles a
+            # minute after it first read empty, then the next mail rings. The settle check reads once.
+            fake.frames = stable_frames(CODEX_IDLE)
             self.tick(10)
+            self.assertEqual([pointer] + ['\t'] * 4, fake.keys)
+            fake.frames = stable_frames(CODEX_IDLE, CODEX_IDLE, codex(pointer), CODEX_IDLE)
+            self.tick(70)
         self.assertEqual([pointer] + ['\t'] * 4 + [pointer, '\t'], fake.keys)
         self.assertEqual(['m1'], self.r.state['announced'])
         self.status.assert_called_with('idle', pane_id=self.peer.pane)

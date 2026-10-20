@@ -1016,7 +1016,13 @@ changes. After two periods of silence it no longer does, and the pointer names i
   for mail still unread is submitted by the pointer rescue, and anything else (copies of a pointer
   typed over each other, a pointer for mail already read, text nobody can account for) is cleared
   with Ctrl+U once the pane is idle, logged with the text removed, so the unread mail rings again
-  into an empty composer. Text that is not a relay pointer alerts you once.
+  into an empty composer (a pointer for unread mail is cleared too once the rescue has given up on
+  it). Text that is not the relay's alerts you once. In a session the workbench did not launch as
+  automatic (an adopted Claude, a manual launch) only the relay's own text is cleared; your draft is
+  left alone. A ring that failed after typing settles before anything is typed into that composer
+  again: it must read empty for `composerStallSeconds`, or the rescue or the watch must have dealt
+  with the text, since a slow redraw hides typed text for seconds and typing again doubled it. The
+  conductor's close backstop runs the same watch.
 - After two more periods with no progress, and both panes idle for a whole period, it reports the
   loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
   a reason starting `stalled:` in queue mode.

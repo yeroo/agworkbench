@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """relay - the workbench's doorbell and its eye on GitHub.
 
-Seven jobs, one loop, one process per issue, running in its own visible agwinterm session:
+Eight jobs, one loop, one process per issue, running in its own visible agwinterm session:
 
 1. **Mail.** Agents never type into each other's panes. They write a message file into the
    workbench mailbox (`agmsg send`, no `--nudge`), and the relay types a one-line pointer into the
@@ -67,17 +67,24 @@ Seven jobs, one loop, one process per issue, running in its own visible agwinter
    revdiff (`#N your review`) stays. Reports and logs in `.workbench/review/` stay; each close is
    logged in `.workbench/state/relay-close.log`. `closeHelpers: false` turns it off.
 
-8. **Stalled composer text (#130).** Nobody types into an automatic session's panes by hand, so
+7. **Stalled composer text (#130).** Nobody types into an automatic session's panes by hand, so
    text that sits typed-but-unsent in an agent's composer is the relay's: a pointer the TUI did not
    take, one typed over another when the composer parser missed a draft, one left behind once its
    mail was read some other way. Every `--limit-interval` seconds, watching, draining and in the
-   close, composer content older than `composerStallSeconds` (config, default 60; 0 = off) is
-   stalled: the stall watch no longer counts it as a turn in progress; exactly the pointer for mail
-   still unread is left to the pointer rescue (#96); anything else is cleared with Ctrl+U on the idle
-   pane (never mid-turn), logged with the text removed, and the unread mail rings again into the
-   empty composer. Text that is not a relay pointer alerts the human once.
+   close (the conductor's close backstop runs the same watch), composer content older than
+   `composerStallSeconds` (config, default 60; 0 = off) is stalled: the stall watch no longer counts
+   it as a turn in progress; exactly the pointer for mail still unread is left to the pointer rescue
+   (#96) until that has given up on it; anything else is cleared with Ctrl+U on the idle pane (never
+   mid-turn), logged with the text removed, its mail's announcement taken back, and the unread mail
+   rings again into the empty composer. Text that is not the relay's alerts the human once; in a
+   session not launched as automatic only the relay's own text is cleared and a draft is left alone.
+   A ring that failed after typing settles before anything is typed into that composer again: the
+   composer must read empty for `composerStallSeconds` (a slow redraw hides typed text for seconds;
+   typing again doubled it), or the rescue or the watch must have dealt with the text. A submit is
+   proven by the transcript's echo of the text within ECHO_TIMEOUT; without one the send still
+   counts and the shortfall is logged.
 
-7. **Exited agents (#98).** On the same reads, whatever exempts the stall watch, it looks for an
+8. **Exited agents (#98).** On the same reads, whatever exempts the stall watch, it looks for an
    agent pane back at its root shell: the tree's `foregroundShells` names a live shell with no child
    in it, and the last row is a bare `PS X:\\...> ` prompt (a crash leaves the agent's frame above it,
    so nothing above is read). Unchanged for EXIT_GRACE_MINUTES, the pane gets its pinned restore
@@ -728,12 +735,9 @@ class StallWatch:
             if not isinstance(text, str):
                 reasons.append(f"{peer.box} pane unreadable")
                 continue
-            blockers = closer.idle_blockers(peer, text)
-            if self.relay.composers.stalled(peer.box):
-                # #130: text that has sat in the composer past composerStallSeconds is stalled text the
-                # composer watch deals with, not an agent at work; it must not hide a stall.
-                blockers = [reason for reason in blockers if 'composer is not provably empty' not in reason]
-            reasons += blockers
+            # #130: text that has sat in the composer past composerStallSeconds is stalled text the
+            # composer watch deals with, not an agent at work; it must not hide a stall.
+            reasons += closer.idle_blockers(peer, text, stalled=self.relay.composers.stalled(peer.box))
         return reasons
 
     # --- the tick -------------------------------------------------------------------------------
@@ -1287,14 +1291,23 @@ class Relay:
             self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
             pointer=lambda message: closer.relay_pointer(message, self.agmsg, self.hub_dir),
             alert=lambda peer, reason: self.alert_pane(peer, f"{peer.box} composer: {reason}"),
+            automatic=self.automatic_session,
+            rescue_exhausted=lambda box, mid: self.rescue.attempts.get((box, mid), 0) >= closer.RESCUE_ATTEMPTS,
             clock=lambda: now(), stall_seconds=composer_stall_seconds)
+        # #130: boxes a ring failed into after typing, with the instant their composer first read
+        # empty since; nothing is typed into one until `settle` (see deliver_mail).
+        self.unsettled: dict[str, float | None] = {}
+        # A send's remarks that are not its outcome go to this log (#130).
+        peerchat_module = __import__('peerchat')
+        peerchat_module.NOTE = lambda text: self.log(f"peer-chat: {text}")
         # #96: a pointer left typed-but-unsent in a composer gets submitted on a later look.
         self.rescue = closer.PointerRescue(
             self.peers, unread_message=self.unread_message, log=lambda text: self.log(text),
             pointer=lambda message: closer.relay_pointer(message, self.agmsg, self.hub_dir),
             alert=lambda peer, mid, reason: self.alert(peer, mid, reason),
             resolved=lambda peer, mid: self.rescue_resolved(peer), clock=lambda: now(),
-            read_message=lambda box, mid: self.read_message(box, mid))
+            read_message=lambda box, mid: self.read_message(box, mid),
+            cleared=lambda peer, mid: self.settle(peer.box))
         for box in self.state.get('reset_pending', []):
             if box in {peer.box for peer in peers}:
                 self.holds[(box, '')] = Hold(now(), 'status reset pending from previous relay',
@@ -2058,10 +2071,69 @@ class Relay:
 
     def watch_composers(self) -> None:
         """One composer-watch look at both panes (#130): text that has sat typed-but-unsent past
-        composerStallSeconds is cleared (or, exactly the pointer for unread mail, left to the rescue)."""
+        composerStallSeconds is cleared (or, exactly the pointer for unread mail, left to the rescue).
+        A cleared composer is settled, and mail whose pointer went with the text is announced no
+        more, so deliver_mail rings it again into the empty composer."""
         if self.dry_run:
             return
-        self.composers.step(self.read_panes())
+        cleared = self.composers.step(self.read_panes())
+        if not cleared:
+            return
+        announced = set(self.state.get("announced", []))
+        changed = False
+        for peer, mid in cleared:
+            self.settle(peer.box)
+            if mid and mid in announced:
+                announced.discard(mid)
+                changed = True
+                self.log(f"{mid} was recorded as announced but its pointer never went; it rings again")
+        if changed:
+            self.state["announced"] = sorted(announced)
+            self._save()
+
+    def automatic_session(self) -> bool:
+        """An automatic session: a queue member, or a loop launched autonomous. Nobody types into
+        its panes by hand, so stalled composer text is the relay's to clear (#130)."""
+        if (self.hub_dir / 'state' / 'queue-member.json').exists():
+            return True
+        try:
+            settings = json.loads((self.hub_dir / 'state' / 'implementer.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return False
+        return isinstance(settings, dict) and settings.get('autonomous') is True
+
+    def settle(self, box: str) -> None:
+        """The composer of `box` is accounted for: rings may go into it again (#130)."""
+        if box in self.unsettled:
+            del self.unsettled[box]
+            self.log(f"{box} composer settled; rings resume")
+
+    def unsettled_reason(self, peer: Peer) -> str | None:
+        """Why nothing is typed into this box yet after a ring failed into it (#130), or None once it
+        has settled: the composer read empty for composerStallSeconds (a slow redraw hides typed text
+        for seconds, and typing again would double it, as it did on docxy-project-pro #12)."""
+        import agw
+        import peerchat
+        if peer.box not in self.unsettled:
+            return None
+        wait = self.composers.stall_seconds if self.composers.stall_seconds > 0 else COMPOSER_STALL_SECONDS
+        try:
+            text = agw.pane_text(peer.pane)
+            content, state, _ = peerchat.composer_state(peer.pane, peerchat.PROFILES[peer.tool], text)
+        except (agw.CtlError, OSError) as err:
+            return f"terminal not reachable while a failed ring settles: {err}"
+        if content is not None and state == 'empty':
+            first = self.unsettled[peer.box]
+            if first is None:
+                first = self.unsettled[peer.box] = now()
+            elapsed = now() - first
+            if elapsed >= wait:
+                self.settle(peer.box)
+                return None
+            return (f"composer read empty for {elapsed:.0f}s of the {wait:.0f}s a failed ring takes to settle; "
+                    "not typing again yet")
+        self.unsettled[peer.box] = None
+        return "composer still holds what a failed ring typed, or cannot be read; waiting for the rescue or the composer watch"
 
     def rung(self, pointers) -> None:
         """Count each (peer, mid) whose pointer is dealt with - rescued, or cleared by the close - as
@@ -2072,6 +2144,7 @@ class Relay:
         for peer, mid in pointers:
             announced.add(mid)
             self.clear(peer, mid)
+            self.settle(peer.box)
         self.state["announced"] = sorted(announced)
         self._save()
 
@@ -2117,6 +2190,10 @@ class Relay:
                     else:
                         self.hold(peer, mid, 'usage limit')
                     continue
+                reason = self.unsettled_reason(peer)
+                if reason is not None:
+                    self.hold(peer, mid, reason)
+                    continue
                 try:
                     # Claude and Kimi take Return, which would land in a running turn: ring between turns.
                     if peer.tool in ("claude", "kimi") and is_busy(agw.pane_text(peer.pane)):
@@ -2144,8 +2221,10 @@ class Relay:
                     self.hold(peer, mid, str(refusal))
                     continue
                 except peerchat.Failed as failure:
-                    # Next tick may retry only through peerchat's empty-composer precheck; what a
-                    # failed ring leaves in the composer, the composer watch clears (#130).
+                    # The text is in the composer whatever the screen shows: nothing more is typed into
+                    # it until it has settled (`unsettled_reason`); what the failed ring left there, the
+                    # rescue submits or the composer watch clears (#130).
+                    self.unsettled.setdefault(peer.box, None)
                     self.hold(peer, mid, str(failure), failed=True)
                     continue
                 except (agw.CtlError, OSError) as err:

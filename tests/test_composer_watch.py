@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -36,7 +37,9 @@ class ComposerWatchFixture(DeliveryFixture):
         self.typed = None            # composer content, None for an empty composer
         self.busy = False            # a turn running in the pane
         self.takes = False           # does the pane take a submit key?
+        self.automatic = True        # a queue member or an autonomous loop
         self.send.side_effect = self.real_send
+        self.r.composers.automatic = lambda: self.automatic
         self.enterContext(patch.object(agw, 'pane_text', side_effect=self.screen))
         self.enterContext(patch.object(agw, 'type_into', side_effect=self.key))
         self.enterContext(patch.object(agw, 'press_key', side_effect=self.key))
@@ -86,6 +89,21 @@ class StalledText(ComposerWatchFixture):
         self.assertEqual([self.pointer, '\t'], self.keys)
         self.assertIn('m1', self.r.state['announced'])
 
+    def test_a_cleared_pointer_for_announced_mail_is_announced_no_more_and_rings_again(self):
+        # The wrong-`submitted` case: the ring was recorded, the pointer sat there and got a twin.
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer + self.pointer
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertEqual([], self.r.state['announced'])
+        self.assertIn('m1 was recorded as announced but its pointer never went; it rings again', self.logs)
+        self.takes = True
+        self.keys.clear()
+        self.tick(61)
+        self.assertEqual([self.pointer, '\t'], self.keys)
+        self.assertEqual(['m1'], self.r.state['announced'])
+
     def test_exactly_the_pointer_for_unread_mail_is_left_to_the_rescue(self):
         self.typed = self.pointer
         for instant in (0, 60, 120):
@@ -94,13 +112,33 @@ class StalledText(ComposerWatchFixture):
         self.assertTrue(self.r.composers.stalled('codex'))
         self.assertTrue(any(line.startswith('composer text stalled in codex after 60s') for line in self.logs))
 
+    def test_the_pointer_the_rescue_gave_up_on_is_cleared_and_rings_again(self):
+        self.r.state['announced'] = ['m1']
+        self.typed = self.pointer
+        # The rescue's looks: remembered, then three submit keys the pane never takes.
+        for instant in (0, 30, 60, 90):
+            self.t = instant
+            self.r.rescue_pointers()
+        self.assertEqual(['\t'] * 3, self.keys)
+        self.assertTrue(any(line.startswith('UNSUBMITTED pointer for m1 in codex') for line in self.logs))
+        self.keys.clear()
+        self.look(91)                     # the watch's first look: remembered
+        self.look(151)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertIn('which the rescue gave up on', self.cleared_lines()[0])
+        self.assertEqual([], self.r.state['announced'])
+        self.takes = True
+        self.keys.clear()
+        self.tick(92)
+        self.assertEqual([self.pointer, '\t'], self.keys)
+
     def test_a_pointer_for_mail_already_read_is_cleared(self):
         self.typed = self.pointer
         self.unread['codex'] = []
         self.look(0)
         self.look(60)
         self.assertEqual([peerchat.CLEAR_KEY], self.keys)
-        self.assertIn('(a pointer for m1)', self.cleared_lines()[0])
+        self.assertIn('(a pointer for m1, whose mail is not unread)', self.cleared_lines()[0])
 
     def test_text_nobody_typed_is_cleared_and_alerted_once(self):
         self.typed = 'git push --force origin main'
@@ -120,6 +158,29 @@ class StalledText(ComposerWatchFixture):
         self.assertEqual([peerchat.CLEAR_KEY] * 2, self.keys)
         self.assertEqual(1, self.notify.call_count)
 
+    def test_the_relays_own_probe_text_is_cleared_without_an_alert(self):
+        self.typed = peerchat.compose_text('Chat from Workbench: ', relay.PROBE_TEXT)
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertIn("(the relay's own text)", self.cleared_lines()[0])
+        self.assertEqual(0, self.notify.call_count)
+
+    def test_an_adopted_session_keeps_a_humans_draft_but_loses_the_relays_text(self):
+        self.automatic = False
+        self.typed = 'my half-written question'
+        self.look(0)
+        self.look(60)
+        self.look(120)
+        self.assertEqual([], self.keys, 'a human may be drafting here')
+        self.assertEqual(0, self.notify.call_count)
+        self.assertEqual(1, len([line for line in self.logs if line.startswith('stalled text in codex is not the relay')]))
+        self.assertTrue(self.r.composers.stalled('codex'), 'stalled all the same, for the stall watch')
+        self.typed = self.pointer + self.pointer
+        self.look(180)
+        self.look(240)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys, 'the relay typed this: it goes')
+
     def test_a_busy_pane_waits_for_its_turn_to_end(self):
         self.typed = 'half a thought'
         self.busy = True
@@ -131,6 +192,21 @@ class StalledText(ComposerWatchFixture):
         self.busy = False
         self.look(120)
         self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+
+    def test_a_turn_that_starts_under_the_clear_stops_it(self):
+        self.typed = 'half a thought'
+        self.look(0)
+        reads = []
+
+        def screen(pane):
+            reads.append(pane)
+            # The watch's two reads see an idle pane; the clear's own read sees a turn begin.
+            self.busy = len(reads) > 2
+            return ComposerWatchFixture.screen(self, pane)
+        with patch.object(agw, 'pane_text', side_effect=screen):
+            self.look(60)
+        self.assertEqual([], self.keys)
+        self.assertTrue(any('a turn started in the target pane' in line for line in self.logs))
 
     def test_changed_text_restarts_the_clock(self):
         self.typed = 'first'
@@ -177,17 +253,53 @@ class StallWatchReadsIt(ComposerWatchFixture):
         self.look(60)
         self.assertNotIn('codex composer is not provably empty', self.r.stall.busy(texts))
         self.assertEqual([], self.r.stall.busy(texts), 'idle: the stall clock may run')
+        # The close keeps the reason: the text has to go before the pane may close.
+        self.assertIn('codex composer is not provably empty', closer.idle_blockers(self.peer, texts['codex']))
 
 
 class FailedRings(ComposerWatchFixture):
-    def test_the_failed_rings_text_is_cleared_after_a_minute_and_rung_again(self):
+    def test_nothing_is_typed_over_a_failed_ring_until_the_composer_settles(self):
         # The ring types the pointer; the pane takes no submit key: Failed, the pointer sits there.
         self.tick(0)
-        self.assertEqual(self.pointer, self.typed)
+        self.assertEqual([self.pointer, '\t', '\t', '\t', '\t', '\n'], self.keys)
         self.assertTrue(any(line.startswith('FAILED ringing codex for m1') for line in self.logs))
         self.keys.clear()
+        # docxy-project-pro #12: the screen shows an empty composer although the text is there (a
+        # slow redraw). The next ticks type nothing.
+        self.typed = None
+        self.tick(5)
+        self.tick(30)
+        self.assertEqual([], self.keys)
+        self.assertIn('composer read empty for', self.r.holds[('codex', 'm1')].reason)
+        # A minute of empty reads later the failed ring has settled and the mail rings.
+        self.takes = True
+        self.tick(66)
+        self.assertEqual([self.pointer, '\t'], self.keys)
+        self.assertIn('codex composer settled; rings resume', self.logs)
+        self.assertIn('m1', self.r.state['announced'])
+
+    def test_text_showing_up_again_restarts_the_settle(self):
+        self.tick(0)
+        self.keys.clear()
+        self.typed = None
+        self.tick(5)                      # empty: the settle clock starts
+        self.typed = self.pointer         # the redraw catches up: the text is there after all
+        self.tick(40)
+        self.assertIn('still holds what a failed ring typed', self.r.holds[('codex', 'm1')].reason)
+        self.typed = None
+        self.tick(70)                     # empty again: a fresh minute
+        self.tick(100)
+        self.assertEqual([], self.keys)
+        self.takes = True
+        self.tick(131)
+        self.assertEqual([self.pointer, '\t'], self.keys)
+
+    def test_the_failed_rings_text_is_cleared_after_a_minute_and_rung_again(self):
+        self.tick(0)
+        self.assertEqual(self.pointer, self.typed)
+        self.keys.clear()
         # Exactly the pointer for unread mail is the rescue's; a copy the TUI mangled is not, and goes
-        # a minute after it was first seen.
+        # a minute after it was first seen. The clear settles the box at once.
         self.look(30)
         self.typed = self.pointer + ' and what the TUI did with it'
         self.look(60)
@@ -199,8 +311,70 @@ class FailedRings(ComposerWatchFixture):
         self.takes = True
         self.keys.clear()
         self.tick(121)
-        self.assertEqual([self.pointer, '	'], self.keys)
+        self.assertEqual([self.pointer, '\t'], self.keys)
         self.assertIn('m1', self.r.state['announced'])
+
+
+class Echo(unittest.TestCase):
+    def verify(self, frames, pointer):
+        notes = []
+        clock = Clock()
+        queue = list(frames)
+
+        def pane_text(pane):
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+        with patch.object(peerchat, 'NOTE', notes.append), patch.object(peerchat, 'now', clock.now), \
+                patch.object(peerchat, 'pause', clock.pause), patch.object(agw, 'pane_text', side_effect=pane_text), \
+                patch.object(agw, 'type_into'), \
+                patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')):
+            outcome = peerchat.verify_submitted('pane', peerchat.PROFILES['codex'], pointer)
+        return outcome, notes
+
+    def test_a_submit_without_an_echo_is_noted_and_counted(self):
+        pointer = peerchat.compose_text('Chat from Workbench: ', 'review [id m1] - read it')
+        outcome, notes = self.verify([codex('Ask Codex to do anything')], pointer)
+        self.assertEqual('submitted', outcome)
+        self.assertEqual(1, len(notes))
+        self.assertIn('not confirmed by an echo', notes[0])
+
+    def test_an_echoed_submit_is_silent(self):
+        pointer = peerchat.compose_text('Chat from Workbench: ', 'review [id m1] - read it')
+        outcome, notes = self.verify([codex('Ask Codex to do anything', '• ' + pointer)], pointer)
+        self.assertEqual('submitted', outcome)
+        self.assertEqual([], notes)
+
+
+class CloserBackstop(unittest.TestCase):
+    def test_the_conductors_close_backstop_clears_stalled_text(self):
+        peer = relay.Peer('codex', 'codex', 'codex-pane')
+        folder = Path(__file__).resolve().parent / ('closer composer ' + os.urandom(4).hex())
+        (folder / 'state').mkdir(parents=True)
+        (folder / 'state' / 'queue-member.json').write_text('{}', encoding='utf-8')
+        self.addCleanup(shutil.rmtree, folder)
+        logs = []
+        clock = Clock()
+        keys = []
+        typed = ['stuck text']
+
+        def screen(pane):
+            return codex(typed[0] or 'Ask Codex to do anything')
+
+        def key(pane, text):
+            keys.append(text)
+            if text == peerchat.CLEAR_KEY:
+                typed[0] = None
+        close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False)
+        close.unread_message = lambda box, mid: None
+        with patch.object(agw, 'pane_text', side_effect=screen), patch.object(agw, 'press_key', side_effect=key), \
+                patch.object(agw, 'type_into', side_effect=key), patch.object(agw, 'set_status'), \
+                patch.object(agw, 'notify'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')), \
+                patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
+            close.watch_composers()
+            clock.pause(60)
+            cleared = close.watch_composers()
+        self.assertEqual([peerchat.CLEAR_KEY], keys)
+        self.assertEqual([(peer, None)], cleared)
+        self.assertTrue(any('cleared stalled composer text in codex' in line for line in logs))
 
 
 class Setting(unittest.TestCase):

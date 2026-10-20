@@ -1920,6 +1920,8 @@ class Worker:
                 return
         attempt.step_helpers(gate=(lambda: attempt.issue_closed(self.gh)[0] is True) if pr is None else None)
         try:
+            # #130: stalled composer text goes first; it would block the close as a draft.
+            attempt.watch_composers()
             # #96: a pointer for mail still unread is submitted; one nobody needs to read is cleared.
             attempt.rescue_pointers(pr)
             attempt.clear_stale_pointers(pr)
