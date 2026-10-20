@@ -701,7 +701,7 @@ class Closer:
                 self.composers.sent(peer.box, mid)
         return pointers
 
-    def watch_composers(self, number: int | None = None) -> list:
+    def watch_composers(self) -> list:
         """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
         relay runs its own. Stalled text goes before the agents are judged idle, so a duplicated or
         mangled pointer for mail the close does not wait for cannot hold the close until its timeout.

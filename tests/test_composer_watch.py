@@ -845,11 +845,11 @@ class CloserBackstop(unittest.TestCase):
                 patch.object(agw, 'type_into', side_effect=key), patch.object(agw, 'set_status'), \
                 patch.object(agw, 'notify'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')), \
                 patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
-            close.watch_composers(5)
+            close.watch_composers()
             clock.pause(30)
-            cleared = close.watch_composers(5)
+            cleared = close.watch_composers()
             clock.pause(30)
-            cleared += close.watch_composers(5)
+            cleared += close.watch_composers()
         return keys, [(p.box, mid) for p, mid in cleared], logs
 
     def test_the_backstop_leaves_an_exhausted_pointer_for_the_planners_mail(self):
@@ -895,12 +895,12 @@ class CloserBackstop(unittest.TestCase):
         close.unread_message = lambda box, mid: None
         with patch.object(agw, 'pane_text', return_value=codex('Ask Codex to do anything')), \
                 patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')):
-            self.assertEqual([], close.watch_composers(5))       # builds the watch
+            self.assertEqual([], close.watch_composers())       # builds the watch
             close.composers.pending['codex'] = ['m1']
             close.rescue = SimpleNamespace(attempts={}, step=lambda texts, skip: [(peer, 'm1')])
             self.assertEqual([(peer, 'm1')], close.rescue_pointers(5))
             self.assertEqual({}, close.composers.pending, 'the rescue dealt with m1')
-            self.assertEqual([], close.watch_composers(5), 'the empty look reports nothing')
+            self.assertEqual([], close.watch_composers(), 'the empty look reports nothing')
         self.assertEqual([], [line for line in logs if 'interrupted clear' in line])
 
     def test_the_conductor_reads_the_queues_composer_stall_seconds(self):
