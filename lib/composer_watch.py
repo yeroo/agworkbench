@@ -28,11 +28,14 @@ draft, so a member can hang for hours on it.
   on the next look that finds the composer empty; what it carried stays pending only for the ids the
   text no longer shows (a marker still there reports itself: the clear that removes it, or the
   rescue's submit), so a remainder (the marker gone, a prefix kept) carries them into the clear that
-  removes it, reported once, however many presses or looks that takes; a pointer that went after all
-  (the rescue's submit, a ring: the relay's `rung` calls `sent`) is pending no more. Text that is not the
-  relay's alerts the human once. The caller's `skip(peer, message)` names unread mail whose pointer
-  is never cleared here, however it is typed (exact, duplicated or mangled): the conductor's backstop
-  passes the mail its close waits for, which is logged once and left for the rescue and the human.
+  removes it, reported once, however many presses or looks that takes; a pointer that is dealt with
+  after all (submitted by the rescue or a ring, or deleted as stale by the rescue or the close: the
+  relay's `rung`, `deliver_mail` and `pointer_gone` and the closer's `pointers_dealt_with` call
+  `sent`) is pending no more. Text that is not the relay's alerts the human once. The caller's
+  `skip(peer, message)` names unread mail whose pointer is never cleared here, however it is typed
+  (exact, duplicated or mangled): the conductor's backstop passes the planner's mail, whose hold no
+  timeout lifts, which is logged once and left for the rescue and the human; the implementer's is
+  cleared as anywhere else and its mail's own ten-minute hold before the merge applies.
 - `automatic(peer)` says whose pane it is: a queue member's panes are the workbench's; an adopted
   Claude (the caller's own session, `claude.json` origin `adopted`) is the human's whatever the loop's
   autonomy. In a pane that is not automatic only text the relay typed (it starts with
@@ -228,8 +231,9 @@ class ComposerWatch:
         self.stalled_boxes.discard(box)
 
     def sent(self, box: str, mid: str) -> None:
-        """A pointer for this mail went after all (the rescue submitted it, or a ring did): it is
-        pending from no interrupted clear, so the empty composer that follows does not report it."""
+        """A pointer for this mail is dealt with (submitted by the rescue or a ring, or deleted as
+        stale by the rescue or the close): it is pending from no interrupted clear, so the empty
+        composer that follows does not report it as cleared."""
         left = [m for m in self.pending.get(box, []) if m != mid]
         if left:
             self.pending[box] = left

@@ -865,6 +865,29 @@ class CloserBackstop(unittest.TestCase):
         self.assertEqual([peerchat.CLEAR_KEY], keys)
         self.assertEqual([('codex', 'm1')], cleared)
 
+    def test_the_backstops_own_rescue_drops_the_pending_id(self):
+        # Three ineffective presses left m1 pending in the backstop's watch; the backstop's rescue
+        # then submits the pointer in the same tick. The empty look that follows reports nothing.
+        peer = relay.Peer('codex', 'codex', 'codex-pane')
+        folder = Path(__file__).resolve().parent / ('closer composer ' + os.urandom(4).hex())
+        (folder / 'state').mkdir(parents=True)
+        (folder / 'state' / 'queue-member.json').write_text('{}', encoding='utf-8')
+        self.addCleanup(shutil.rmtree, folder)
+        logs = []
+        clock = Clock()
+        close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False,
+                              composer_stall_seconds=30.0)
+        close.unread_message = lambda box, mid: None
+        with patch.object(agw, 'pane_text', return_value=codex('Ask Codex to do anything')), \
+                patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')):
+            self.assertEqual([], close.watch_composers(5))       # builds the watch
+            close.composers.pending['codex'] = ['m1']
+            close.rescue = SimpleNamespace(attempts={}, step=lambda texts, skip: [(peer, 'm1')])
+            self.assertEqual([(peer, 'm1')], close.rescue_pointers(5))
+            self.assertEqual({}, close.composers.pending, 'the rescue dealt with m1')
+            self.assertEqual([], close.watch_composers(5), 'the empty look reports nothing')
+        self.assertEqual([], [line for line in logs if 'interrupted clear' in line])
+
     def test_the_conductor_reads_the_queues_composer_stall_seconds(self):
         import conductor
         folder = Path(__file__).resolve().parent / ('conductor setting ' + os.urandom(4).hex())

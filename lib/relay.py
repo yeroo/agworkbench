@@ -80,8 +80,9 @@ Eight jobs, one loop, one process per issue, running in its own visible agwinter
    rings again into the empty composer. Text that is not the relay's alerts the human once; in a
    pane that is not the workbench's (an adopted Claude planner, whatever the loop's autonomy; a
    manual launch) only the relay's own text is cleared and a draft is left alone. The conductor's
-   backstop clears the same way but types no pointer, so it never clears a pointer for mail the
-   close waits for: the planner's unread mail still holds its close.
+   backstop clears the same way but types no pointer, so text for the planner's unread mail, whose
+   hold no timeout lifts, is never cleared there and that mail still holds its close; text for the
+   implementer's mail is cleared as anywhere else, its ten-minute hold before the merge standing.
    A ring that failed after typing settles before anything is typed into that composer again: the
    composer must read empty for `composerStallSeconds` (a slow redraw hides typed text for seconds;
    typing again doubled it; with the watch off, 0, the wait is SETTLE_SECONDS_WHEN_OFF, 60 s), or

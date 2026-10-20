@@ -689,7 +689,17 @@ class Closer:
                 texts[peer.box] = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 texts[peer.box] = err
-        return self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message))
+        return self.pointers_dealt_with(
+            self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message)))
+
+    def pointers_dealt_with(self, pointers: list) -> list:
+        """Pointers the backstop's rescue submitted or its stale clear deleted are pending from no
+        interrupted clear in this close's own composer watch (#130 r4, round 5), so its next empty
+        look does not report them as cleared. Returns `pointers` for the caller."""
+        if self.composers is not None:
+            for peer, mid in pointers:
+                self.composers.sent(peer.box, mid)
+        return pointers
 
     def watch_composers(self, number: int | None = None) -> list:
         """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
@@ -781,7 +791,7 @@ class Closer:
                 cleared_pointers.append((peer, mid))
             else:
                 self.log(f"could not clear {where}: not empty after {peerchat.CLEAR_PRESSES} presses")
-        return cleared_pointers
+        return self.pointers_dealt_with(cleared_pointers)
 
     def close_issue_session(self) -> None:
         agents = {peer.pane for peer in self.peers}
