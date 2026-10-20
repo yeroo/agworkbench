@@ -695,20 +695,17 @@ class Closer:
         """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
         relay runs its own. Stalled text goes before the agents are judged idle, so a duplicated or
         mangled pointer for mail the close does not wait for cannot hold the close until its timeout.
-        The conductor types no pointer, so a pointer for mail the close waits for (the planner's,
-        pre-merge implementer mail) is never cleared here, however often the rescue failed to submit
-        it: it stays for the rescue and the human, and the unread mail holds the close."""
+        The conductor types no pointer, so text carrying a pointer for mail the close waits for (the
+        planner's, pre-merge implementer mail) is never cleared here, exact, duplicated or mangled,
+        however often the rescue failed to submit it (the watch's `skip`): it stays for the rescue
+        and the human, logged once, and the unread mail holds the close."""
         if self.dry_run:
             return []
         if self.composers is None:
             import composer_watch
 
             def exhausted(box: str, mid: str) -> bool:
-                if self.rescue is None or self.rescue.attempts.get((box, mid), 0) < RESCUE_ATTEMPTS:
-                    return False
-                peer = next((p for p in self.peers if p.box == box), None)
-                message = self.unread_message(box, mid)
-                return peer is not None and message is not None and self.needs_no_reading(number, peer, message)
+                return self.rescue is not None and self.rescue.attempts.get((box, mid), 0) >= RESCUE_ATTEMPTS
             self.composers = composer_watch.ComposerWatch(
                 self.peers, unread_message=self.unread_message,
                 pointer=lambda message: relay_pointer(message, AGMSG, self.hub_dir), log=self.log,
@@ -724,7 +721,8 @@ class Closer:
                 texts[peer.box] = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 texts[peer.box] = err
-        return self.composers.step(texts)
+        return self.composers.step(
+            texts, skip=lambda peer, message: message is not None and not self.needs_no_reading(number, peer, message))
 
     def clear_stale_pointers(self, number: int | None) -> list:
         """Delete a relay pointer that no longer needs reading from a settled, idle composer (#96).

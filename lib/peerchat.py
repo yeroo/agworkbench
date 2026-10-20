@@ -69,7 +69,8 @@ CLEAR_PRESSES = 3
 POINTER_ID_RE = re.compile(r"\[id\s+([^\]\s]+)\]")
 # The same across a row break inside the id (a wrapped composer joins rows with a space, #130 r3):
 # the group is folded with `compact` before use.
-WRAPPED_ID_RE = re.compile(r"\[id\s+([^\]]+)\]")
+# No `[` inside: an unmatched `[id ` earlier in the text must not swallow the whole marker after it.
+WRAPPED_ID_RE = re.compile(r"\[id\s+([^\[\]]+)\]")
 QUEUED_RE = re.compile(r"^\s*• Queued follow-up inputs\s*$")
 CLAUDE_BUSY_RE = re.compile(r"…\s*\((?:\d+h )?(?:\d+m )?\d+s\s*·")
 

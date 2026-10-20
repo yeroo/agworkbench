@@ -1021,11 +1021,12 @@ changes. After two periods of silence it no longer does, and the pointer names i
   Claude the launcher adopted from your own session, whatever the loop's autonomy; a manual launch)
   only the relay's own text is cleared; your draft is left alone. A ring that failed after typing
   settles before anything is typed into that composer again: it must read empty for
-  `composerStallSeconds`, or the rescue or the watch must have dealt with the text, since a slow
-  redraw hides typed text for seconds and typing again doubled it. The conductor's close backstop
-  runs the same watch (under the queue's `composerStallSeconds`) for text whose mail the close does
-  not wait for; it types no pointer, so a pointer for mail the close waits for is never cleared there
-  and the planner's unread mail still holds that close.
+  `composerStallSeconds` (60 s when that is 0 and the watch is off), or the rescue or the watch must
+  have dealt with the text, since a slow redraw hides typed text for seconds and typing again doubled
+  it. The conductor's close backstop runs the same watch (under the queue's `composerStallSeconds`)
+  for text whose mail the close does not wait for; it types no pointer, so text carrying a pointer
+  for mail the close waits for, exact, duplicated or mangled, is never cleared there (logged once and
+  left for the rescue and you) and the planner's unread mail still holds that close.
 - After two more periods with no progress, and both panes idle for a whole period, it reports the
   loop blocked: a blocked sound status and a notification, waiting.json, and `loop-state blocked` with
   a reason starting `stalled:` in queue mode.
@@ -1119,7 +1120,7 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `minFreeGB` | `20` | the queue admits no member while the checkout drive has less free space (GiB); `0` turns the guard off |
 | `minFreeRamGB` | `3` | the queue admits no member while less memory is free (GiB); `0` turns the guard off |
 | `stallMinutes` | `15` | minutes a loop may sit idle with nothing to wake it before the relay mails the planner a stall pointer (see Stalls); `0` turns the watch off |
-| `composerStallSeconds` | `60` | seconds text may sit typed-but-unsent in an agent's composer before the relay treats it as stalled and clears or submits it (see Stalls, #130); `0` turns the composer watch off |
+| `composerStallSeconds` | `60` | seconds text may sit typed-but-unsent in an agent's composer before the relay treats it as stalled and clears or submits it (see Stalls, #130); `0` turns the composer watch off (a failed ring then still settles for 60 s) |
 | `limitRetryMinutes` | `30` | with `-WaitOnLimit`: minutes between the relay's probes of an agent waiting out its usage limit, and the wait before rerunning a review round a reviewer's limit stopped (more than 0; see A slow queue that waits out usage limits) |
 | `closeHelpers` | `true` | the relay closes a finished revmux or suite helper session once its result mail has been read (see Finished helpers, before the merge); `false` keeps them until the loop's close |
 | `restartExited` | `true` | the relay restarts an agent that exited to its pane's shell with the pane's pinned command, at most 3 times an hour (see Exited agents); `false` leaves the pane alone |

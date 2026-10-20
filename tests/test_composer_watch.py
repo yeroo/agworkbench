@@ -11,6 +11,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -245,6 +246,59 @@ class StalledText(ComposerWatchFixture):
         self.assertTrue(self.r.composers.stalled('codex'), 'still stalled, tried again next look')
 
 
+class InterruptedClearRemainder(ComposerWatchFixture):
+    def test_a_remainder_of_an_interrupted_clear_carries_the_mail_ids_into_the_clear_that_removes_it(self):
+        self.typed = self.pointer + self.pointer
+        state = {'fail_reads': 0}
+        original_screen = self.screen
+
+        def key(pane, text):
+            self.keys.append(text)
+            if text == peerchat.CLEAR_KEY:
+                if self.typed and self.typed.startswith(self.pointer):
+                    # Ctrl+U took the marker and left a prefix; the pane then went quiet for a look.
+                    self.typed = 'Chat from Workbench: work'
+                    state['fail_reads'] = 1
+                else:
+                    self.typed = None
+
+        def screen(pane):
+            if state['fail_reads']:
+                state['fail_reads'] -= 1
+                raise agw.CtlError('pane busy')
+            return original_screen(pane)
+        self.enterContext(patch.object(agw, 'pane_text', side_effect=screen))
+        self.enterContext(patch.object(agw, 'press_key', side_effect=key))
+        self.enterContext(patch.object(agw, 'type_into', side_effect=key))
+        self.r.state['announced'] = ['m1']
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys)
+        self.assertTrue(any('could not clear stalled composer text in codex' in line for line in self.logs))
+        self.assertEqual(['m1'], self.r.state['announced'], 'nothing reported yet: the remainder is still there')
+        # The remainder is new content: timed from its first look, cleared a minute later, and that
+        # clear reports m1, once, so the mail rings again.
+        self.look(61)
+        self.look(120)
+        self.assertEqual([peerchat.CLEAR_KEY], self.keys, 'the remainder is under a minute old')
+        self.look(121)
+        self.assertEqual([peerchat.CLEAR_KEY, peerchat.CLEAR_KEY], self.keys)
+        self.assertIsNone(self.typed)
+        self.assertEqual(1, len(self.cleared_lines()))
+        self.assertIn('the remainder of an interrupted clear that carried m1', self.cleared_lines()[0])
+        self.assertEqual([], self.r.state.get('announced', []), 'm1 rings again')
+        self.assertEqual(0, self.notify.call_count, 'the relay\'s own text: no alert')
+
+
+class WrappedIds(unittest.TestCase):
+    def test_an_unmatched_id_opener_does_not_swallow_the_marker_after_it(self):
+        # An accepted subject may contain `[id `; the whole marker after it is still the pointer's.
+        text = 'Chat from Workbench: workbench mail from claude: handle [id parsing [id m1] - read it'
+        self.assertEqual(['m1'], peerchat.pointer_ids(text))
+        self.assertEqual('m1', peerchat.pointer_id(text))
+        self.assertEqual(['m1', 'm2'], peerchat.pointer_ids('[id m1] then [id\n  m2]'))
+
+
 class StalledTextMore(ComposerWatchFixture):
     def test_two_distinct_pointers_in_one_composer_are_both_announced_no_more(self):
         self.messages['m2'] = {'id': 'm2', 'from': 'claude', 'subject': 'second'}
@@ -431,16 +485,18 @@ class Retries(unittest.TestCase):
         pointer = peerchat.compose_text('Chat from Workbench: ', 'review [id m1] - read it')
         frames = [codex('Ask Codex to do anything')] * 9 + [codex(pointer)] * 30
         echoed = codex('Ask Codex to do anything', '• ' + pointer)
-        state = {'keys': 0}
+        state = {'keys': 0, 'after': 0}
 
         def pane_text(pane):
             if state['keys']:
-                return echoed if len(frames) < 25 else frames.pop(0)
+                # After the retry key: the composer reads empty with no echo for four looks (the
+                # earlier empty window, from the first frames, expired long ago), then the echo.
+                state['after'] += 1
+                return echoed if state['after'] > 4 else codex('Ask Codex to do anything')
             return frames.pop(0) if len(frames) > 1 else frames[0]
 
         def type_into(pane, text):
             state['keys'] += 1
-            del frames[:len(frames) - 20]
         with patch.object(peerchat, 'NOTE', notes.append), patch.object(peerchat, 'now', clock.now), \
                 patch.object(peerchat, 'pause', clock.pause), patch.object(agw, 'pane_text', side_effect=pane_text), \
                 patch.object(agw, 'type_into', side_effect=type_into), \
@@ -448,6 +504,7 @@ class Retries(unittest.TestCase):
             outcome = peerchat.verify_submitted('pane', peerchat.PROFILES['codex'], pointer)
         self.assertTrue(outcome.startswith('submitted after retry'), outcome)
         self.assertEqual([], [n for n in notes if 'not confirmed' in n])
+        self.assertGreaterEqual(state['after'], 5, 'verification waited for the echo after the retry')
 
     def test_each_extra_submit_key_is_noted(self):
         notes = []
@@ -600,6 +657,65 @@ class CloserBackstop(unittest.TestCase):
         self.assertTrue(any('cleared stalled composer text in codex' in line for line in logs))
         self.assertTrue(any('ALERT codex composer: composer held text' in line for line in logs),
                         'no mail is waiting: the alert says what happened')
+
+    def backstop(self, typed_text, *, attempts, no_reading):
+        """Two looks 30 s apart at a codex composer holding `typed_text` under the backstop, with the
+        rescue's attempts at m1 and `needs_no_reading` answering `no_reading`: (keys, cleared, logs)."""
+        peer = relay.Peer('codex', 'codex', 'codex-pane')
+        folder = Path(__file__).resolve().parent / ('closer composer ' + os.urandom(4).hex())
+        (folder / 'state').mkdir(parents=True)
+        (folder / 'state' / 'queue-member.json').write_text('{}', encoding='utf-8')
+        self.addCleanup(shutil.rmtree, folder)
+        message = {'id': 'm1', 'from': 'claude', 'subject': 'review'}
+        pointer = closer.relay_pointer(message, closer.AGMSG, folder)
+        logs = []
+        clock = Clock()
+        keys = []
+        typed = [typed_text.replace('POINTER', pointer)]
+
+        def screen(pane):
+            return codex(typed[0] or 'Ask Codex to do anything')
+
+        def key(pane, text):
+            keys.append(text)
+            if text == peerchat.CLEAR_KEY:
+                typed[0] = None
+        close = closer.Closer(folder, 'o/r', 5, [peer], log=logs.append, clock=clock.now, dry_run=False,
+                              composer_stall_seconds=30.0)
+        close.unread_message = lambda box, mid: message if mid == 'm1' else None
+        close.needs_no_reading = lambda number, peer, message: no_reading
+        close.rescue = SimpleNamespace(attempts={('codex', 'm1'): attempts})
+        with patch.object(agw, 'pane_text', side_effect=screen), patch.object(agw, 'press_key', side_effect=key), \
+                patch.object(agw, 'type_into', side_effect=key), patch.object(agw, 'set_status'), \
+                patch.object(agw, 'notify'), patch.object(agw, 'cursor_column', side_effect=agw.CtlError('no cursor')), \
+                patch.object(peerchat, 'now', clock.now), patch.object(peerchat, 'pause', clock.pause):
+            close.watch_composers(5)
+            clock.pause(30)
+            cleared = close.watch_composers(5)
+            clock.pause(30)
+            cleared += close.watch_composers(5)
+        return keys, [(p.box, mid) for p, mid in cleared], logs
+
+    def test_the_backstop_leaves_an_exhausted_pointer_for_mail_the_close_waits_for(self):
+        keys, cleared, logs = self.backstop('POINTER', attempts=closer.RESCUE_ATTEMPTS, no_reading=False)
+        self.assertEqual([], keys, 'the pointer stays for the rescue and the human')
+        self.assertEqual([], cleared)
+        self.assertEqual(1, len([line for line in logs if 'which the close waits for; left' in line]), 'logged once')
+        self.assertEqual([], [line for line in logs if 'cleared stalled composer text' in line])
+
+    def test_the_backstop_clears_an_exhausted_pointer_for_mail_the_close_does_not_wait_for(self):
+        keys, cleared, logs = self.backstop('POINTER', attempts=closer.RESCUE_ATTEMPTS, no_reading=True)
+        self.assertEqual([peerchat.CLEAR_KEY], keys)
+        self.assertEqual([('codex', 'm1')], cleared)
+        self.assertTrue(any('which the rescue gave up on' in line for line in logs))
+
+    def test_the_backstop_leaves_a_duplicated_pointer_for_mail_the_close_waits_for(self):
+        # Two copies own nothing, so this is not the rescue's exact pointer; the mail still holds the
+        # close, so the text stays for a human to submit.
+        keys, cleared, logs = self.backstop('POINTERPOINTER', attempts=0, no_reading=False)
+        self.assertEqual([], keys)
+        self.assertEqual([], cleared)
+        self.assertTrue(any('which the close waits for; left' in line for line in logs))
 
     def test_the_conductor_reads_the_queues_composer_stall_seconds(self):
         import conductor

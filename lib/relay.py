@@ -84,7 +84,8 @@ Eight jobs, one loop, one process per issue, running in its own visible agwinter
    close waits for: the planner's unread mail still holds its close.
    A ring that failed after typing settles before anything is typed into that composer again: the
    composer must read empty for `composerStallSeconds` (a slow redraw hides typed text for seconds;
-   typing again doubled it), or the rescue or the watch must have dealt with the text. A submit is
+   typing again doubled it; with the watch off, 0, the wait is SETTLE_SECONDS_WHEN_OFF, 60 s), or
+   the rescue or the watch must have dealt with the text. A submit is
    proven by the transcript's echo of the text within ECHO_TIMEOUT; without one the send still
    counts and the shortfall is logged.
 
@@ -159,6 +160,9 @@ TERMINAL_DRAIN_TIMEOUT = 30 * 60.0
 LIMIT_READS = 2          # consecutive reads that start (or end) a usage-limit episode
 STALL_MINUTES = 15.0     # the default stall period (#45); `stallMinutes` in ~/.agworkbench.json, 0 = off
 COMPOSER_STALL_SECONDS = composer_watch.COMPOSER_STALL_SECONDS   # `composerStallSeconds` (#130), 0 = off
+# How long a failed ring settles when the composer watch is off: 0 cannot mean "type again at once",
+# which is what doubled the pointer on docxy-project-pro #12.
+SETTLE_SECONDS_WHEN_OFF = composer_watch.COMPOSER_STALL_SECONDS
 # A pending set unchanged this long is stuck, not running (#94 r1): wait-ci's default --timeout, the
 # bound the CI-running exemption had while every planner ran wait-ci.
 CI_STUCK_MINUTES = 90.0
@@ -2103,13 +2107,14 @@ class Relay:
 
     def unsettled_reason(self, peer: Peer) -> str | None:
         """Why nothing is typed into this box yet after a ring failed into it (#130), or None once it
-        has settled: the composer read empty for composerStallSeconds (a slow redraw hides typed text
-        for seconds, and typing again would double it, as it did on docxy-project-pro #12)."""
+        has settled: the composer read empty for composerStallSeconds, or SETTLE_SECONDS_WHEN_OFF with
+        the watch off (a slow redraw hides typed text for seconds, and typing again would double it,
+        as it did on docxy-project-pro #12)."""
         import agw
         import peerchat
         if peer.box not in self.unsettled:
             return None
-        wait = self.composers.stall_seconds if self.composers.stall_seconds > 0 else COMPOSER_STALL_SECONDS
+        wait = self.composers.stall_seconds if self.composers.stall_seconds > 0 else SETTLE_SECONDS_WHEN_OFF
         try:
             text = agw.pane_text(peer.pane)
             content, state, _ = peerchat.composer_state(peer.pane, peerchat.PROFILES[peer.tool], text)
