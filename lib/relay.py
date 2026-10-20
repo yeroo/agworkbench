@@ -2148,6 +2148,8 @@ class Relay:
             announced.add(mid)
             self.clear(peer, mid)
             self.settle(peer.box)
+            # Pending from an interrupted clear no more: the pointer went (#130 r4, round 2).
+            self.composers.sent(peer.box, mid)
         self.state["announced"] = sorted(announced)
         self._save()
 

@@ -28,7 +28,8 @@ draft, so a member can hang for hours on it.
   on the next look that finds the composer empty; what it carried stays pending only for the ids the
   text no longer shows (a marker still there reports itself: the clear that removes it, or the
   rescue's submit), so a remainder (the marker gone, a prefix kept) carries them into the clear that
-  removes it, reported once, however many presses or looks that takes. Text that is not the
+  removes it, reported once, however many presses or looks that takes; a pointer that went after all
+  (the rescue's submit, a ring: the relay's `rung` calls `sent`) is pending no more. Text that is not the
   relay's alerts the human once. The caller's `skip(peer, message)` names unread mail whose pointer
   is never cleared here, however it is typed (exact, duplicated or mangled): the conductor's backstop
   passes the mail its close waits for, which is logged once and left for the rescue and the human.
@@ -71,8 +72,8 @@ class ComposerWatch:
         self.stalled_boxes: set[str] = set()
         self.alerted: set[tuple[str, str]] = set()         # (box, folded content) alerted once
         self.left_alone: set[tuple[str, str]] = set()      # (box, folded content) logged once as not ours
-        # box -> (mids a clear interrupted after a press carried, the folded text it was clearing)
-        self.pending: dict[str, tuple[list[str | None], str]] = {}
+        # box -> the mids a clear interrupted after a press carried (None: it carried no mail)
+        self.pending: dict[str, list[str | None]] = {}
 
     def stalled(self, box: str) -> bool:
         """Text has sat in this box's composer past the stall period."""
@@ -110,7 +111,7 @@ class ComposerWatch:
                 self.forget(peer.box)
                 if peer.box in self.pending:
                     # The clear went through after all: report what it carried.
-                    for mid in self.pending.pop(peer.box)[0]:
+                    for mid in self.pending.pop(peer.box):
                         cleared.append((peer, mid))
                     self.log(f"{peer.box} composer is empty after an interrupted clear")
                 continue
@@ -122,9 +123,9 @@ class ComposerWatch:
                 # the rescue's submit), whether the clear took nothing or left a remainder that
                 # kept it. With nothing left to carry the entry goes.
                 shown = peerchat.pointer_ids(content)
-                left = [mid for mid in pend[0] if mid is not None and mid not in shown]
+                left = [mid for mid in pend if mid is not None and mid not in shown]
                 if left:
-                    pend = (left, folded)
+                    pend = left
                     self.pending[peer.box] = pend
                 else:
                     self.pending.pop(peer.box)
@@ -187,7 +188,7 @@ class ComposerWatch:
             carried: list[str | None] = list(unread)
             if pend is not None:
                 # A remainder of an interrupted clear: the ids it carried go with this one.
-                left = [mid for mid in pend[0] if mid is not None and mid not in carried]
+                left = [mid for mid in pend if mid is not None and mid not in carried]
                 if left:
                     what += f", the remainder of an interrupted clear that carried {', '.join(left)}"
                     carried.extend(left)
@@ -202,13 +203,13 @@ class ComposerWatch:
                     # A key went in before the pane stopped answering: the text may be gone. The
                     # next look that finds the composer empty reports what it carried; a remainder
                     # carries it into the clear that removes it.
-                    self.pending[peer.box] = (carried, folded)
+                    self.pending[peer.box] = carried
                 self.log(f"could not clear stalled composer text in {peer.box}: {err}")
                 continue
             if not done:
                 # The presses took only part of the text: what is left is a remainder, and the ids
                 # go with the clear that removes it, as after an interrupted clear.
-                self.pending[peer.box] = (carried, folded)
+                self.pending[peer.box] = carried
                 self.log(f"could not clear stalled composer text in {peer.box}: not empty after "
                          f"{peerchat.CLEAR_PRESSES} presses")
                 continue
@@ -225,3 +226,12 @@ class ComposerWatch:
     def forget(self, box: str) -> None:
         self.seen.pop(box, None)
         self.stalled_boxes.discard(box)
+
+    def sent(self, box: str, mid: str) -> None:
+        """A pointer for this mail went after all (the rescue submitted it, or a ring did): it is
+        pending from no interrupted clear, so the empty composer that follows does not report it."""
+        left = [m for m in self.pending.get(box, []) if m != mid]
+        if left:
+            self.pending[box] = left
+        else:
+            self.pending.pop(box, None)

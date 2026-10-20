@@ -339,7 +339,7 @@ class InterruptedClearRemainder(ComposerWatchFixture):
         self.look(61)            # the remainder is seen
         self.look(121)           # second clear: nothing changes, the pane is quiet again
         self.assertEqual([peerchat.CLEAR_KEY] * 2, self.keys)
-        self.assertEqual(['m1'], self.r.composers.pending['codex'][0], 'm1 is not in the text: still carried')
+        self.assertEqual(['m1'], self.r.composers.pending['codex'], 'm1 is not in the text: still carried')
         self.look(122)           # third clear takes it
         self.assertEqual([peerchat.CLEAR_KEY] * 3, self.keys)
         self.assertIsNone(self.typed)
@@ -367,13 +367,38 @@ class InterruptedClearRemainder(ComposerWatchFixture):
         self.look(60)
         self.assertEqual([peerchat.CLEAR_KEY] * 3, self.keys)
         self.assertTrue(any('not empty after 3 presses' in line for line in self.logs))
-        self.assertEqual((['m1'], peerchat.compact(self.pointer + self.pointer)), self.r.composers.pending['codex'])
+        self.assertEqual(['m1'], self.r.composers.pending['codex'])
         self.look(61)
-        self.assertEqual(['m1'], self.r.composers.pending['codex'][0], 'the remainder shows no marker')
+        self.assertEqual(['m1'], self.r.composers.pending['codex'], 'the remainder shows no marker')
         self.look(121)
         self.assertEqual([peerchat.CLEAR_KEY] * 4, self.keys)
         self.assertIn('the remainder of an interrupted clear that carried m1', self.cleared_lines()[0])
         self.assertEqual([], self.r.state.get('announced', []), 'm1 rings again')
+
+    def test_a_pointer_the_rescue_sends_after_an_ineffective_clear_is_not_reported_as_cleared(self):
+        # Three presses changed nothing, so m1 is pending; the rescue then submits the pointer in the
+        # same tick. The empty composer that follows reports nothing: m1 stays announced, it went.
+        self.typed = self.pointer
+
+        def clear_composer(pane, profile, content, idle=None, on_press=None):
+            for _ in range(peerchat.CLEAR_PRESSES):
+                self.keys.append(peerchat.CLEAR_KEY)
+                on_press()
+            return False
+        self.enterContext(patch.object(peerchat, 'clear_composer', side_effect=clear_composer))
+        self.r.composers.rescue_exhausted = lambda box, mid: True
+        self.r.state['announced'] = ['m1']
+        self.look(0)
+        self.look(60)
+        self.assertEqual([peerchat.CLEAR_KEY] * 3, self.keys)
+        self.assertEqual(['m1'], self.r.composers.pending['codex'])
+        peer = next(p for p in self.r.peers if p.box == 'codex')
+        self.r.rung([(peer, 'm1')])          # the rescue's submit took
+        self.assertEqual({}, self.r.composers.pending, 'the pointer went: nothing is pending')
+        self.typed = None
+        self.look(61)
+        self.assertEqual(['m1'], self.r.state['announced'], 'm1 was sent, not lost')
+        self.assertEqual([], [line for line in self.logs if 'never went' in line])
 
 
 class WrappedIds(unittest.TestCase):
