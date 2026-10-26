@@ -319,8 +319,9 @@ function Get-RosterEntry($Roster, [string] $Id) {
 }
 
 function Get-FailoverOrderProblem($Order, $Roster) {
-    <# Why this failoverOrder is invalid, or $null: a list, no duplicates, every element a tool or a roster
-       id, at least two distinct tools among them. The text continues "failoverOrder in '<path>' ...". #>
+    <# Why this failoverOrder is invalid, or $null: a non-empty list, no duplicates, every element a tool or a
+       roster id. One tool is enough (#134): a limited member then waits out its limit. The text continues
+       "failoverOrder in '<path>' ...". #>
     if ($Order -is [string] -or $Order -isnot [System.Collections.IEnumerable]) { return 'must be a list of tools or roster ids' }
     $items = @($Order)
     $tools = @{}
@@ -332,7 +333,7 @@ function Get-FailoverOrderProblem($Order, $Roster) {
         $tools[[string]$entry.tool] = $true
     }
     if (@($items | Select-Object -Unique).Count -ne $items.Count) { return "must not list an element twice (got '$($items -join ', ')')" }
-    if ($tools.Count -lt 2) { return "must list at least two distinct tools of codex, claude and kimi (got '$($items -join ', ')')" }
+    if ($tools.Count -lt 1) { return 'must list at least one tool of codex, claude and kimi (got an empty list)' }
     return $null
 }
 

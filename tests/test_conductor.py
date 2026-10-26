@@ -4136,7 +4136,7 @@ class AutoRouting(unittest.TestCase):
         self.assertEqual(('kimi', None, None), (entry['id'], entry.get('bare'), entry.get('model')))   # kimi is a roster id
 
     def test_an_invalid_failover_order_or_roster_is_a_pause_reason(self):
-        for settings in ({'failoverOrder': ['codex', 'nobody']}, {'failoverOrder': ['claude-sonnet', 'claude-opus']},
+        for settings in ({'failoverOrder': ['codex', 'nobody']}, {'failoverOrder': []},
                          {'implementerRoster': []}):
             with self.subTest(settings=settings):
                 self.settings(**settings)

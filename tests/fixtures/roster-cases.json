@@ -427,12 +427,12 @@
    "ok": true
   },
   {
-   "name": "one element",
+   "name": "one tool (#134)",
    "roster": null,
    "order": [
     "claude"
    ],
-   "ok": false
+   "ok": true
   },
   {
    "name": "a bare string",
@@ -482,7 +482,7 @@
     "claude-sonnet",
     "claude-opus"
    ],
-   "ok": false
+   "ok": true
   },
   {
    "name": "an id and its own tool",
@@ -491,7 +491,7 @@
     "claude-sonnet",
     "claude"
    ],
-   "ok": false
+   "ok": true
   },
   {
    "name": "not strings",
@@ -526,6 +526,12 @@
     "claude"
    ],
    "ok": true
+  },
+  {
+   "name": "an empty list (#134)",
+   "roster": null,
+   "order": [],
+   "ok": false
   }
  ]
 }
