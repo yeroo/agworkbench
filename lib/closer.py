@@ -176,8 +176,12 @@ class PointerRescue:
                  log: Callable[[str], None], alert: Callable[[object, str, str], None],
                  resolved: Callable[[object, str], None] | None = None,
                  clock: Callable[[], float] = time.monotonic,
-                 read_message: Callable[[str, str], dict | None] | None = None):
+                 read_message: Callable[[str, str], dict | None] | None = None,
+                 cleared: Callable[[object, str], None] | None = None):
         self.peers = peers
+        # Told of each stale pointer cleared (#130): the relay settles the composer a failed ring
+        # typed into, so its rings may resume.
+        self.cleared = cleared
         self.unread_message = unread_message
         # A pointer for mail the agent has already read is stale: submitting it would only start a
         # turn, and leaving it makes every later ring refuse the composer as a draft. With this set,
@@ -268,6 +272,8 @@ class PointerRescue:
         if cleared:
             seen.pop(peer.box)
             self.log(f"cleared {where}")
+            if self.cleared is not None:
+                self.cleared(peer, mid)
         else:
             self.log(f"could not clear {where}: not empty after {peerchat.CLEAR_PRESSES} presses")
 
@@ -280,8 +286,12 @@ class PointerRescue:
 
 class Closer:
     def __init__(self, hub_dir: Path, repo: str, issue: str | int | None, peers, *, log: Callable[[str], None],
-                 clock: Callable[[], float] = time.monotonic, dry_run: bool = False, workspace: str | None = None):
+                 clock: Callable[[], float] = time.monotonic, dry_run: bool = False, workspace: str | None = None,
+                 composer_stall_seconds: float | None = None):
         self.hub_dir = Path(hub_dir)
+        # The queue's composerStallSeconds (#130), for the conductor's composer watch; None reads as
+        # the default.
+        self.composer_stall_seconds = composer_stall_seconds
         self.repo = repo
         self.issue = str(issue) if issue else None
         # The conductor passes its queue's workspace; the relay reads its checkout's (#66).
@@ -295,6 +305,7 @@ class Closer:
         self.hard: list[str] = []               # the last agent_blockers(): what a timeout never overrides
         self.soft: list[str] = []               # ... and the unread implementer mail ids it does (#44)
         self.rescue: PointerRescue | None = None  # the conductor's pointer rescue (#96), made on first use
+        self.composers = None                    # ... and its composer watch (#130), likewise
         self.deadline = clock() + CLOSE_WAIT
 
     # --- logging and settings ------------------------------------------------------------------
@@ -584,8 +595,19 @@ class Closer:
             self.log(f"ignoring unread post-merge mail for the implementer: {', '.join(ignored)}")
         if (self.hub_dir.parent / '.git' / 'index.lock').exists():
             hard.append('.git/index.lock exists')
+        snapshot = None
         for peer in self.peers:
             try:
+                if snapshot is None:
+                    snapshot = agw.tree()
+                if agw.find_pane(peer.pane, snapshot) is None:
+                    # The pane no longer exists: closed by hand, or a terminal restart gave the
+                    # agents new ids (#128). Nothing is left there to wait for or to close, so it
+                    # is not a blocker; an unreadable pane that does exist still is.
+                    if self.decided.get(f'__gone__{peer.box}') != peer.pane:
+                        self.decided[f'__gone__{peer.box}'] = peer.pane
+                        self.log(f'{peer.box} pane {peer.pane} is gone: nothing left to close there')
+                    continue
                 text = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 hard.append(f'{peer.box} pane unreadable: {err}')
@@ -626,7 +648,10 @@ class Closer:
             return None
 
     def pointer_alert(self, peer, mid: str, reason: str) -> None:
-        message = f"workbench mail for {peer.box} ({mid}) is waiting: {reason}"
+        self.pane_alert(peer, f"workbench mail for {peer.box} ({mid}) is waiting: {reason}")
+
+    def pane_alert(self, peer, message: str) -> None:
+        """Blocked status, sound and a notification on the peer's pane, logged as ALERT."""
         self.log(f"ALERT {message}")
         if self.dry_run:
             return
@@ -664,7 +689,51 @@ class Closer:
                 texts[peer.box] = agw.pane_text(peer.pane)
             except (agw.CtlError, OSError) as err:
                 texts[peer.box] = err
-        return self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message))
+        return self.pointers_dealt_with(
+            self.rescue.step(texts, skip=lambda peer, message: self.needs_no_reading(number, peer, message)))
+
+    def pointers_dealt_with(self, pointers: list) -> list:
+        """Pointers the backstop's rescue submitted or its stale clear deleted are pending from no
+        interrupted clear in this close's own composer watch (#130 r4, round 5), so its next empty
+        look does not report them as cleared. Returns `pointers` for the caller."""
+        if self.composers is not None:
+            for peer, mid in pointers:
+                self.composers.sent(peer.box, mid)
+        return pointers
+
+    def watch_composers(self) -> list:
+        """One composer-watch step over the agent panes (#130), for the conductor's backstop: the
+        relay runs its own. Stalled text goes before the agents are judged idle, so a duplicated or
+        mangled pointer for mail the close does not wait for cannot hold the close until its timeout.
+        The conductor types no pointer, so text carrying a pointer for the planner's unread mail,
+        whose hold no timeout lifts, is never cleared here, exact, duplicated or mangled, however
+        often the rescue failed to submit it (the watch's `skip`): it stays for the rescue and the
+        human, logged once, and the unread mail holds the close. Text for the implementer's mail is
+        cleared as anywhere else: its pre-merge mail holds the close for the #44 ten minutes and no
+        longer, as the README says, and a stuck pointer must not turn that into a refusal."""
+        if self.dry_run:
+            return []
+        if self.composers is None:
+            import composer_watch
+
+            def exhausted(box: str, mid: str) -> bool:
+                return self.rescue is not None and self.rescue.attempts.get((box, mid), 0) >= RESCUE_ATTEMPTS
+            self.composers = composer_watch.ComposerWatch(
+                self.peers, unread_message=self.unread_message,
+                pointer=lambda message: relay_pointer(message, AGMSG, self.hub_dir), log=self.log,
+                alert=lambda peer, reason: self.pane_alert(peer, f"{peer.box} composer: {reason}"),
+                automatic=lambda peer: automatic_pane(self.hub_dir, peer),
+                rescue_exhausted=exhausted,
+                clock=self.clock,
+                stall_seconds=(composer_watch.COMPOSER_STALL_SECONDS if self.composer_stall_seconds is None
+                               else self.composer_stall_seconds))
+        texts = {}
+        for peer in self.peers:
+            try:
+                texts[peer.box] = agw.pane_text(peer.pane)
+            except (agw.CtlError, OSError) as err:
+                texts[peer.box] = err
+        return self.composers.step(texts, skip=lambda peer, message: message is not None and peer.box != 'codex')
 
     def clear_stale_pointers(self, number: int | None) -> list:
         """Delete a relay pointer that no longer needs reading from a settled, idle composer (#96).
@@ -722,26 +791,31 @@ class Closer:
                 cleared_pointers.append((peer, mid))
             else:
                 self.log(f"could not clear {where}: not empty after {peerchat.CLEAR_PRESSES} presses")
-        return cleared_pointers
+        return self.pointers_dealt_with(cleared_pointers)
 
     def close_issue_session(self) -> None:
         agents = {peer.pane for peer in self.peers}
         snapshot = agw.tree()
+        # The session holding the agent panes, and nothing but agent panes: one of them may be
+        # gone already (#128); a human's split beside them must never go with it.
         issue_session = next((session for _, session in agw.sessions(snapshot)
-                              if set(agw.panes_of(session)) == agents), None)
+                              if agents & set(agw.panes_of(session)) and set(agw.panes_of(session)) <= agents), None)
         if issue_session is None:
             self.log('the issue session is already gone')
             return
         self.log(f"closing the issue session {issue_session.get('name')} ({issue_session.get('id')})")
-        for pane in sorted(agents):
+        for pane in sorted(agents & set(agw.panes_of(issue_session))):
             agw.clear_restore(pane)
         agw.close_session(issue_session.get('id'))
 
 
-def idle_blockers(peer, text: str) -> list[str]:
+def idle_blockers(peer, text: str, *, stalled: bool = False) -> list[str]:
     """Why an agent pane is not provably idle: a turn is running, or its composer is not provably
     empty. Empty only when it is idle. Shared by the close and the relay's stall watch (#45), so the
-    two can never disagree about what idle means."""
+    two can never disagree about what idle means, with one exception they both name (#130): with
+    `stalled` (the composer watch has seen the same text there past composerStallSeconds) the
+    composer is not a turn in progress and does not block. The stall watch passes it, so stuck text
+    cannot hide a stall; the close does not, since the text has to go before the pane may close."""
     import peerchat
     if limits.ps_prompt_last(text):
         # #98: no agent is left to be busy or to hold a draft, so the pane is idle. The close may close
@@ -752,6 +826,8 @@ def idle_blockers(peer, text: str) -> list[str]:
         reasons.append(f'{peer.box} is running a turn')
     profile = peerchat.PROFILES[peer.tool]
     content = peerchat.composer_content(peer.tool, text)
+    if stalled:
+        return reasons
     if content is None or not peerchat.looks_empty(profile, content):
         reason = f'{peer.box} composer is not provably empty'
         if peer.tool == 'claude':
@@ -759,6 +835,31 @@ def idle_blockers(peer, text: str) -> list[str]:
                        ' for an adopted Claude set "promptSuggestionEnabled": false in ~/.claude/settings.json)')
         reasons.append(reason)
     return reasons
+
+
+def automatic_pane(hub_dir: Path, peer) -> bool:
+    """Whose pane this is (#130): a queue member's panes are the workbench's; otherwise an autonomous
+    loop's are, except the planner pane the launcher adopted from the caller (`claude.json` origin
+    `adopted`), which is the human's own session whatever the loop's autonomy."""
+    state = Path(hub_dir) / 'state'
+    if (state / 'queue-member.json').exists():
+        return True
+    try:
+        settings = json.loads((state / 'implementer.json').read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return False
+    if not (isinstance(settings, dict) and settings.get('autonomous') is True):
+        return False
+    if getattr(peer, 'box', None) == 'claude':
+        # The planner's pane: `claude.json` is its identity record. A Claude implementer (box
+        # 'codex', tool 'claude') has its own record and is never adopted.
+        try:
+            identity = json.loads((state / 'claude.json').read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            identity = {}
+        if isinstance(identity, dict) and identity.get('origin') == 'adopted':
+            return False
+    return True
 
 
 def relay_alive(repo: str, issue: str, snapshot, workspace: str | None = None) -> bool:

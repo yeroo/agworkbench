@@ -467,6 +467,40 @@ class AfterClose(Clones):
         self.assertIn('kept: still open after 600s: #7 your review', self.root_log())
         self.assertIn('still open after 600s', self.relay_log(checkout))
         self.assertEqual([], self.gh_calls)
+        # #128: the cleanup is owed, not forgotten.
+        pending = json.loads((checkout / '.workbench' / 'state' / cleanup.PENDING_NAME).read_text(encoding='utf-8'))
+        self.assertEqual(('o/repo', 7, 42, 'merged'), (pending['repo'], pending['issue'], pending['pr'], pending['mode']))
+        self.assertIn('cleanup pending', self.root_log())
+
+    def test_a_pending_cleanup_is_retried_once_the_sessions_are_gone(self):
+        # #128: after-close gave up on a session that stayed open; the conductor's retry waits while
+        # a session of the issue is open, then deletes once none is.
+        checkout = self.clone()
+        self.head = self.commit(checkout)
+        self.trees = [{'workspaces': [{'name': 'repo', 'sessions': [{'id': 'r', 'name': '#7 relay'}]}]}]
+        self.assertEqual(1, self.after_close(checkout))
+        what, deleted = cleanup.retry_pending(checkout, self.trees[0], gh=self.gh, pause=self.pause)
+        self.assertEqual(('waiting: still open: #7 relay', False), (what, deleted))
+        self.assertTrue(checkout.exists())
+        what, deleted = cleanup.retry_pending(checkout, EMPTY_TREE, gh=self.gh, pause=self.pause)
+        self.assertTrue(deleted, what)
+        self.assertTrue(what.startswith('deleted (merged)'), what)
+        self.assertFalse(checkout.exists())
+        self.assertIn('deleted (merged): freed', self.root_log())
+
+    def test_a_pending_cleanup_kept_for_another_reason_keeps_its_marker(self):
+        checkout = self.clone()
+        self.trees = [{'workspaces': [{'name': 'repo', 'sessions': [{'id': 'r', 'name': '#7 relay'}]}]}]
+        self.assertEqual(1, self.after_close(checkout))
+        (checkout / 'notes.txt').write_text('draft', encoding='utf-8')
+        what, deleted = cleanup.retry_pending(checkout, EMPTY_TREE, gh=self.gh, pause=self.pause)
+        self.assertFalse(deleted)
+        self.assertIn('uncommitted changes', what)
+        self.assertTrue((checkout / '.workbench' / 'state' / cleanup.PENDING_NAME).exists())
+        self.assertIn('cleanup retry: kept: uncommitted changes', self.relay_log(checkout))
+        self.assertEqual(('kept: unreadable cleanup-pending.json', False),
+                         tuple(x if not isinstance(x, str) else x.split(':', 2)[0] + ':' + x.split(':', 2)[1]
+                               for x in cleanup.retry_pending(self.root / 'nowhere-issue-9', EMPTY_TREE, gh=self.gh)))
 
     def test_a_named_queue_checkout_waits_on_its_own_workspace(self):
         # #66: the sessions to wait for are in the workspace the membership records; an unreadable
