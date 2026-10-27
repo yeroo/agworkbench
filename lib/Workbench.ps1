@@ -747,6 +747,13 @@ function Confirm-WindowUsable([string] $Pane) {
         do {
             $minimized = Test-AgwintermMinimized
             $reply = (Invoke-Ctl session metrics $Pane --json) | ConvertFrom-Json
+            if ($reply.ok -ne $true -and "$($reply.error)" -match 'lite subset') {
+                # agliteterm has no session.metrics: its panes cannot be measured, so the launch
+                # goes on as if the window were usable (the pane is the one it just created).
+                Write-Step "agliteterm: pane $Pane cannot be measured (lite subset); assuming a usable window"
+                $script:Launch.Stage = $oldStage
+                return
+            }
             if ($reply.ok -ne $true -or $null -eq $reply.result -or $null -eq $reply.result.cols) {
                 throw "window metrics unavailable for pane $Pane"
             }
@@ -823,8 +830,8 @@ function Get-PaneIds($Session) {
     if ($hasIds) { $ids = @($Session.paneIds) }
     if ($ids.Count -lt 1 -or $ids.Count -gt 2) { throw "session '$($Session.id)' has unsupported panes: $($ids -join ', ')" }
     foreach ($id in $ids) {
-        $guid = [guid]::Empty
-        if ($id -isnot [string] -or -not [guid]::TryParse($id, [ref]$guid) -or $guid -eq [guid]::Empty) {
+        # agwinterm pane ids are GUIDs; agliteterm's are `lite-N` (Test-PaneId takes both).
+        if ($id -isnot [string] -or -not (Test-PaneId $id)) {
             throw "session '$($Session.id)' has invalid pane id '$id'"
         }
     }
@@ -985,6 +992,17 @@ function Normalize-WorkbenchPath([string] $Path) {
 function Test-SessionGuid([string] $Value) {
     $id = [guid]::Empty
     return [guid]::TryParse($Value, [ref]$id) -and $id -ne [guid]::Empty
+}
+
+# A terminal pane or session id. agwinterm gives every pane a GUID; agliteterm, which shares the
+# control API, numbers them `lite-N`. Claude conversation ids stay GUIDs (Test-SessionGuid).
+function Test-PaneId([string] $Value) {
+    return (Test-SessionGuid $Value) -or ($Value -match '^lite-[0-9]+$')
+}
+
+# A workspace id: agwinterm's are GUIDs, agliteterm's are small integers.
+function Test-WorkspaceId([string] $Value) {
+    return (Test-SessionGuid $Value) -or ($Value -match '^[0-9]+$')
 }
 
 function Read-SharedText([string] $Path, [scriptblock] $Read) {
@@ -1174,7 +1192,7 @@ function Read-ClaudeIdentity([string] $Checkout, [string] $Issue, [string] $Role
     $path = Get-ClaudeIdentityPath $Checkout $Role
     $record = Get-Content -Raw -LiteralPath $path -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
     if (-not (Test-SessionGuid $record.sessionId) -or
-        ($null -ne $record.pane -and -not (Test-SessionGuid $record.pane)) -or
+        ($null -ne $record.pane -and -not (Test-PaneId $record.pane)) -or
         -not $record.cwd -or -not [IO.Path]::IsPathRooted([string]$record.cwd) -or
         $record.origin -notin @('fresh', 'adopted', 'recovered') -or $record.issue -ne $Issue -or
         (Normalize-WorkbenchPath $record.checkout) -ne (Normalize-WorkbenchPath $Checkout)) {
@@ -1804,7 +1822,7 @@ function Get-ImplementerName([string] $Tool) {
 }
 
 function Set-PaneRestore([string] $Pane, [string] $Command) {
-    if (-not (Test-SessionGuid $Pane)) { throw "invalid restore pane '$Pane'" }
+    if (-not (Test-PaneId $Pane)) { throw "invalid restore pane '$Pane'" }
     $stage = $script:Launch.Stage
     try {
         Set-LaunchStage restore-pin
@@ -1850,8 +1868,7 @@ function Get-AdoptionPlan($Tree, [string] $Checkout, [string] $WorkspaceName, [i
     }
     $workspaceId = $null
     if ($workspaces.Count) {
-        $guid = [guid]::Empty
-        if (-not [guid]::TryParse([string]$workspaces[0].id, [ref]$guid) -or $guid -eq [guid]::Empty) {
+        if (-not (Test-WorkspaceId ([string]$workspaces[0].id))) {
             throw [AdoptRefused]::new("workspace '$WorkspaceName' has no valid id")
         }
         $workspaceId = $workspaces[0].id
@@ -1933,8 +1950,7 @@ function Initialize-AdoptedSession($Plan, [string] $Checkout, [string] $Workspac
     $workspaceId = $Plan.TargetWorkspace
     if (-not $workspaceId) {
         $workspaceId = (Invoke-Ctl workspace new $WorkspaceName).Trim()
-        $guid = [guid]::Empty
-        if (-not [guid]::TryParse($workspaceId, [ref]$guid) -or $guid -eq [guid]::Empty) {
+        if (-not (Test-WorkspaceId $workspaceId)) {
             throw "workspace new returned an invalid id: '$workspaceId'"
         }
     }
@@ -2036,7 +2052,7 @@ function Start-WorkbenchSessionCore {
         $id = Invoke-Ctl session new --name "#$Number $Slug" --cwd $Checkout `
             --workspace-name $WorkspaceName --create-workspace @command @selection
         $script:Launch.SessionId = ($id -split '\s+')[0]
-        if (-not (Test-SessionGuid $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
+        if (-not (Test-PaneId $script:Launch.SessionId)) { throw 'session new returned an invalid pane id' }
         if ($script:Launch.QueueContext) { Add-QueueCreatedSession $Checkout $script:Launch.SessionId }
         $script:Launch.Claude = $script:Launch.SessionId
         $null = Reserve-ClaudeIdentity $Checkout $script:Launch.IssueRef $script:Launch.Claude

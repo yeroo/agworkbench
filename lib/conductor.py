@@ -269,6 +269,11 @@ def valid_uuid(value):
         return False
 
 
+def valid_pane_id(value):
+    """A terminal session or pane id: agwinterm's GUIDs, or agliteterm's `lite-N`."""
+    return valid_uuid(value) or bool(re.fullmatch(r'lite-[0-9]+', str(value or '')))
+
+
 def pr_url(value, repo):
     parsed = urlparse(value or '')
     if (parsed.scheme != 'https' or parsed.netloc.lower() != 'github.com' or parsed.query or parsed.fragment or
@@ -1144,7 +1149,7 @@ def start_queue(spec, repo=None, parallel=None, watch=False, retry=False, yes=Fa
         # queue's opens beside its caller, as before.
         args.update({'workspace-name': workspace, 'create-workspace': True})
     session = str(agw.request('session.new', args=args)).split()[0]
-    if not valid_uuid(session):
+    if not valid_pane_id(session):
         raise QueueError(f'invalid conductor session id: {session}')
     with store.transaction() as data:
         if data['owner']['token'] == token:
