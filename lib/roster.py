@@ -97,8 +97,9 @@ def entry_of(roster, ident):
 
 
 def failover_problem(order, roster) -> str | None:
-    """Why this failoverOrder is invalid, or None: a list, no duplicates, every element a tool or a roster
-    id, at least two distinct tools among them."""
+    """Why this failoverOrder is invalid, or None: a non-empty list, no duplicates, every element a tool or a
+    roster id. One tool is enough (#134): a Claude-only machine lists ["claude"], and a limited member then
+    has nowhere to fail over to, so it waits out the limit."""
     if not isinstance(order, list):
         return 'must be a list of tools or roster ids'
     tools = set()
@@ -114,8 +115,8 @@ def failover_problem(order, roster) -> str | None:
         tools.add(entry['tool'])
     if len(set(order)) != len(order):
         return f"must not list an element twice (got '{', '.join(order)}')"
-    if len(tools) < 2:
-        return f"must list at least two distinct tools of codex, claude and kimi (got '{', '.join(order)}')"
+    if not tools:
+        return 'must list at least one tool of codex, claude and kimi (got an empty list)'
     return None
 
 
