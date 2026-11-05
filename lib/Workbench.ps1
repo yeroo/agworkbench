@@ -2475,8 +2475,15 @@ function New-IssueCheckout {
         $existing = & git rev-parse --abbrev-ref HEAD
         if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed in $dir (exit $LASTEXITCODE)" }
         if ($existing -notlike "issue-$($Issue.Number)-*") {
-            $default = (& gh repo view $Issue.Repo --json defaultBranchRef --jq .defaultBranchRef.name).Trim()
-            if ($LASTEXITCODE -ne 0 -or -not $default) { throw 'could not read the default branch' }
+            # gh can answer with nothing on a transient API error (seen on the Linux queue), and
+            # $null.Trim() then aborts the whole launch: retry a few times, then say what failed.
+            $default = $null
+            foreach ($try in 1..4) {
+                $answer = & gh repo view $Issue.Repo --json defaultBranchRef --jq .defaultBranchRef.name
+                if ($LASTEXITCODE -eq 0 -and "$answer".Trim()) { $default = "$answer".Trim(); break }
+                Start-Sleep -Seconds (2 * $try)
+            }
+            if (-not $default) { throw "could not read the default branch of $($Issue.Repo) (gh repo view gave nothing after 4 tries)" }
             & git fetch --quiet origin $default
             if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
             $known = & git branch --list "issue-$($Issue.Number)-*"
