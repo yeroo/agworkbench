@@ -1107,6 +1107,7 @@ the result mail's id and box, so the relay can close it once that mail has been 
 | `closeHelpers` | `true` | the relay closes a finished revmux or suite helper session once its result mail has been read (see Finished helpers, before the merge); `false` keeps them until the loop's close |
 | `restartExited` | `true` | the relay restarts an agent that exited to its pane's shell with the pane's pinned command, at most 3 times an hour (see Exited agents); `false` leaves the pane alone |
 | `reviewOnLimit` | `"wait"` | with `-WaitOnLimit`, a review round a reviewer's usage limit degraded: `wait` reruns it after `limitRetryMinutes`, `fallback` reruns it at once with `claude-only` |
+| `claudeConfigDir` | none | Claude Code's config directory, for finding a loop's conversation when `CLAUDE_CONFIG_DIR` is not set in the launcher's environment (e.g. a machine whose `claude` wrapper sets it only for Claude itself); `~` is expanded. Without it, `CLAUDE_CONFIG_DIR`, else `~/.claude` |
 | `autoMerge` | `false` | new checkouts let the planner merge its own PR when every auto-merge condition holds; `-AutoMerge` / `-NoAutoMerge` change it per checkout or queue |
 
 ## Layout
