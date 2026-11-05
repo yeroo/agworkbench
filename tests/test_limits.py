@@ -401,6 +401,17 @@ class PsPromptLast(unittest.TestCase):
                 self.assertIs(expected, limits.ps_prompt_last(text))
 
 
+    def test_posix_prompts_on_agterm(self):
+        """agterm (Linux/macOS): an exited agent leaves its pane at the login shell's bash/zsh prompt."""
+        bash = "boris@laptop:~/personal/workbench/looksy-suite-plugin-linux-issue-68$ "
+        for text, expected in ((bash, True), (bash.rstrip(), True), ("frame\n" + bash + "\n\n", True),
+                               ("root@box:/srv# ", True), ("me@mac:~%", True),
+                               (bash + "ls", False), ("s: command not found\n" + bash + "s t'/x", False),
+                               ("user@host ~ $ ", False), ("not a prompt$ ", False)):
+            with self.subTest(text=text[-40:]):
+                self.assertIs(expected, limits.ps_prompt_last(text))
+
+
 class Cli(unittest.TestCase):
     def test_classify_prints_json(self):
         done = subprocess.run([sys.executable, str(ROOT / "lib" / "limits.py"), "classify", "--tool", "codex"],
