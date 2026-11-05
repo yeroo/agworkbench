@@ -175,10 +175,10 @@ function Get-WorkbenchConfig {
                  implementer = 'codex'; revmuxProfile = $null; autoMerge = $false; failover = $true; autonomous = $false;
                  cleanup = 'merged'; minFreeGB = 20; minFreeRamGB = 3; stallMinutes = 15; kimiPath = $null; kimiArgs = @(); kimiApproval = 'ask'; claudeImplementerModel = $null;
                  failoverOrder = @('claude', 'codex', 'kimi'); implementerRoster = $null; route = $null; limitRetryMinutes = 30; reviewOnLimit = 'wait';
-                 closeHelpers = $true; restartExited = $true; cloneReference = $null }
+                 closeHelpers = $true; restartExited = $true; cloneReference = $null; claudeConfigDir = $null }
     if (Test-Path -LiteralPath $path) {
         $loaded = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
-        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'route', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited', 'cloneReference')) {
+        foreach ($key in @('claudeArgs', 'codexArgs', 'checkoutRoot', 'allowNetwork', 'implementer', 'revmuxProfile', 'autoMerge', 'failover', 'autonomous', 'cleanup', 'minFreeGB', 'minFreeRamGB', 'stallMinutes', 'kimiPath', 'kimiArgs', 'kimiApproval', 'claudeImplementerModel', 'implementerRoster', 'route', 'failoverOrder', 'limitRetryMinutes', 'reviewOnLimit', 'closeHelpers', 'restartExited', 'cloneReference', 'claudeConfigDir')) {
             if ($null -ne $loaded.$key) { $config[$key] = $loaded.$key }
         }
     }
@@ -1000,7 +1000,12 @@ function Read-SharedText([string] $Path, [scriptblock] $Read) {
 }
 
 function Get-ClaudeProjects {
+    # Where Claude Code keeps its transcripts: $env:CLAUDE_CONFIG_DIR, else "claudeConfigDir" in
+    # ~/.agworkbench.json (a machine whose workbench runs Claude under a config dir that a wrapper
+    # sets only for claude itself, so the launcher and conductor never see the variable), else ~/.claude.
     $root = Join-Path $HOME '.claude'
+    $configured = [string](Get-WorkbenchConfig).claudeConfigDir
+    if ($configured) { $root = $configured.Replace('~', $HOME) }
     if ($env:CLAUDE_CONFIG_DIR) { $root = $env:CLAUDE_CONFIG_DIR }
     return Join-Path $root 'projects'
 }
