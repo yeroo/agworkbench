@@ -186,6 +186,12 @@ def _session_node(session: dict[str, Any]) -> dict[str, Any]:
     if split:
         fg[panes[1]] = session.get("splitForeground") or None
     node["paneForeground"] = fg
+    # The relay's exit watch (#98) reads `foregroundShells`, one entry per pane: the root shell's name
+    # while the pane is at that shell's prompt with no child in front of it, else "". agterm reports
+    # exactly that by omitting the pane's foreground, so an agent that exited (or crashed) back to its
+    # login shell is detected on agterm as it is on agwinterm.
+    shell = os.path.basename(os.environ.get("SHELL") or "") or "sh"
+    node["foregroundShells"] = [shell if fg.get(pane) is None else "" for pane in panes]
     for key in ("context", "status", "statusChangedAt"):
         if key in session:
             node[key] = session[key]

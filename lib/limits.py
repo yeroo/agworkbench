@@ -94,6 +94,9 @@ CLAUDE_PROMPT_RE = re.compile(r"^\s*[>❯]\s?")
 CODEX_PROMPT_RE = re.compile(r"^[›»]")
 TOOL_CALL_RE = re.compile(r"^\s*●\s+[A-Za-z_][\w.-]*\(")
 SHELL_PS_RE = re.compile(r"^PS [A-Za-z]:\\[^>]*> ?$")
+# A bare POSIX shell prompt (bash/zsh default `user@host:path$ ` / `#` / `%`), nothing typed after it:
+# the pane's root shell on agterm (Linux/macOS), where an exited agent leaves it (#98).
+SHELL_POSIX_RE = re.compile(r"^[\w.-]+@[\w.-]+:\S*[$#%] ?$")
 SHELL_PS_COMMAND_RE = re.compile(r"^PS [A-Za-z]:\\[^>]*>")   # a prompt, with or without a command after it
 SHELL_GLYPH_RE = re.compile(r"^\s*❯\s*$")
 SHELL_TIMING_RE = re.compile(r"(\d+(\.\d+)?(ms|s)|\d\d:\d\d(:\d\d)?)\s*$")
@@ -172,10 +175,11 @@ def shell_prompt(rows: list[str]) -> bool:
 
 
 def ps_prompt_last(text: str | None) -> bool:
-    """#98: the frame's last non-empty row is a bare pwsh prompt (`PS X:\\...> `, nothing typed after it).
-    Rows above it are not looked at: an agent that crashed leaves its whole frame there."""
+    """#98: the frame's last non-empty row is a bare shell prompt - pwsh's (`PS X:\\...> `) or a POSIX
+    shell's (`user@host:path$ `, agterm on Linux/macOS) - with nothing typed after it. Rows above it are
+    not looked at: an agent that crashed leaves its whole frame there."""
     filled = [row.rstrip() for row in (text or "").splitlines() if row.strip()]
-    return bool(filled) and bool(SHELL_PS_RE.match(filled[-1]))
+    return bool(filled) and bool(SHELL_PS_RE.match(filled[-1]) or SHELL_POSIX_RE.match(filled[-1]))
 
 
 def _last_block(rows: list[str]) -> list[str]:
